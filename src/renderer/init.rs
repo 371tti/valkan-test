@@ -13,7 +13,10 @@ use ash::{
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
-use crate::{APP_NAME, ENGINE_NAME, renderer::{MAX_FRAMES_IN_FLIGHT, QueueFamilyIndices}};
+use crate::{
+    APP_NAME, ENGINE_NAME,
+    renderer::{MAX_FRAMES_IN_FLIGHT, QueueFamilyIndices, RendererConfig},
+};
 
 const WANT_VALIDATION: bool = cfg!(debug_assertions);
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -21,24 +24,24 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 impl super::Renderer {
     pub fn new(window_ref: Arc<Window>) -> Self {
         let entry = unsafe { Entry::load().expect("renderer init: failed to load Vulkan entry") };
-        log::info!("renderer init: Vulkan entry loaded");
+        log::debug!("renderer init: Vulkan entry loaded");
 
         let validation_enabled = WANT_VALIDATION && validation_layer_supported(&entry);
 
         if WANT_VALIDATION && !validation_enabled {
             log::warn!("renderer init: validation layer is not supported; validation disabled");
         } else if validation_enabled {
-            log::info!("renderer init: validation enabled");
+            log::debug!("renderer init: validation enabled");
         } else {
-            log::info!("renderer init: validation disabled");
+            log::debug!("renderer init: validation disabled");
         }
 
         let instance = create_instance(&entry, &window_ref, validation_enabled);
-        log::info!("renderer init: Vulkan instance created");
+        log::debug!("renderer init: Vulkan instance created");
 
         let surface_loader = surface::Instance::new(&entry, &instance);
         let surface = create_surface(&entry, &instance, &window_ref);
-        log::info!("renderer init: surface created");
+        log::debug!("renderer init: surface created");
 
         let (physical_device, queue_family_indices) =
             pick_physical_device(&instance, &surface_loader, surface);
@@ -49,7 +52,7 @@ impl super::Renderer {
             unsafe { logical_device.get_device_queue(queue_family_indices.graphics_family, 0) };
         let present_queue =
             unsafe { logical_device.get_device_queue(queue_family_indices.present_family, 0) };
-        log::info!("renderer init: logical device and queues ready");
+        log::debug!("renderer init: logical device and queues ready");
 
         let swapchain_loader = swapchain::Device::new(&instance, &logical_device);
 
@@ -68,39 +71,36 @@ impl super::Renderer {
             surface,
             &swapchain_loader,
             queue_family_indices,
+            None,
+            None,
         );
-        log::info!(
+        log::debug!(
             "renderer init: swapchain created: {}x{}, images: {}",
             swapchain_extent.width,
             swapchain_extent.height,
             swapchain_images.len()
         );
 
-        let command_pool = create_command_pool(
-            &logical_device,
-            queue_family_indices.graphics_family,
-        );
+        let command_pool =
+            create_command_pool(&logical_device, queue_family_indices.graphics_family);
 
-        let command_buffers = create_command_buffers(
-            &logical_device,
-            command_pool,
-            swapchain_images.len() as u32,
-        );
-        log::info!("renderer init: command pool and buffers ready");
+        let command_buffers =
+            create_command_buffers(&logical_device, command_pool, swapchain_images.len() as u32);
+        log::debug!("renderer init: command pool and buffers ready");
 
         let image_available_semaphores = create_semaphores(&logical_device, MAX_FRAMES_IN_FLIGHT);
 
         let render_finished_semaphores = create_semaphores(&logical_device, swapchain_images.len());
 
         let in_flight_fences = create_fences(&logical_device, MAX_FRAMES_IN_FLIGHT);
-        log::info!("renderer init: synchronization objects ready");
+        log::debug!("renderer init: synchronization objects ready");
 
         let swapchain_image_layouts = vec![vk::ImageLayout::UNDEFINED; swapchain_images.len()];
 
         let (debug_utils_loader, debug_messenger) = if validation_enabled {
             let loader = debug_utils::Instance::new(&entry, &instance);
             let messenger = create_debug_messenger(&loader);
-            log::info!("renderer init: debug messenger ready");
+            log::debug!("renderer init: debug messenger ready");
 
             (Some(loader), Some(messenger))
         } else {
@@ -109,7 +109,6 @@ impl super::Renderer {
 
         Self {
             window_ref,
-            entry,
             instance,
             surface_loader,
             surface,
@@ -131,9 +130,11 @@ impl super::Renderer {
             in_flight_fences,
             current_frame: 0,
             swapchain_image_layouts,
+            config: RendererConfig::default(),
             debug_utils_loader,
             debug_messenger,
-            framebuffer_resized: false,
+            needs_swapchain_rebuild_fast: false,
+            needs_swapchain_rebuild_full: false,
         }
     }
 }
@@ -235,7 +236,7 @@ fn pick_physical_device(
             let props = unsafe { instance.get_physical_device_properties(device) };
 
             let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) };
-            log::info!("renderer init: selected GPU: {:?}", name);
+            log::debug!("renderer init: selected GPU: {:?}", name);
 
             Some((device, indices))
         })
@@ -289,6 +290,8 @@ pub fn create_swapchain(
     surface: vk::SurfaceKHR,
     swapchain_loader: &swapchain::Device,
     indices: QueueFamilyIndices,
+    preferred_surface_format: Option<vk::SurfaceFormatKHR>,
+    preferred_present_mode: Option<vk::PresentModeKHR>,
 ) -> (
     vk::SwapchainKHR,
     Vec<vk::Image>,
@@ -298,8 +301,29 @@ pub fn create_swapchain(
 ) {
     let support = query_swapchain_support(physical_device, surface_loader, surface);
 
-    let surface_format = choose_surface_format(&support.formats);
-    let present_mode = choose_present_mode(&support.present_modes);
+    let surface_format = match preferred_surface_format {
+        Some(format) if support.formats.contains(&format) => format,
+        Some(format) => {
+            log::warn!(
+                "renderer: preferred surface format {:?} not supported; falling back",
+                format
+            );
+            choose_surface_format(&support.formats)
+        }
+        None => choose_surface_format(&support.formats),
+    };
+
+    let present_mode = match preferred_present_mode {
+        Some(mode) if support.present_modes.contains(&mode) => mode,
+        Some(mode) => {
+            log::warn!(
+                "renderer: preferred present mode {:?} not supported; falling back",
+                mode
+            );
+            choose_present_mode(&support.present_modes)
+        }
+        None => choose_present_mode(&support.present_modes),
+    };
     let extent = choose_extent(window, &support.capabilities);
 
     let mut image_count = support.capabilities.min_image_count + 1;
@@ -319,7 +343,7 @@ pub fn create_swapchain(
         .image_array_layers(1)
         .image_usage(
             vk::ImageUsageFlags::COLOR_ATTACHMENT // このimageをレンダーターゲット/フレームバッファとして定義
-            | vk::ImageUsageFlags::TRANSFER_DST // このイメージは転送先として使用できる(vkCmdClearとかの対象 リサイズでのクリアとかのため)
+            | vk::ImageUsageFlags::TRANSFER_DST, // このイメージは転送先として使用できる(vkCmdClearとかの対象 リサイズでのクリアとかのため)
         )
         .pre_transform(support.capabilities.current_transform)
         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -360,10 +384,7 @@ pub fn create_swapchain(
     )
 }
 
-fn create_command_pool(
-    device: &ash::Device,
-    graphics_queue_family: u32,
-) -> vk::CommandPool {
+fn create_command_pool(device: &ash::Device, graphics_queue_family: u32) -> vk::CommandPool {
     let create_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(graphics_queue_family)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -393,12 +414,12 @@ pub fn create_command_buffers(
 }
 
 pub struct SwapchainSupport {
-    capabilities: vk::SurfaceCapabilitiesKHR,
-    formats: Vec<vk::SurfaceFormatKHR>,
-    present_modes: Vec<vk::PresentModeKHR>,
+    pub capabilities: vk::SurfaceCapabilitiesKHR,
+    pub formats: Vec<vk::SurfaceFormatKHR>,
+    pub present_modes: Vec<vk::PresentModeKHR>,
 }
 
-fn query_swapchain_support(
+pub fn query_swapchain_support(
     physical_device: vk::PhysicalDevice,
     surface_loader: &surface::Instance,
     surface: vk::SurfaceKHR,
@@ -424,7 +445,7 @@ fn query_swapchain_support(
     }
 }
 
-fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+pub fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
     formats
         .iter()
         .copied()
@@ -435,7 +456,7 @@ fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatK
         .unwrap_or(formats[0])
 }
 
-fn choose_present_mode(present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+pub fn choose_present_mode(present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     present_modes
         .iter()
         .copied()
@@ -579,10 +600,7 @@ fn debug_messenger_create_info() -> vk::DebugUtilsMessengerCreateInfoEXT<'static
         .pfn_user_callback(Some(vulkan_debug_callback))
 }
 
-fn create_semaphores(
-    device: &ash::Device,
-    count: usize,
-) -> Vec<vk::Semaphore> {
+fn create_semaphores(device: &ash::Device, count: usize) -> Vec<vk::Semaphore> {
     let info = vk::SemaphoreCreateInfo::default();
 
     (0..count)
@@ -594,12 +612,8 @@ fn create_semaphores(
         .collect()
 }
 
-fn create_fences(
-    device: &ash::Device,
-    count: usize,
-) -> Vec<vk::Fence> {
-    let info = vk::FenceCreateInfo::default()
-        .flags(vk::FenceCreateFlags::SIGNALED);
+fn create_fences(device: &ash::Device, count: usize) -> Vec<vk::Fence> {
+    let info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
 
     (0..count)
         .map(|_| unsafe {
@@ -626,7 +640,7 @@ unsafe extern "system" fn vulkan_debug_callback(
             log::warn!("[Vulkan][{:?}] {:?}", ty, message);
         }
         vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
-            log::info!("[Vulkan][{:?}] {:?}", ty, message);
+            log::debug!("[Vulkan][{:?}] {:?}", ty, message);
         }
         vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => {
             log::trace!("[Vulkan][{:?}] {:?}", ty, message);
