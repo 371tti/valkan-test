@@ -8,7 +8,7 @@ use ash::{
 };
 use winit::window::Window;
 
-use crate::renderer::init::{create_command_buffers, create_semaphores, create_swapchain};
+use crate::renderer::init::{create_graphics_pipeline, create_swapchain, create_swapchain_state};
 
 /// CPUがGPU完了を待たずに先行して準備できるフレーム数(1..4程度が一般的)
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -25,15 +25,19 @@ struct SwapchainState {
     render_finished_semaphores: Vec<vk::Semaphore>,
 }
 
+struct FrameSync {
+    image_available: vk::Semaphore,
+    in_flight_fence: vk::Fence,
+}
+
 struct SyncState {
-    image_available_semaphores: Vec<vk::Semaphore>,
-    in_flight_fences: Vec<vk::Fence>,
+    frames: Vec<FrameSync>,
     current_frame: usize,
 }
 
 impl SyncState {
     fn advance_frame(&mut self) {
-        self.current_frame = (self.current_frame + 1) % self.in_flight_fences.len();
+        self.current_frame = (self.current_frame + 1) % self.frames.len();
     }
 }
 
@@ -56,6 +60,8 @@ pub struct Renderer {
 
     swapchain_loader: swapchain::Device,
     swapchain: SwapchainState,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
 
     command_pool: vk::CommandPool,
     sync: SyncState,
@@ -63,8 +69,7 @@ pub struct Renderer {
     debug_utils_loader: Option<debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
 
-    needs_swapchain_rebuild_fast: bool,
-    needs_swapchain_rebuild_full: bool,
+    needs_swapchain_rebuild: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -84,26 +89,20 @@ impl Renderer {
     pub fn draw(&mut self) {
         unsafe {
             // スケジュール済みSwapchain再作成を実行
-            if self.needs_swapchain_rebuild_full {
-                self.needs_swapchain_rebuild_full = false;
-                self.recreate_swapchain_full();
-                return;
-            }
-
-            if self.needs_swapchain_rebuild_fast {
-                self.needs_swapchain_rebuild_fast = false;
-                self.recreate_swapchain_fast();
+            if self.needs_swapchain_rebuild {
+                self.needs_swapchain_rebuild = false;
+                self.recreate_swapchain();
                 return;
             }
 
             let frame_index = self.sync.current_frame;
-            let fence = self.sync.in_flight_fences[frame_index];
+            let fence = self.sync.frames[frame_index].in_flight_fence;
 
             self.logical_device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .expect("failed to wait for fence");
 
-            let image_available = self.sync.image_available_semaphores[frame_index];
+            let image_available = self.sync.frames[frame_index].image_available;
 
             let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
                 self.swapchain.swapchain,
@@ -114,18 +113,14 @@ impl Renderer {
                 Ok(result) => result,
 
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    log::debug!(
-                        "renderer: acquire_next_image returned OUT_OF_DATE_KHR, scheduling fast rebuild"
-                    );
-                    self.needs_swapchain_rebuild_fast = true;
+                    log::debug!("renderer: acquire_next_image returned OUT_OF_DATE_KHR");
+                    self.schedule_rebuild();
                     return;
                 }
 
                 Err(err) => {
-                    log::error!(
-                        "renderer: failed to acquire swapchain image: {err:?}, scheduling full rebuild"
-                    );
-                    self.needs_swapchain_rebuild_full = true;
+                    log::error!("renderer: failed to acquire swapchain image: {err:?}");
+                    self.schedule_rebuild();
                     return;
                 }
             };
@@ -152,7 +147,7 @@ impl Renderer {
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
                 .expect("failed to reset command buffer");
 
-            self.record_clear_command_buffer(command_buffer, image_index as usize);
+            self.record_draw_command_buffer(command_buffer, image_index as usize);
 
             let render_finished = self.swapchain.render_finished_semaphores[image_index as usize];
 
@@ -186,15 +181,13 @@ impl Renderer {
                 Ok(_suboptimal) => {}
 
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    log::debug!(
-                        "renderer: queue_present returned OUT_OF_DATE_KHR, scheduling fast rebuild"
-                    );
-                    self.needs_swapchain_rebuild_fast = true;
+                    log::debug!("renderer: queue_present returned OUT_OF_DATE_KHR");
+                    self.schedule_rebuild();
                 }
 
                 Err(err) => {
-                    log::error!("renderer: queue_present failed: {err:?}, scheduling full rebuild");
-                    self.needs_swapchain_rebuild_full = true;
+                    log::error!("renderer: queue_present failed: {err:?}");
+                    self.schedule_rebuild();
                 }
             }
 
@@ -202,99 +195,34 @@ impl Renderer {
         }
     }
 
-    /// ウィンドウリサイズ: 高速再作成をスケジュール
+    /// ウィンドウリサイズ: 再作成をスケジュール
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
+        if width != 0 && height != 0 {
+            self.schedule_rebuild();
         }
-
-        self.needs_swapchain_rebuild_fast = true;
     }
 
-    /// PresentMode設定変更: 完全再作成をスケジュール
+    /// PresentMode設定変更: 再作成をスケジュール
     pub fn set_present_mode(&mut self, mode: vk::PresentModeKHR) {
         self.config.preferred_present_mode = Some(mode);
-        log::debug!("renderer: set_present_mode scheduled");
-        self.needs_swapchain_rebuild_full = true;
+        self.schedule_rebuild();
     }
 
-    /// SurfaceFormat設定変更: 完全再作成をスケジュール
+    /// SurfaceFormat設定変更: 再作成をスケジュール
     pub fn set_surface_format(&mut self, format: vk::SurfaceFormatKHR) {
         self.config.preferred_surface_format = Some(format);
-        log::debug!("renderer: set_surface_format scheduled");
-        self.needs_swapchain_rebuild_full = true;
+        self.schedule_rebuild();
     }
 
-    /// 高速再作成（ウィンドウリサイズ用）: 現在のサイズで即座に再作成
-    fn recreate_swapchain_fast(&mut self) {
+    fn recreate_swapchain(&mut self) {
         let size = self.window_ref.inner_size();
 
         if size.width == 0 || size.height == 0 {
-            log::warn!("renderer: fast rebuild skipped (zero window size)");
+            log::warn!("renderer: rebuild skipped (zero window size)");
             return;
         }
 
-        self.wait_for_swapchain_idle();
-
-        unsafe {
-            self.cleanup_swapchain();
-        }
-
-        // 現在のサポート情報をそのまま使用（高速）
-        let (
-            swapchain,
-            swapchain_images,
-            swapchain_image_views,
-            swapchain_format,
-            swapchain_extent,
-        ) = create_swapchain(
-            &self.window_ref,
-            &self.instance,
-            &self.logical_device,
-            self.physical_device,
-            &self.surface_loader,
-            self.surface,
-            &self.swapchain_loader,
-            self.queue_family_indices,
-            self.config.preferred_surface_format,
-            self.config.preferred_present_mode,
-        );
-
-        let image_count = swapchain_images.len();
-
-        self.swapchain = SwapchainState {
-            swapchain,
-            images: swapchain_images,
-            image_views: swapchain_image_views,
-            format: swapchain_format,
-            extent: swapchain_extent,
-            command_buffers: create_command_buffers(
-                &self.logical_device,
-                self.command_pool,
-                image_count as u32,
-            ),
-            image_layouts: vec![vk::ImageLayout::UNDEFINED; image_count],
-            images_in_flight: vec![vk::Fence::null(); image_count],
-            render_finished_semaphores: create_semaphores(&self.logical_device, image_count),
-        };
-
-        log::trace!(
-            "fast recreated swapchain: {}x{}, format: {:?}, present_mode: {:?}",
-            self.swapchain.extent.width,
-            self.swapchain.extent.height,
-            self.swapchain.format,
-            self.config.preferred_present_mode,
-        );
-    }
-
-    /// 完全再作成（query_swapchain_support を再度呼ぶ）: 設定変更やエラー復帰用
-    fn recreate_swapchain_full(&mut self) {
-        let size = self.window_ref.inner_size();
-
-        if size.width == 0 || size.height == 0 {
-            log::warn!("renderer: full rebuild skipped (zero window size)");
-            return;
-        }
+        let old_format = self.swapchain.format;
 
         self.wait_for_swapchain_idle();
 
@@ -321,26 +249,22 @@ impl Renderer {
             self.config.preferred_present_mode,
         );
 
-        let image_count = swapchain_images.len();
+        if swapchain_format != old_format {
+            self.rebuild_pipeline(swapchain_format);
+        }
 
-        self.swapchain = SwapchainState {
+        self.swapchain = create_swapchain_state(
+            &self.logical_device,
+            self.command_pool,
             swapchain,
-            images: swapchain_images,
-            image_views: swapchain_image_views,
-            format: swapchain_format,
-            extent: swapchain_extent,
-            command_buffers: create_command_buffers(
-                &self.logical_device,
-                self.command_pool,
-                image_count as u32,
-            ),
-            image_layouts: vec![vk::ImageLayout::UNDEFINED; image_count],
-            images_in_flight: vec![vk::Fence::null(); image_count],
-            render_finished_semaphores: create_semaphores(&self.logical_device, image_count),
-        };
+            swapchain_images,
+            swapchain_image_views,
+            swapchain_format,
+            swapchain_extent,
+        );
 
         log::trace!(
-            "full recreated swapchain: {}x{}, format: {:?}, present_mode: {:?}",
+            "recreated swapchain: {}x{}, format: {:?}, present_mode: {:?}",
             self.swapchain.extent.width,
             self.swapchain.extent.height,
             self.swapchain.format,
@@ -348,7 +272,11 @@ impl Renderer {
         );
     }
 
-    fn record_clear_command_buffer(
+    fn schedule_rebuild(&mut self) {
+        self.needs_swapchain_rebuild = true;
+    }
+
+    fn record_draw_command_buffer(
         &mut self,
         command_buffer: vk::CommandBuffer,
         image_index: usize,
@@ -362,38 +290,68 @@ impl Renderer {
                 .expect("failed to begin command buffer");
 
             let image = self.swapchain.images[image_index];
+            let old_layout = self.swapchain.image_layouts[image_index];
 
             self.transition_image_layout(
                 command_buffer,
                 image,
-                self.swapchain.image_layouts[image_index],
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                old_layout,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             );
 
-            let clear_color = vk::ClearColorValue {
-                float32: [1.0, 0.0, 1.0, 1.0],
-            };
+            let color_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain.image_views[image_index])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.1, 0.1, 0.1, 1.0],
+                    },
+                });
 
-            let range = vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain.extent,
+                })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&color_attachment));
 
-            self.logical_device.cmd_clear_color_image(
+            self.logical_device
+                .cmd_begin_rendering(command_buffer, &rendering_info);
+
+            self.logical_device.cmd_bind_pipeline(
                 command_buffer,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear_color,
-                &[range],
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
             );
+
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: self.swapchain.extent.width as f32,
+                height: self.swapchain.extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.swapchain.extent,
+            };
+
+            self.logical_device
+                .cmd_set_viewport(command_buffer, 0, &[viewport]);
+            self.logical_device
+                .cmd_set_scissor(command_buffer, 0, &[scissor]);
+            self.logical_device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            self.logical_device.cmd_end_rendering(command_buffer);
 
             self.transition_image_layout(
                 command_buffer,
                 image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
 
@@ -412,37 +370,32 @@ impl Renderer {
         old_layout: vk::ImageLayout,
         new_layout: vk::ImageLayout,
     ) {
-        let (src_access_mask, dst_access_mask, src_stage, dst_stage) =
-            match (old_layout, new_layout) {
-                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                ),
+        let (src_stage, src_access, dst_stage, dst_access) = match (old_layout, new_layout) {
+            (vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            | (vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) => (
+                vk::PipelineStageFlags2::NONE,
+                vk::AccessFlags2::NONE,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            ),
 
-                (vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                ),
+            (vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR) => (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::NONE,
+                vk::AccessFlags2::NONE,
+            ),
 
-                (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR) => (
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::empty(),
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                ),
+            _ => panic!("unsupported layout transition"),
+        };
 
-                _ => panic!("unsupported layout transition"),
-            };
-
-        let barrier = vk::ImageMemoryBarrier::default()
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(src_stage)
+            .src_access_mask(src_access)
+            .dst_stage_mask(dst_stage)
+            .dst_access_mask(dst_access)
             .old_layout(old_layout)
             .new_layout(new_layout)
-            .src_access_mask(src_access_mask)
-            .dst_access_mask(dst_access_mask)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
@@ -454,29 +407,45 @@ impl Renderer {
                 layer_count: 1,
             });
 
+        let dependency =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+
         unsafe {
-            self.logical_device.cmd_pipeline_barrier(
-                command_buffer,
-                src_stage,
-                dst_stage,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
+            self.logical_device
+                .cmd_pipeline_barrier2(command_buffer, &dependency);
         }
     }
 
     fn wait_for_swapchain_idle(&self) {
+        let fences: Vec<vk::Fence> = self
+            .sync
+            .frames
+            .iter()
+            .map(|frame| frame.in_flight_fence)
+            .collect();
+
         unsafe {
             self.logical_device
-                .wait_for_fences(&self.sync.in_flight_fences, true, u64::MAX)
+                .wait_for_fences(&fences, true, u64::MAX)
                 .expect("failed to wait for in-flight fences");
 
             self.logical_device
                 .queue_wait_idle(self.present_queue)
                 .expect("failed to wait present queue idle");
         }
+    }
+
+    fn rebuild_pipeline(&mut self, format: vk::Format) {
+        unsafe {
+            self.logical_device.destroy_pipeline(self.pipeline, None);
+            self.logical_device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+        }
+
+        let (pipeline_layout, pipeline) = create_graphics_pipeline(&self.logical_device, format);
+
+        self.pipeline_layout = pipeline_layout;
+        self.pipeline = pipeline;
     }
 
     unsafe fn cleanup_swapchain(&mut self) {
@@ -503,8 +472,8 @@ impl Renderer {
         };
 
         self.swapchain.images.clear();
-        self.swapchain.image_layouts.clear();
         self.swapchain.images_in_flight.clear();
+        self.swapchain.image_layouts.clear();
     }
 }
 

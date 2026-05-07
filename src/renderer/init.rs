@@ -1,5 +1,6 @@
 use std::{
     ffi::{CStr, CString},
+    io::Cursor,
     os::raw::c_void,
     sync::Arc,
 };
@@ -20,6 +21,8 @@ use crate::{
 
 const WANT_VALIDATION: bool = cfg!(debug_assertions);
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
+const VERT_SPV: &[u8] = include_bytes!("../../shaders/triangle.vert.spv");
+const FRAG_SPV: &[u8] = include_bytes!("../../shaders/triangle.frag.spv");
 
 impl super::Renderer {
     pub fn new(window_ref: Arc<Window>) -> Self {
@@ -84,35 +87,34 @@ impl super::Renderer {
         let command_pool =
             create_command_pool(&logical_device, queue_family_indices.graphics_family);
 
-        let command_buffers =
-            create_command_buffers(&logical_device, command_pool, swapchain_images.len() as u32);
-        log::debug!("renderer init: command pool and buffers ready");
-
         let image_available_semaphores = create_semaphores(&logical_device, MAX_FRAMES_IN_FLIGHT);
-
-        let render_finished_semaphores = create_semaphores(&logical_device, swapchain_images.len());
-
         let in_flight_fences = create_fences(&logical_device, MAX_FRAMES_IN_FLIGHT);
         log::debug!("renderer init: synchronization objects ready");
 
-        let swapchain_image_layouts = vec![vk::ImageLayout::UNDEFINED; swapchain_images.len()];
-        let images_in_flight = vec![vk::Fence::null(); swapchain_images.len()];
+        let (pipeline_layout, pipeline) =
+            create_graphics_pipeline(&logical_device, swapchain_format);
 
-        let swapchain_state = super::SwapchainState {
+        let swapchain_state = create_swapchain_state(
+            &logical_device,
+            command_pool,
             swapchain,
-            images: swapchain_images,
-            image_views: swapchain_image_views,
-            format: swapchain_format,
-            extent: swapchain_extent,
-            command_buffers,
-            image_layouts: swapchain_image_layouts,
-            images_in_flight,
-            render_finished_semaphores,
-        };
+            swapchain_images,
+            swapchain_image_views,
+            swapchain_format,
+            swapchain_extent,
+        );
+
+        let frames = image_available_semaphores
+            .into_iter()
+            .zip(in_flight_fences)
+            .map(|(image_available, in_flight_fence)| super::FrameSync {
+                image_available,
+                in_flight_fence,
+            })
+            .collect();
 
         let sync = super::SyncState {
-            image_available_semaphores,
-            in_flight_fences,
+            frames,
             current_frame: 0,
         };
 
@@ -140,12 +142,13 @@ impl super::Renderer {
             swapchain_loader,
             command_pool,
             swapchain: swapchain_state,
+            pipeline_layout,
+            pipeline,
             sync,
             config: RendererConfig::default(),
             debug_utils_loader,
             debug_messenger,
-            needs_swapchain_rebuild_fast: false,
-            needs_swapchain_rebuild_full: false,
+            needs_swapchain_rebuild: false,
         }
     }
 }
@@ -159,7 +162,7 @@ fn create_instance(entry: &Entry, window: &Window, enable_validation: bool) -> I
         .application_version(vk::make_api_version(0, 0, 1, 0))
         .engine_name(&engine_name)
         .engine_version(vk::make_api_version(0, 0, 1, 0))
-        .api_version(vk::API_VERSION_1_3);
+        .api_version(vk::make_api_version(0, 1, 4, 0));
 
     let display_handle = window
         .display_handle()
@@ -279,11 +282,15 @@ fn create_logical_device(
     let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
 
     let features = vk::PhysicalDeviceFeatures::default();
+    let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
+        .dynamic_rendering(true)
+        .synchronization2(true);
 
     let create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
         .enabled_extension_names(&device_extensions)
-        .enabled_features(&features);
+        .enabled_features(&features)
+        .push_next(&mut features13);
 
     unsafe {
         instance
@@ -421,6 +428,155 @@ pub fn create_command_buffers(
         device
             .allocate_command_buffers(&alloc_info)
             .expect("failed to allocate command buffers")
+    }
+}
+
+pub(super) fn create_swapchain_state(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+    swapchain: vk::SwapchainKHR,
+    images: Vec<vk::Image>,
+    image_views: Vec<vk::ImageView>,
+    format: vk::Format,
+    extent: vk::Extent2D,
+) -> super::SwapchainState {
+    let command_buffers = create_command_buffers(device, command_pool, images.len() as u32);
+    let images_in_flight = vec![vk::Fence::null(); images.len()];
+    let image_layouts = vec![vk::ImageLayout::UNDEFINED; images.len()];
+    let render_finished_semaphores = create_semaphores(device, images.len());
+
+    super::SwapchainState {
+        swapchain,
+        images,
+        image_views,
+        format,
+        extent,
+        command_buffers,
+        image_layouts,
+        images_in_flight,
+        render_finished_semaphores,
+    }
+}
+
+pub(crate) fn create_graphics_pipeline(
+    device: &ash::Device,
+    format: vk::Format,
+) -> (vk::PipelineLayout, vk::Pipeline) {
+    let entry = CString::new("main").unwrap();
+
+    let vert_module = create_shader_module(device, VERT_SPV);
+    let frag_module = create_shader_module(device, FRAG_SPV);
+
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(&entry),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_module)
+            .name(&entry),
+    ];
+
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .primitive_restart_enable(false);
+
+    let viewport = vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+
+    let scissor = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: 1,
+            height: 1,
+        },
+    };
+
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewports(std::slice::from_ref(&viewport))
+        .scissors(std::slice::from_ref(&scissor));
+
+    let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+
+    let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+        .sample_shading_enable(false);
+
+    let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(false);
+
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+        .attachments(std::slice::from_ref(&color_blend_attachment));
+
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+    let layout_info = vk::PipelineLayoutCreateInfo::default();
+
+    let pipeline_layout = unsafe {
+        device
+            .create_pipeline_layout(&layout_info, None)
+            .expect("renderer init: failed to create pipeline layout")
+    };
+
+    let color_formats = [format];
+    let mut rendering_info =
+        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterizer)
+        .multisample_state(&multisampling)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .render_pass(vk::RenderPass::null())
+        .subpass(0)
+        .push_next(&mut rendering_info);
+
+    let pipelines = unsafe {
+        device
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            .expect("renderer init: failed to create graphics pipeline")
+    };
+
+    unsafe {
+        device.destroy_shader_module(vert_module, None);
+        device.destroy_shader_module(frag_module, None);
+    }
+
+    (pipeline_layout, pipelines[0])
+}
+
+fn create_shader_module(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
+    let mut cursor = Cursor::new(bytes);
+    let code = ash::util::read_spv(&mut cursor).expect("renderer init: failed to read shader spv");
+
+    let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
+
+    unsafe {
+        device
+            .create_shader_module(&create_info, None)
+            .expect("renderer init: failed to create shader module")
     }
 }
 
