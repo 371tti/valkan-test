@@ -439,7 +439,7 @@ fn choose_present_mode(present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeK
     present_modes
         .iter()
         .copied()
-        .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
+        .find(|&mode| mode == vk::PresentModeKHR::FIFO) // V-Sync
         .unwrap_or(vk::PresentModeKHR::FIFO)
 }
 
