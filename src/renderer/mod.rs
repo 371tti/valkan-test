@@ -1,19 +1,44 @@
 use std::sync::Arc;
 
 use ash::{
-    Instance,
+    Entry, Instance,
     ext::debug_utils,
     khr::{surface, swapchain},
     vk,
 };
 use winit::window::Window;
 
-use crate::renderer::init::{create_command_buffers, create_swapchain};
+use crate::renderer::init::{create_command_buffers, create_semaphores, create_swapchain};
 
 /// CPUがGPU完了を待たずに先行して準備できるフレーム数(1..4程度が一般的)
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
+struct SwapchainState {
+    swapchain: vk::SwapchainKHR,
+    images: Vec<vk::Image>,
+    image_views: Vec<vk::ImageView>,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    command_buffers: Vec<vk::CommandBuffer>,
+    image_layouts: Vec<vk::ImageLayout>,
+    images_in_flight: Vec<vk::Fence>,
+    render_finished_semaphores: Vec<vk::Semaphore>,
+}
+
+struct SyncState {
+    image_available_semaphores: Vec<vk::Semaphore>,
+    in_flight_fences: Vec<vk::Fence>,
+    current_frame: usize,
+}
+
+impl SyncState {
+    fn advance_frame(&mut self) {
+        self.current_frame = (self.current_frame + 1) % self.in_flight_fences.len();
+    }
+}
+
 pub struct Renderer {
+    _entry: Entry,
     window_ref: Arc<Window>,
 
     config: RendererConfig,
@@ -30,24 +55,10 @@ pub struct Renderer {
     present_queue: vk::Queue,
 
     swapchain_loader: swapchain::Device,
-    swapchain: vk::SwapchainKHR,
-    swapchain_images: Vec<vk::Image>,
-    swapchain_image_views: Vec<vk::ImageView>,
-    swapchain_format: vk::Format,
-    swapchain_extent: vk::Extent2D,
+    swapchain: SwapchainState,
 
     command_pool: vk::CommandPool,
-    command_buffers: Vec<vk::CommandBuffer>,
-
-    /// Swapchain image が描画可能になったことを **GPU** に通知するせまふぉ
-    image_available_semaphores: Vec<vk::Semaphore>,
-    /// 描画が終わったことを **Present(Window)** に通知するせまふぉ
-    render_finished_semaphores: Vec<vk::Semaphore>,
-    /// CPUがGPUに送ったコマンド(フレーム処理)の終了の確認/待ちに使うせまふぉ
-    in_flight_fences: Vec<vk::Fence>,
-    current_frame: usize,
-
-    swapchain_image_layouts: Vec<vk::ImageLayout>,
+    sync: SyncState,
 
     debug_utils_loader: Option<debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
@@ -85,16 +96,17 @@ impl Renderer {
                 return;
             }
 
-            let fence = self.in_flight_fences[self.current_frame];
+            let frame_index = self.sync.current_frame;
+            let fence = self.sync.in_flight_fences[frame_index];
 
             self.logical_device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .expect("failed to wait for fence");
 
-            let image_available = self.image_available_semaphores[self.current_frame];
+            let image_available = self.sync.image_available_semaphores[frame_index];
 
             let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
-                self.swapchain,
+                self.swapchain.swapchain,
                 u64::MAX,
                 image_available,
                 vk::Fence::null(),
@@ -118,11 +130,23 @@ impl Renderer {
                 }
             };
 
+            if self.swapchain.images_in_flight[image_index as usize] != vk::Fence::null() {
+                self.logical_device
+                    .wait_for_fences(
+                        &[self.swapchain.images_in_flight[image_index as usize]],
+                        true,
+                        u64::MAX,
+                    )
+                    .expect("failed to wait for image fence");
+            }
+
+            self.swapchain.images_in_flight[image_index as usize] = fence;
+
             self.logical_device
                 .reset_fences(&[fence])
                 .expect("failed to reset fence");
 
-            let command_buffer = self.command_buffers[image_index as usize];
+            let command_buffer = self.swapchain.command_buffers[image_index as usize];
 
             self.logical_device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
@@ -130,7 +154,7 @@ impl Renderer {
 
             self.record_clear_command_buffer(command_buffer, image_index as usize);
 
-            let render_finished = self.render_finished_semaphores[image_index as usize];
+            let render_finished = self.swapchain.render_finished_semaphores[image_index as usize];
 
             let wait_semaphores = [image_available];
             let signal_semaphores = [render_finished];
@@ -147,7 +171,7 @@ impl Renderer {
                 .queue_submit(self.graphics_queue, &[submit_info], fence)
                 .expect("failed to submit draw command buffer");
 
-            let swapchains = [self.swapchain];
+            let swapchains = [self.swapchain.swapchain];
             let image_indices = [image_index];
 
             let present_info = vk::PresentInfoKHR::default()
@@ -174,7 +198,7 @@ impl Renderer {
                 }
             }
 
-            self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+            self.sync.advance_frame();
         }
     }
 
@@ -210,17 +234,9 @@ impl Renderer {
             return;
         }
 
-        log::debug!(
-            "renderer: fast recreate_swapchain: {}x{}",
-            size.width,
-            size.height
-        );
+        self.wait_for_swapchain_idle();
 
         unsafe {
-            self.logical_device
-                .device_wait_idle()
-                .expect("failed to wait device idle");
-
             self.cleanup_swapchain();
         }
 
@@ -244,19 +260,30 @@ impl Renderer {
             self.config.preferred_present_mode,
         );
 
-        self.swapchain = swapchain;
-        self.swapchain_images = swapchain_images;
-        self.swapchain_image_views = swapchain_image_views;
-        self.swapchain_format = swapchain_format;
-        self.swapchain_extent = swapchain_extent;
+        let image_count = swapchain_images.len();
 
-        self.swapchain_image_layouts =
-            vec![vk::ImageLayout::UNDEFINED; self.swapchain_images.len()];
+        self.swapchain = SwapchainState {
+            swapchain,
+            images: swapchain_images,
+            image_views: swapchain_image_views,
+            format: swapchain_format,
+            extent: swapchain_extent,
+            command_buffers: create_command_buffers(
+                &self.logical_device,
+                self.command_pool,
+                image_count as u32,
+            ),
+            image_layouts: vec![vk::ImageLayout::UNDEFINED; image_count],
+            images_in_flight: vec![vk::Fence::null(); image_count],
+            render_finished_semaphores: create_semaphores(&self.logical_device, image_count),
+        };
 
-        self.command_buffers = create_command_buffers(
-            &self.logical_device,
-            self.command_pool,
-            self.swapchain_images.len() as u32,
+        log::trace!(
+            "fast recreated swapchain: {}x{}, format: {:?}, present_mode: {:?}",
+            self.swapchain.extent.width,
+            self.swapchain.extent.height,
+            self.swapchain.format,
+            self.config.preferred_present_mode,
         );
     }
 
@@ -269,13 +296,9 @@ impl Renderer {
             return;
         }
 
-        log::debug!("renderer: full recreate_swapchain with query_swapchain_support");
+        self.wait_for_swapchain_idle();
 
         unsafe {
-            self.logical_device
-                .device_wait_idle()
-                .expect("failed to wait device idle");
-
             self.cleanup_swapchain();
         }
 
@@ -298,26 +321,29 @@ impl Renderer {
             self.config.preferred_present_mode,
         );
 
-        self.swapchain = swapchain;
-        self.swapchain_images = swapchain_images;
-        self.swapchain_image_views = swapchain_image_views;
-        self.swapchain_format = swapchain_format;
-        self.swapchain_extent = swapchain_extent;
+        let image_count = swapchain_images.len();
 
-        self.swapchain_image_layouts =
-            vec![vk::ImageLayout::UNDEFINED; self.swapchain_images.len()];
+        self.swapchain = SwapchainState {
+            swapchain,
+            images: swapchain_images,
+            image_views: swapchain_image_views,
+            format: swapchain_format,
+            extent: swapchain_extent,
+            command_buffers: create_command_buffers(
+                &self.logical_device,
+                self.command_pool,
+                image_count as u32,
+            ),
+            image_layouts: vec![vk::ImageLayout::UNDEFINED; image_count],
+            images_in_flight: vec![vk::Fence::null(); image_count],
+            render_finished_semaphores: create_semaphores(&self.logical_device, image_count),
+        };
 
-        self.command_buffers = create_command_buffers(
-            &self.logical_device,
-            self.command_pool,
-            self.swapchain_images.len() as u32,
-        );
-
-        log::debug!(
+        log::trace!(
             "full recreated swapchain: {}x{}, format: {:?}, present_mode: {:?}",
-            self.swapchain_extent.width,
-            self.swapchain_extent.height,
-            self.swapchain_format,
+            self.swapchain.extent.width,
+            self.swapchain.extent.height,
+            self.swapchain.format,
             self.config.preferred_present_mode,
         );
     }
@@ -328,18 +354,19 @@ impl Renderer {
         image_index: usize,
     ) {
         unsafe {
-            let begin_info = vk::CommandBufferBeginInfo::default();
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
             self.logical_device
                 .begin_command_buffer(command_buffer, &begin_info)
                 .expect("failed to begin command buffer");
 
-            let image = self.swapchain_images[image_index];
+            let image = self.swapchain.images[image_index];
 
             self.transition_image_layout(
                 command_buffer,
                 image,
-                self.swapchain_image_layouts[image_index],
+                self.swapchain.image_layouts[image_index],
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             );
 
@@ -370,7 +397,7 @@ impl Renderer {
                 vk::ImageLayout::PRESENT_SRC_KHR,
             );
 
-            self.swapchain_image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
+            self.swapchain.image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
 
             self.logical_device
                 .end_command_buffer(command_buffer)
@@ -440,27 +467,44 @@ impl Renderer {
         }
     }
 
+    fn wait_for_swapchain_idle(&self) {
+        unsafe {
+            self.logical_device
+                .wait_for_fences(&self.sync.in_flight_fences, true, u64::MAX)
+                .expect("failed to wait for in-flight fences");
+
+            self.logical_device
+                .queue_wait_idle(self.present_queue)
+                .expect("failed to wait present queue idle");
+        }
+    }
+
     unsafe fn cleanup_swapchain(&mut self) {
-        if !self.command_buffers.is_empty() {
+        if !self.swapchain.command_buffers.is_empty() {
             unsafe {
                 self.logical_device
-                    .free_command_buffers(self.command_pool, &self.command_buffers)
+                    .free_command_buffers(self.command_pool, &self.swapchain.command_buffers)
             };
 
-            self.command_buffers.clear();
+            self.swapchain.command_buffers.clear();
         }
 
-        for image_view in self.swapchain_image_views.drain(..) {
+        for semaphore in self.swapchain.render_finished_semaphores.drain(..) {
+            unsafe { self.logical_device.destroy_semaphore(semaphore, None) };
+        }
+
+        for image_view in self.swapchain.image_views.drain(..) {
             unsafe { self.logical_device.destroy_image_view(image_view, None) };
         }
 
         unsafe {
             self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None)
+                .destroy_swapchain(self.swapchain.swapchain, None)
         };
 
-        self.swapchain_images.clear();
-        self.swapchain_image_layouts.clear();
+        self.swapchain.images.clear();
+        self.swapchain.image_layouts.clear();
+        self.swapchain.images_in_flight.clear();
     }
 }
 

@@ -96,6 +96,25 @@ impl super::Renderer {
         log::debug!("renderer init: synchronization objects ready");
 
         let swapchain_image_layouts = vec![vk::ImageLayout::UNDEFINED; swapchain_images.len()];
+        let images_in_flight = vec![vk::Fence::null(); swapchain_images.len()];
+
+        let swapchain_state = super::SwapchainState {
+            swapchain,
+            images: swapchain_images,
+            image_views: swapchain_image_views,
+            format: swapchain_format,
+            extent: swapchain_extent,
+            command_buffers,
+            image_layouts: swapchain_image_layouts,
+            images_in_flight,
+            render_finished_semaphores,
+        };
+
+        let sync = super::SyncState {
+            image_available_semaphores,
+            in_flight_fences,
+            current_frame: 0,
+        };
 
         let (debug_utils_loader, debug_messenger) = if validation_enabled {
             let loader = debug_utils::Instance::new(&entry, &instance);
@@ -108,6 +127,7 @@ impl super::Renderer {
         };
 
         Self {
+            _entry: entry,
             window_ref,
             instance,
             surface_loader,
@@ -118,18 +138,9 @@ impl super::Renderer {
             graphics_queue,
             present_queue,
             swapchain_loader,
-            swapchain,
-            swapchain_images,
-            swapchain_image_views,
-            swapchain_format,
-            swapchain_extent,
             command_pool,
-            command_buffers,
-            image_available_semaphores,
-            render_finished_semaphores,
-            in_flight_fences,
-            current_frame: 0,
-            swapchain_image_layouts,
+            swapchain: swapchain_state,
+            sync,
             config: RendererConfig::default(),
             debug_utils_loader,
             debug_messenger,
@@ -600,7 +611,7 @@ fn debug_messenger_create_info() -> vk::DebugUtilsMessengerCreateInfoEXT<'static
         .pfn_user_callback(Some(vulkan_debug_callback))
 }
 
-fn create_semaphores(device: &ash::Device, count: usize) -> Vec<vk::Semaphore> {
+pub(crate) fn create_semaphores(device: &ash::Device, count: usize) -> Vec<vk::Semaphore> {
     let info = vk::SemaphoreCreateInfo::default();
 
     (0..count)

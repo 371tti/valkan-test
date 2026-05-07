@@ -3,25 +3,17 @@ impl Drop for super::Renderer {
         unsafe {
             let _ = self.logical_device.device_wait_idle();
 
-            for semaphore in self.image_available_semaphores.drain(..) {
+            for semaphore in self.sync.image_available_semaphores.drain(..) {
                 self.logical_device.destroy_semaphore(semaphore, None);
             }
 
-            for semaphore in self.render_finished_semaphores.drain(..) {
-                self.logical_device.destroy_semaphore(semaphore, None);
-            }
-
-            for fence in self.in_flight_fences.drain(..) {
+            for fence in self.sync.in_flight_fences.drain(..) {
                 self.logical_device.destroy_fence(fence, None);
             }
 
+            self.cleanup_swapchain();
+
             self.logical_device.destroy_command_pool(self.command_pool, None);
-
-            for image_view in self.swapchain_image_views.drain(..) {
-                self.logical_device.destroy_image_view(image_view, None);
-            }
-
-            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
 
             self.logical_device.destroy_device(None);
 

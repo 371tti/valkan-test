@@ -1,10 +1,11 @@
 use valkan_test::app::App;
 use winit::event_loop::EventLoop;
 
-
-
 fn main() {
-    env_logger::init_from_env(env_logger::Env::default().filter_or("LOG_LEVEL", "trace"));
+    #[cfg(debug_assertions)]
+    {
+        env_logger::init_from_env(env_logger::Env::default().filter_or("LOG_LEVEL", "trace"));
+    }
 
     let event_loop = EventLoop::new().unwrap();
 
