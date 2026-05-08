@@ -12,11 +12,18 @@ impl Drop for super::Renderer {
 
             self.cleanup_swapchain();
 
-            self.logical_device.destroy_pipeline(self.pipeline, None);
-            self.logical_device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.assets.destroy(&self.logical_device);
 
-            self.logical_device.destroy_command_pool(self.command_pool, None);
+            for slot in &mut self.pipelines {
+                slot.pipeline.destroy(&self.logical_device);
+            }
+
+            self.scene_bindings.destroy(&self.logical_device);
+            self.logical_device
+                .destroy_pipeline_cache(self.pipeline_cache, None);
+
+            self.logical_device
+                .destroy_command_pool(self.command_pool, None);
 
             self.logical_device.destroy_device(None);
 

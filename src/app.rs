@@ -1,18 +1,19 @@
 //! windowの作成とAppのイベント処理、また最上位構造体の定義をしてるよ
-//! 
+//!
 //! んぺ＾＾
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::WindowEvent,
+    event::{ElementState, WindowEvent},
     event_loop::ActiveEventLoop,
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes},
 };
 
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, SceneContext, SceneController, SceneKey, SceneMessage};
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
@@ -31,18 +32,32 @@ pub struct WindowConfig {
 pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    scene: Box<dyn SceneController>,
+    started_at: Instant,
+    last_frame_at: Instant,
+    frame: u64,
 
     // 作成前の設定
     config: WindowConfig,
 }
 
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    pub fn new(scene: impl SceneController + 'static) -> Self {
+        let now = Instant::now();
+
         Self {
             window: None,
             renderer: None,
+            scene: Box::new(scene),
+            started_at: now,
+            last_frame_at: now,
+            frame: 0,
             config: WindowConfig::default(),
         }
+    }
+
+    pub fn send_message(&mut self, message: SceneMessage) {
+        self.scene.on_message(message);
     }
 }
 
@@ -145,6 +160,45 @@ impl App {
             window.set_min_inner_size(None::<PhysicalSize<u32>>);
         }
     }
+
+    fn render(&mut self) {
+        if self.renderer.is_none() {
+            return;
+        }
+
+        let now = Instant::now();
+        let size = self
+            .window
+            .as_ref()
+            .map(|window| window.inner_size())
+            .unwrap_or(self.config.size_px);
+        let context = SceneContext {
+            elapsed: now.duration_since(self.started_at).as_secs_f32(),
+            delta_time: now.duration_since(self.last_frame_at).as_secs_f32(),
+            frame: self.frame,
+            window_size: [size.width, size.height],
+        };
+
+        self.last_frame_at = now;
+        self.frame += 1;
+        self.scene.on_message(SceneMessage::RedrawRequested);
+
+        let scene = self.scene.scene(context);
+        if let Some(renderer) = &mut self.renderer {
+            renderer.draw(&scene);
+        }
+    }
+
+    fn scene_key(physical_key: PhysicalKey) -> SceneKey {
+        match physical_key {
+            PhysicalKey::Code(KeyCode::Space) => SceneKey::Space,
+            PhysicalKey::Code(KeyCode::ArrowUp) => SceneKey::ArrowUp,
+            PhysicalKey::Code(KeyCode::ArrowDown) => SceneKey::ArrowDown,
+            PhysicalKey::Code(KeyCode::ArrowLeft) => SceneKey::ArrowLeft,
+            PhysicalKey::Code(KeyCode::ArrowRight) => SceneKey::ArrowRight,
+            _ => SceneKey::Other,
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -171,10 +225,15 @@ impl ApplicationHandler for App {
 
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
-        let renderer = Renderer::new(Arc::clone(&window));
-        
+        let mut renderer = Renderer::new(Arc::clone(&window));
+        let size = window.inner_size();
+        self.scene.on_renderer_ready(&mut renderer);
+
         self.renderer = Some(renderer);
         self.window = Some(window);
+        self.scene.on_message(SceneMessage::Started {
+            window_size: [size.width, size.height],
+        });
     }
 
     /// 文字通りイベントを受け取るやつ
@@ -186,19 +245,25 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
+                self.scene.on_message(SceneMessage::CloseRequested);
                 event_loop.exit();
             }
 
             // フレームの描画が必要なときに呼び出される
             // 描画処理を実際に呼ばれてからするとは限らないと思っておいた方が良いかもしれない(くどい)
             WindowEvent::RedrawRequested => {
-                if let Some(ref mut renderer) = self.renderer {
-                    renderer.draw();
-                }
+                self.render();
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.scene.on_message(SceneMessage::Keyboard {
+                    key: Self::scene_key(event.physical_key),
+                    pressed: event.state == ElementState::Pressed,
+                });
             }
 
             // ウィンドウのサイズが変更されたときに呼び出される
-            // ValkanではSwapchain Imageのサイズ変更が必要なためここでいじいじしないと 
+            // ValkanではSwapchain Imageのサイズ変更が必要なためここでいじいじしないと
             // Window resized
             //   ↓
             // old swapchain is no longer suitable
@@ -213,10 +278,14 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 // ここで renderer.resize(size.width, size.height) を呼ぶ予定
                 log::debug!("window resized: {}x{}", size.width, size.height);
+                self.scene.on_message(SceneMessage::Resized {
+                    width: size.width,
+                    height: size.height,
+                });
                 if let Some(ref mut renderer) = self.renderer {
                     renderer.resize(size.width, size.height);
-                    renderer.draw();
                 }
+                self.render();
             }
 
             _ => {}

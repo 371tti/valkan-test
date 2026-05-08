@@ -1,20 +1,33 @@
 #version 450
 
-vec2 positions[3] = vec2[](
-    vec2( 0.0, -0.5),
-    vec2( 0.5,  0.5),
-    vec2(-0.5,  0.5)
-);
+layout(location = 0) in vec3 in_position;
+layout(location = 1) in vec3 in_normal;
+layout(location = 2) in vec2 in_uv;
 
-vec3 colors[3] = vec3[](
-    vec3(1.0, 0.0, 0.0),
-    vec3(0.0, 1.0, 0.0),
-    vec3(0.0, 0.0, 1.0)
-);
+layout(set = 0, binding = 0) uniform Scene {
+    mat4 view_proj;
+    vec4 light_dir;
+    vec4 light_color;
+    vec4 ambient;
+    vec4 camera_pos;
+} scene;
 
-layout(location = 0) out vec3 frag_color;
+layout(push_constant) uniform Object {
+    mat4 model;
+    vec4 base_color;
+} object;
+
+layout(location = 0) out vec3 frag_normal;
+layout(location = 1) out vec2 frag_uv;
+layout(location = 2) out vec3 frag_world_pos;
+layout(location = 3) out vec4 frag_base_color;
 
 void main() {
-    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-    frag_color = colors[gl_VertexIndex];
+    vec4 world_pos = object.model * vec4(in_position, 1.0);
+
+    gl_Position = scene.view_proj * world_pos;
+    frag_normal = mat3(object.model) * in_normal;
+    frag_uv = in_uv;
+    frag_world_pos = world_pos.xyz;
+    frag_base_color = object.base_color;
 }
