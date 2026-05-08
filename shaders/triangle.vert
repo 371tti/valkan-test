@@ -15,6 +15,10 @@ layout(set = 0, binding = 0) uniform Scene {
 layout(push_constant) uniform Object {
     mat4 model;
     vec4 base_color;
+    vec4 emissive_color;
+    vec4 material;
+    vec4 texture_flags;
+    vec4 texture_info;
 } object;
 
 layout(location = 0) out vec3 frag_normal;

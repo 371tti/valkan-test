@@ -18,7 +18,7 @@ use winit::window::Window;
 use crate::{
     APP_NAME, ENGINE_NAME,
     renderer::{
-        DepthConfig, HotReload, MAX_FRAMES_IN_FLIGHT, ModelVertex, PipelineDesc,
+        ColorBlendConfig, DepthConfig, HotReload, MAX_FRAMES_IN_FLIGHT, ModelVertex, PipelineDesc,
         QueueFamilyIndices, RendererConfig, ShaderSet, create_pipeline_cache,
     },
 };
@@ -130,7 +130,11 @@ impl super::Renderer {
             FRAG_SPV,
         ))
         .with_vertex_layout(ModelVertex::layout())
-        .with_layout(vec![scene_bindings.layout], push_constants)
+        .with_layout(
+            vec![scene_bindings.layout, assets.texture_set_layout()],
+            push_constants,
+        )
+        .with_color_blend(ColorBlendConfig::alpha())
         .with_depth(DepthConfig::default());
         let hot_reload = HotReload::new(&pipeline_desc.shaders, Duration::from_millis(250));
         let pipeline = pipeline_desc

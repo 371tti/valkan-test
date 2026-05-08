@@ -161,6 +161,10 @@ impl App {
         }
     }
 
+    fn is_drawable_size(size: PhysicalSize<u32>) -> bool {
+        size.width > 0 && size.height > 0
+    }
+
     fn render(&mut self) {
         if self.renderer.is_none() {
             return;
@@ -172,9 +176,19 @@ impl App {
             .as_ref()
             .map(|window| window.inner_size())
             .unwrap_or(self.config.size_px);
+
+        if !Self::is_drawable_size(size) {
+            self.last_frame_at = now;
+            return;
+        }
+
+        let delta_time = now
+            .duration_since(self.last_frame_at)
+            .as_secs_f32()
+            .min(1.0 / 15.0);
         let context = SceneContext {
             elapsed: now.duration_since(self.started_at).as_secs_f32(),
-            delta_time: now.duration_since(self.last_frame_at).as_secs_f32(),
+            delta_time,
             frame: self.frame,
             window_size: [size.width, size.height],
         };
@@ -196,6 +210,12 @@ impl App {
             PhysicalKey::Code(KeyCode::ArrowDown) => SceneKey::ArrowDown,
             PhysicalKey::Code(KeyCode::ArrowLeft) => SceneKey::ArrowLeft,
             PhysicalKey::Code(KeyCode::ArrowRight) => SceneKey::ArrowRight,
+            PhysicalKey::Code(KeyCode::KeyW) => SceneKey::KeyW,
+            PhysicalKey::Code(KeyCode::KeyA) => SceneKey::KeyA,
+            PhysicalKey::Code(KeyCode::KeyS) => SceneKey::KeyS,
+            PhysicalKey::Code(KeyCode::KeyD) => SceneKey::KeyD,
+            PhysicalKey::Code(KeyCode::KeyQ) => SceneKey::KeyQ,
+            PhysicalKey::Code(KeyCode::KeyE) => SceneKey::KeyE,
             _ => SceneKey::Other,
         }
     }
@@ -285,7 +305,11 @@ impl ApplicationHandler for App {
                 if let Some(ref mut renderer) = self.renderer {
                     renderer.resize(size.width, size.height);
                 }
-                self.render();
+                if Self::is_drawable_size(size) {
+                    self.render();
+                } else {
+                    self.last_frame_at = Instant::now();
+                }
             }
 
             _ => {}
@@ -296,7 +320,9 @@ impl ApplicationHandler for App {
     // ここで新しいeventがくるまで待機できる
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
-            window.request_redraw();
+            if Self::is_drawable_size(window.inner_size()) {
+                window.request_redraw();
+            }
         }
     }
 }

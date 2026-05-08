@@ -366,6 +366,11 @@ impl PipelineDesc {
         self
     }
 
+    pub fn with_color_blend(mut self, color_blend: ColorBlendConfig) -> Self {
+        self.color_blend = color_blend;
+        self
+    }
+
     pub fn build(
         &self,
         device: &ash::Device,

@@ -1,4 +1,4 @@
-use std::{mem, sync::Arc};
+use std::{mem, path::Path, sync::Arc};
 
 use ash::{
     Entry, Instance,
@@ -21,11 +21,13 @@ pub use pipeline::{
     PipelineError, RasterizationConfig, ShaderCode, ShaderSet, VertexAttribute, VertexLayout,
     create_pipeline_cache,
 };
-pub use resource::{CpuMesh, CpuModel, CpuPrimitive};
+pub use resource::{
+    CpuMesh, CpuModel, CpuPrimitive, CpuTexture, TextureFilter, TextureSampler, TextureWrap,
+};
 pub use scene::{
     Camera, DirectionalLight, Material, MaterialId, MeshId, ModelId, PipelineId, RenderModel,
-    RenderObject, RenderScene, SceneContext, SceneController, SceneKey, SceneMessage, Transform,
-    mat4_mul,
+    RenderObject, RenderScene, SceneContext, SceneController, SceneKey, SceneMessage, TextureId,
+    Transform, mat4_mul,
 };
 
 /// CPUがGPU完了を待たずに先行して準備できるフレーム数(1..4程度が一般的)
@@ -123,10 +125,59 @@ impl Default for SceneUniform {
 struct ObjectPush {
     model: [f32; 16],
     base_color: [f32; 4],
+    emissive_color: [f32; 4],
+    material: [f32; 4],
+    texture_flags: [f32; 4],
+    texture_info: [f32; 4],
 }
 
 fn bytes_of<T>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), mem::size_of::<T>()) }
+}
+
+fn has_texture(texture: Option<TextureId>) -> f32 {
+    texture.is_some() as u8 as f32
+}
+
+fn material_texture_slot_count(material: Material) -> usize {
+    [
+        material.base_color_texture,
+        material.metallic_roughness_texture,
+        material.normal_texture,
+        material.occlusion_texture,
+        material.emissive_texture,
+    ]
+    .into_iter()
+    .filter(Option::is_some)
+    .count()
+}
+
+fn log_model_stats(path: &Path, model: &CpuModel) {
+    let texture_slots = model
+        .primitives
+        .iter()
+        .map(|primitive| material_texture_slot_count(primitive.material))
+        .sum::<usize>();
+
+    log::info!(
+        "renderer: loaded model '{}': primitives={}, textures={}, material_texture_slots={}",
+        path.display(),
+        model.primitives.len(),
+        model.textures.len(),
+        texture_slots
+    );
+
+    if model.textures.is_empty() {
+        log::warn!(
+            "renderer: model '{}' has no image textures; only material factors will be drawn",
+            path.display()
+        );
+    } else if texture_slots == 0 {
+        log::warn!(
+            "renderer: model '{}' contains textures but no material texture references",
+            path.display()
+        );
+    }
 }
 
 fn draw_object(
@@ -138,6 +189,7 @@ fn draw_object(
     frame_index: usize,
     object: RenderObject,
     bound_pipeline: &mut Option<PipelineId>,
+    bound_material: &mut Option<MaterialId>,
 ) {
     let Some(slot) = pipelines.get(object.pipeline.0) else {
         return;
@@ -162,11 +214,51 @@ fn draw_object(
                 &[],
             );
             *bound_pipeline = Some(object.pipeline);
+            *bound_material = None;
+        }
+
+        let material = assets.material(object.material);
+        if *bound_material != Some(object.material) {
+            if let Some(texture_set) = assets.material_texture_set(object.material) {
+                device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    slot.pipeline.layout,
+                    1,
+                    std::slice::from_ref(&texture_set),
+                    &[],
+                );
+                *bound_material = Some(object.material);
+            }
         }
 
         let push = ObjectPush {
             model: object.transform.matrix(),
-            base_color: assets.material(object.material).base_color,
+            base_color: material.base_color,
+            emissive_color: [
+                material.emissive_color[0],
+                material.emissive_color[1],
+                material.emissive_color[2],
+                0.0,
+            ],
+            material: [
+                material.metallic,
+                material.roughness,
+                material.specular,
+                material.ambient_occlusion,
+            ],
+            texture_flags: [
+                has_texture(material.base_color_texture),
+                has_texture(material.metallic_roughness_texture),
+                has_texture(material.normal_texture),
+                has_texture(material.occlusion_texture),
+            ],
+            texture_info: [
+                has_texture(material.emissive_texture),
+                material.normal_scale,
+                material.occlusion_strength,
+                material.alpha_cutoff,
+            ],
         };
         device.cmd_push_constants(
             command_buffer,
@@ -228,8 +320,17 @@ pub struct QueueFamilyIndices {
 }
 
 impl Renderer {
+    fn has_drawable_extent(&self) -> bool {
+        let size = self.window_ref.inner_size();
+        size.width > 0 && size.height > 0
+    }
+
     /// 描画 高速パス: スケジュール済み再作成をここで実行してからreturn
     pub fn draw(&mut self, scene: &RenderScene) {
+        if !self.has_drawable_extent() {
+            return;
+        }
+
         unsafe {
             // スケジュール済みSwapchain再作成を実行
             if self.needs_swapchain_rebuild {
@@ -353,9 +454,11 @@ impl Renderer {
 
     /// ウィンドウリサイズ: 再作成をスケジュール
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width != 0 && height != 0 {
-            self.schedule_rebuild();
+        if width == 0 || height == 0 {
+            return;
         }
+
+        self.schedule_rebuild();
     }
 
     /// PresentMode設定変更: 再作成をスケジュール
@@ -382,7 +485,18 @@ impl Renderer {
     }
 
     pub fn upload_material(&mut self, material: Material) -> MaterialId {
-        self.assets.upload_material(material)
+        self.assets.upload_material(&self.logical_device, material)
+    }
+
+    pub fn upload_texture(&mut self, texture: &CpuTexture) -> TextureId {
+        self.assets.upload_texture(
+            &self.instance,
+            &self.logical_device,
+            self.physical_device,
+            self.command_pool,
+            self.graphics_queue,
+            texture,
+        )
     }
 
     pub fn upload_model(&mut self, model: &CpuModel) -> ModelId {
@@ -397,7 +511,19 @@ impl Renderer {
     }
 
     pub fn load_obj(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<ModelId> {
-        Ok(self.upload_model(&CpuModel::load_obj(path)?))
+        let path = path.as_ref();
+        let model = CpuModel::load_obj(path)?;
+        log_model_stats(path, &model);
+
+        Ok(self.upload_model(&model))
+    }
+
+    pub fn load_model(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<ModelId> {
+        let path = path.as_ref();
+        let model = CpuModel::load(path)?;
+        log_model_stats(path, &model);
+
+        Ok(self.upload_model(&model))
     }
 
     pub fn register_pipeline(&mut self, desc: PipelineDesc) -> Result<PipelineId, PipelineError> {
@@ -426,7 +552,7 @@ impl Renderer {
         let size = self.window_ref.inner_size();
 
         if size.width == 0 || size.height == 0 {
-            log::warn!("renderer: rebuild skipped (zero window size)");
+            log::debug!("renderer: rebuild postponed (zero window size)");
             return;
         }
 
@@ -568,6 +694,7 @@ impl Renderer {
                 .cmd_set_scissor(command_buffer, 0, &[scissor]);
 
             let mut bound_pipeline = None;
+            let mut bound_material = None;
 
             for object in &scene.objects {
                 draw_object(
@@ -579,6 +706,7 @@ impl Renderer {
                     frame_index,
                     *object,
                     &mut bound_pipeline,
+                    &mut bound_material,
                 );
             }
 
@@ -602,6 +730,7 @@ impl Renderer {
                             material: primitive.material,
                         },
                         &mut bound_pipeline,
+                        &mut bound_material,
                     );
                 }
             }
