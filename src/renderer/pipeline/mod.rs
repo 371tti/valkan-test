@@ -257,7 +257,7 @@ impl Default for RasterizationConfig {
     fn default() -> Self {
         Self {
             polygon_mode: vk::PolygonMode::FILL,
-            cull_mode: vk::CullModeFlags::NONE,
+            cull_mode: vk::CullModeFlags::BACK,
             front_face: vk::FrontFace::COUNTER_CLOCKWISE,
             line_width: 1.0,
         }
@@ -368,6 +368,11 @@ impl PipelineDesc {
 
     pub fn with_color_blend(mut self, color_blend: ColorBlendConfig) -> Self {
         self.color_blend = color_blend;
+        self
+    }
+
+    pub fn with_rasterization(mut self, rasterization: RasterizationConfig) -> Self {
+        self.rasterization = rasterization;
         self
     }
 
@@ -641,5 +646,18 @@ pub fn create_pipeline_cache(device: &ash::Device) -> vk::PipelineCache {
         device
             .create_pipeline_cache(&info, None)
             .expect("renderer init: failed to create pipeline cache")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_rasterization_culls_back_faces() {
+        let rasterization = RasterizationConfig::default();
+
+        assert_eq!(rasterization.cull_mode, vk::CullModeFlags::BACK);
+        assert_eq!(rasterization.front_face, vk::FrontFace::COUNTER_CLOCKWISE);
     }
 }

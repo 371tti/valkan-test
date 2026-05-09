@@ -1,19 +1,21 @@
-//! windowの作成とAppのイベント処理、また最上位構造体の定義をしてるよ
+//! Window/event-loop integration.
 //!
-//! んぺ＾＾
+//! `App` owns the OS window, forwards input to the active scene, and asks the
+//! renderer to draw each frame.
+
+mod input;
 
 use std::{sync::Arc, time::Instant};
 
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{ElementState, WindowEvent},
+    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::ActiveEventLoop,
-    keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowAttributes},
+    window::{CursorGrabMode, Window, WindowAttributes},
 };
 
-use crate::renderer::{Renderer, SceneContext, SceneController, SceneKey, SceneMessage};
+use crate::renderer::{Renderer, SceneContext, SceneController, SceneMessage};
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
@@ -36,8 +38,8 @@ pub struct App {
     started_at: Instant,
     last_frame_at: Instant,
     frame: u64,
+    mouse_captured: bool,
 
-    // 作成前の設定
     config: WindowConfig,
 }
 
@@ -52,6 +54,7 @@ impl App {
             started_at: now,
             last_frame_at: now,
             frame: 0,
+            mouse_captured: false,
             config: WindowConfig::default(),
         }
     }
@@ -115,9 +118,10 @@ impl App {
         }
     }
 
-    // 成功したら新しいサイズを返す、失敗したら現在のサイズを返す
-    //
-    // request_inner_size は「要求」なので、実際に変更されたサイズは WindowEvent::Resized で見る。
+    /// Requests a new inner size and returns the best known size immediately.
+    ///
+    /// `request_inner_size` is asynchronous on some platforms; the authoritative
+    /// value still arrives through `WindowEvent::Resized`.
     pub fn req_window_size(&self, width: u32, height: u32) -> PhysicalSize<u32> {
         if let Some(window) = &self.window {
             if let Some(size) = window.request_inner_size(PhysicalSize::new(width, height)) {
@@ -130,7 +134,6 @@ impl App {
         self.config.size_px
     }
 
-    // 固定サイズにしたからといってResizeイベントが来ないわけではないぞー
     pub fn set_window_resizable(&self, resizable: bool) {
         if let Some(window) = &self.window {
             window.set_resizable(resizable);
@@ -203,27 +206,36 @@ impl App {
         }
     }
 
-    fn scene_key(physical_key: PhysicalKey) -> SceneKey {
-        match physical_key {
-            PhysicalKey::Code(KeyCode::Space) => SceneKey::Space,
-            PhysicalKey::Code(KeyCode::ArrowUp) => SceneKey::ArrowUp,
-            PhysicalKey::Code(KeyCode::ArrowDown) => SceneKey::ArrowDown,
-            PhysicalKey::Code(KeyCode::ArrowLeft) => SceneKey::ArrowLeft,
-            PhysicalKey::Code(KeyCode::ArrowRight) => SceneKey::ArrowRight,
-            PhysicalKey::Code(KeyCode::KeyW) => SceneKey::KeyW,
-            PhysicalKey::Code(KeyCode::KeyA) => SceneKey::KeyA,
-            PhysicalKey::Code(KeyCode::KeyS) => SceneKey::KeyS,
-            PhysicalKey::Code(KeyCode::KeyD) => SceneKey::KeyD,
-            PhysicalKey::Code(KeyCode::KeyQ) => SceneKey::KeyQ,
-            PhysicalKey::Code(KeyCode::KeyE) => SceneKey::KeyE,
-            _ => SceneKey::Other,
+    fn set_mouse_captured(&mut self, captured: bool) {
+        let Some(window) = &self.window else {
+            self.mouse_captured = captured;
+            return;
+        };
+
+        if captured {
+            let grab_result = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            if let Err(err) = grab_result {
+                log::warn!("failed to grab cursor: {err}");
+                self.mouse_captured = false;
+                window.set_cursor_visible(true);
+                return;
+            }
+        } else if let Err(err) = window.set_cursor_grab(CursorGrabMode::None) {
+            log::warn!("failed to release cursor: {err}");
         }
+
+        self.mouse_captured = captured;
+        window.set_cursor_visible(!captured);
     }
 }
 
 impl ApplicationHandler for App {
-    /// windowが作成可能になったときに呼び出される
-    /// Valkan surface の作成はwindow作成後に行う必要があるためこれが終わってからSurfaceを作成するんだろなと
+    /// Called once the event loop can create a native window.
+    ///
+    /// Vulkan surface creation depends on the native window handles, so renderer
+    /// initialization starts here instead of in `App::new`.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -251,12 +263,13 @@ impl ApplicationHandler for App {
 
         self.renderer = Some(renderer);
         self.window = Some(window);
+        self.set_mouse_captured(true);
         self.scene.on_message(SceneMessage::Started {
             window_size: [size.width, size.height],
         });
     }
 
-    /// 文字通りイベントを受け取るやつ
+    /// Routes window events into scene messages and renderer lifecycle calls.
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -269,34 +282,38 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
 
-            // フレームの描画が必要なときに呼び出される
-            // 描画処理を実際に呼ばれてからするとは限らないと思っておいた方が良いかもしれない(くどい)
             WindowEvent::RedrawRequested => {
                 self.render();
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                if input::is_escape(event.physical_key) && event.state == ElementState::Pressed {
+                    self.set_mouse_captured(false);
+                }
+
                 self.scene.on_message(SceneMessage::Keyboard {
-                    key: Self::scene_key(event.physical_key),
+                    key: input::scene_key(event.physical_key),
                     pressed: event.state == ElementState::Pressed,
                 });
             }
 
-            // ウィンドウのサイズが変更されたときに呼び出される
-            // ValkanではSwapchain Imageのサイズ変更が必要なためここでいじいじしないと
-            // Window resized
-            //   ↓
-            // old swapchain is no longer suitable
-            //   ↓
-            // wait device idle or synchronize
-            //   ↓
-            // destroy old image views / swapchain
-            //   ↓
-            // create new swapchain
-            //   ↓
-            // continue rendering
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => self.set_mouse_captured(true),
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let delta = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (position.y as f32 / 32.0).clamp(-4.0, 4.0)
+                    }
+                };
+                self.scene.on_message(SceneMessage::MouseWheel { delta });
+            }
+
             WindowEvent::Resized(size) => {
-                // ここで renderer.resize(size.width, size.height) を呼ぶ予定
                 log::debug!("window resized: {}x{}", size.width, size.height);
                 self.scene.on_message(SceneMessage::Resized {
                     width: size.width,
@@ -316,8 +333,23 @@ impl ApplicationHandler for App {
         }
     }
 
-    // 待ち ブロッキング
-    // ここで新しいeventがくるまで待機できる
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if !self.mouse_captured {
+            return;
+        }
+
+        if let DeviceEvent::MouseMotion { delta } = event {
+            self.scene.on_message(SceneMessage::MouseMotion {
+                delta: [delta.0 as f32, delta.1 as f32],
+            });
+        }
+    }
+
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
             if Self::is_drawable_size(window.inner_size()) {

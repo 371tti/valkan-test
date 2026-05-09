@@ -1,4 +1,4 @@
-use std::{mem, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use ash::{
     Entry, Instance,
@@ -9,29 +9,44 @@ use ash::{
 use winit::window::Window;
 
 use crate::renderer::init::{create_swapchain, create_swapchain_state};
-use resource::{DepthTarget, GpuAssets, SceneBindings};
+use crate::renderer::math::probe_binding_index;
+use crate::renderer::uniforms::SceneUniform;
+use assets::{DepthTarget, GpuAssets, PlanarReflectionTarget, ReflectionProbe, SceneBindings};
 
+mod assets;
+#[path = "passes/draw.rs"]
+mod draw;
+#[path = "lifecycle/drop.rs"]
 mod drop;
+#[path = "lifecycle/init.rs"]
 mod init;
+mod math;
 mod pipeline;
-mod resource;
+#[path = "passes/reflections.rs"]
+mod reflections;
 mod scene;
+mod uniforms;
+pub use assets::{
+    CpuMesh, CpuModel, CpuPrimitive, CpuTexture, TextureFilter, TextureSampler, TextureWrap,
+};
 pub use pipeline::{
     ColorBlendConfig, DepthConfig, GraphicsPipeline, HotReload, ModelVertex, PipelineDesc,
     PipelineError, RasterizationConfig, ShaderCode, ShaderSet, VertexAttribute, VertexLayout,
     create_pipeline_cache,
 };
-pub use resource::{
-    CpuMesh, CpuModel, CpuPrimitive, CpuTexture, TextureFilter, TextureSampler, TextureWrap,
-};
 pub use scene::{
-    Camera, DirectionalLight, Material, MaterialId, MeshId, ModelId, PipelineId, RenderModel,
-    RenderObject, RenderScene, SceneContext, SceneController, SceneKey, SceneMessage, TextureId,
-    Transform, mat4_mul,
+    BoxReflectionSettings, Camera, DirectionalLight, Material, MaterialId, MeshId, ModelId,
+    PipelineId, PlanarReflectionSettings, ReflectionSettings, RenderModel, RenderObject,
+    RenderScene, SceneContext, SceneController, SceneKey, SceneMessage, TextureId, Transform,
+    mat4_mul,
 };
 
 /// CPUがGPU完了を待たずに先行して準備できるフレーム数(1..4程度が一般的)
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const MAX_EMISSIVE_LIGHTS: usize = 8;
+const REFLECTION_PROBE_SIZE: u32 = 256;
+const PLANAR_REFLECTION_MIN_SIZE: u32 = 64;
+const PLANAR_REFLECTION_MAX_SIZE: u32 = 4096;
 
 struct SwapchainState {
     swapchain: vk::SwapchainKHR,
@@ -66,77 +81,6 @@ struct PipelineSlot {
     desc: PipelineDesc,
     pipeline: GraphicsPipeline,
     hot_reload: HotReload,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SceneUniform {
-    view_proj: [f32; 16],
-    light_dir: [f32; 4],
-    light_color: [f32; 4],
-    ambient: [f32; 4],
-    camera_pos: [f32; 4],
-}
-
-impl SceneUniform {
-    fn new(scene: &RenderScene, extent: vk::Extent2D) -> Self {
-        let aspect = extent.width as f32 / extent.height.max(1) as f32;
-        let light = scene.light;
-
-        Self {
-            view_proj: scene.camera.view_projection(aspect),
-            light_dir: [
-                light.direction[0],
-                light.direction[1],
-                light.direction[2],
-                0.0,
-            ],
-            light_color: [
-                light.color[0] * light.intensity,
-                light.color[1] * light.intensity,
-                light.color[2] * light.intensity,
-                0.0,
-            ],
-            ambient: [light.ambient[0], light.ambient[1], light.ambient[2], 0.0],
-            camera_pos: [
-                scene.camera.eye[0],
-                scene.camera.eye[1],
-                scene.camera.eye[2],
-                1.0,
-            ],
-        }
-    }
-}
-
-impl Default for SceneUniform {
-    fn default() -> Self {
-        Self::new(
-            &RenderScene::default(),
-            vk::Extent2D {
-                width: 1,
-                height: 1,
-            },
-        )
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ObjectPush {
-    model: [f32; 16],
-    base_color: [f32; 4],
-    emissive_color: [f32; 4],
-    material: [f32; 4],
-    texture_flags: [f32; 4],
-    texture_info: [f32; 4],
-}
-
-fn bytes_of<T>(value: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), mem::size_of::<T>()) }
-}
-
-fn has_texture(texture: Option<TextureId>) -> f32 {
-    texture.is_some() as u8 as f32
 }
 
 fn material_texture_slot_count(material: Material) -> usize {
@@ -180,100 +124,6 @@ fn log_model_stats(path: &Path, model: &CpuModel) {
     }
 }
 
-fn draw_object(
-    device: &ash::Device,
-    pipelines: &[PipelineSlot],
-    assets: &GpuAssets,
-    scene_bindings: &SceneBindings,
-    command_buffer: vk::CommandBuffer,
-    frame_index: usize,
-    object: RenderObject,
-    bound_pipeline: &mut Option<PipelineId>,
-    bound_material: &mut Option<MaterialId>,
-) {
-    let Some(slot) = pipelines.get(object.pipeline.0) else {
-        return;
-    };
-    let Some(mesh) = assets.mesh(object.mesh) else {
-        return;
-    };
-
-    unsafe {
-        if *bound_pipeline != Some(object.pipeline) {
-            device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                slot.pipeline.handle,
-            );
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                slot.pipeline.layout,
-                0,
-                std::slice::from_ref(&scene_bindings.sets[frame_index]),
-                &[],
-            );
-            *bound_pipeline = Some(object.pipeline);
-            *bound_material = None;
-        }
-
-        let material = assets.material(object.material);
-        if *bound_material != Some(object.material) {
-            if let Some(texture_set) = assets.material_texture_set(object.material) {
-                device.cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    slot.pipeline.layout,
-                    1,
-                    std::slice::from_ref(&texture_set),
-                    &[],
-                );
-                *bound_material = Some(object.material);
-            }
-        }
-
-        let push = ObjectPush {
-            model: object.transform.matrix(),
-            base_color: material.base_color,
-            emissive_color: [
-                material.emissive_color[0],
-                material.emissive_color[1],
-                material.emissive_color[2],
-                0.0,
-            ],
-            material: [
-                material.metallic,
-                material.roughness,
-                material.specular,
-                material.ambient_occlusion,
-            ],
-            texture_flags: [
-                has_texture(material.base_color_texture),
-                has_texture(material.metallic_roughness_texture),
-                has_texture(material.normal_texture),
-                has_texture(material.occlusion_texture),
-            ],
-            texture_info: [
-                has_texture(material.emissive_texture),
-                material.normal_scale,
-                material.occlusion_strength,
-                material.alpha_cutoff,
-            ],
-        };
-        device.cmd_push_constants(
-            command_buffer,
-            slot.pipeline.layout,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-            0,
-            bytes_of(&push),
-        );
-
-        device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex.buffer], &[0]);
-        device.cmd_bind_index_buffer(command_buffer, mesh.index.buffer, 0, vk::IndexType::UINT32);
-        device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
-    }
-}
-
 pub struct Renderer {
     _entry: Entry,
     window_ref: Arc<Window>,
@@ -295,6 +145,12 @@ pub struct Renderer {
     swapchain: SwapchainState,
     pipeline_cache: vk::PipelineCache,
     scene_bindings: SceneBindings,
+    probe_scene_bindings: SceneBindings,
+    planar_scene_bindings: SceneBindings,
+    reflection_probe: ReflectionProbe,
+    fallback_reflection_probe: ReflectionProbe,
+    planar_reflection: PlanarReflectionTarget,
+    fallback_planar_reflection: PlanarReflectionTarget,
     assets: GpuAssets,
     pipelines: Vec<PipelineSlot>,
 
@@ -325,7 +181,7 @@ impl Renderer {
         size.width > 0 && size.height > 0
     }
 
-    /// 描画 高速パス: スケジュール済み再作成をここで実行してからreturn
+    /// Draws one frame and performs any scheduled swapchain rebuild first.
     pub fn draw(&mut self, scene: &RenderScene) {
         if !self.has_drawable_extent() {
             return;
@@ -348,10 +204,32 @@ impl Renderer {
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .expect("failed to wait for fence");
 
+            self.ensure_reflection_targets(scene);
+
+            let reflections = self.prepare_reflections(scene);
+            for face in 0..ReflectionProbe::FACE_COUNT {
+                let binding_index = probe_binding_index(frame_index, face);
+                self.probe_scene_bindings.update(
+                    &self.logical_device,
+                    binding_index,
+                    &SceneUniform::reflection_probe_face(scene, &self.assets, reflections, face),
+                );
+            }
+            self.planar_scene_bindings.update(
+                &self.logical_device,
+                frame_index,
+                &SceneUniform::planar_reflection(
+                    scene,
+                    self.planar_reflection.extent,
+                    &self.assets,
+                    reflections,
+                ),
+            );
+
             self.scene_bindings.update(
                 &self.logical_device,
                 frame_index,
-                &SceneUniform::new(scene, self.swapchain.extent),
+                &SceneUniform::new(scene, self.swapchain.extent, &self.assets, reflections),
             );
 
             let image_available = self.sync.frames[frame_index].image_available;
@@ -404,6 +282,7 @@ impl Renderer {
                 image_index as usize,
                 frame_index,
                 scene,
+                reflections,
             );
 
             let render_finished = self.swapchain.render_finished_semaphores[image_index as usize];
@@ -584,6 +463,53 @@ impl Renderer {
         );
 
         if swapchain_format != old_format {
+            unsafe { self.reflection_probe.destroy(&self.logical_device) };
+            unsafe { self.fallback_reflection_probe.destroy(&self.logical_device) };
+            unsafe { self.planar_reflection.destroy(&self.logical_device) };
+            unsafe {
+                self.fallback_planar_reflection
+                    .destroy(&self.logical_device)
+            };
+            self.reflection_probe = ReflectionProbe::new(
+                &self.instance,
+                &self.logical_device,
+                self.physical_device,
+                self.command_pool,
+                self.graphics_queue,
+                swapchain_format,
+                REFLECTION_PROBE_SIZE,
+            );
+            self.fallback_reflection_probe = ReflectionProbe::new(
+                &self.instance,
+                &self.logical_device,
+                self.physical_device,
+                self.command_pool,
+                self.graphics_queue,
+                swapchain_format,
+                1,
+            );
+            self.planar_reflection = PlanarReflectionTarget::new(
+                &self.instance,
+                &self.logical_device,
+                self.physical_device,
+                self.command_pool,
+                self.graphics_queue,
+                swapchain_format,
+                self.planar_reflection.extent,
+            );
+            self.fallback_planar_reflection = PlanarReflectionTarget::new(
+                &self.instance,
+                &self.logical_device,
+                self.physical_device,
+                self.command_pool,
+                self.graphics_queue,
+                swapchain_format,
+                vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+            );
+            self.update_reflection_descriptors();
             self.rebuild_pipelines(swapchain_format)
                 .expect("renderer: failed to rebuild pipelines for swapchain format");
         }
@@ -614,149 +540,23 @@ impl Renderer {
         self.needs_swapchain_rebuild = true;
     }
 
-    fn record_draw_command_buffer(
-        &mut self,
-        command_buffer: vk::CommandBuffer,
-        image_index: usize,
-        frame_index: usize,
-        scene: &RenderScene,
-    ) {
-        unsafe {
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-            self.logical_device
-                .begin_command_buffer(command_buffer, &begin_info)
-                .expect("failed to begin command buffer");
-
-            let image = self.swapchain.images[image_index];
-            let old_layout = self.swapchain.image_layouts[image_index];
-
-            self.transition_image_layout(
-                command_buffer,
-                image,
-                old_layout,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            );
-
-            let color_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(self.swapchain.image_views[image_index])
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 0.0],
-                    },
-                });
-
-            let depth_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(self.swapchain.depth.view)
-                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                });
-
-            let rendering_info = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.swapchain.extent,
-                })
-                .layer_count(1)
-                .color_attachments(std::slice::from_ref(&color_attachment))
-                .depth_attachment(&depth_attachment);
-
-            self.logical_device
-                .cmd_begin_rendering(command_buffer, &rendering_info);
-
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: self.swapchain.extent.width as f32,
-                height: self.swapchain.extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: self.swapchain.extent,
-            };
-
-            self.logical_device
-                .cmd_set_viewport(command_buffer, 0, &[viewport]);
-            self.logical_device
-                .cmd_set_scissor(command_buffer, 0, &[scissor]);
-
-            let mut bound_pipeline = None;
-            let mut bound_material = None;
-
-            for object in &scene.objects {
-                draw_object(
-                    &self.logical_device,
-                    &self.pipelines,
-                    &self.assets,
-                    &self.scene_bindings,
-                    command_buffer,
-                    frame_index,
-                    *object,
-                    &mut bound_pipeline,
-                    &mut bound_material,
-                );
-            }
-
-            for model in &scene.models {
-                let Some(gpu_model) = self.assets.model(model.model) else {
-                    continue;
-                };
-
-                for primitive in &gpu_model.primitives {
-                    draw_object(
-                        &self.logical_device,
-                        &self.pipelines,
-                        &self.assets,
-                        &self.scene_bindings,
-                        command_buffer,
-                        frame_index,
-                        RenderObject {
-                            mesh: primitive.mesh,
-                            pipeline: model.pipeline,
-                            transform: model.transform,
-                            material: primitive.material,
-                        },
-                        &mut bound_pipeline,
-                        &mut bound_material,
-                    );
-                }
-            }
-            self.logical_device.cmd_end_rendering(command_buffer);
-
-            self.transition_image_layout(
-                command_buffer,
-                image,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-            );
-
-            self.swapchain.image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
-
-            self.logical_device
-                .end_command_buffer(command_buffer)
-                .expect("failed to end command buffer");
-        }
-    }
-
     fn transition_image_layout(
         &self,
         command_buffer: vk::CommandBuffer,
         image: vk::Image,
         old_layout: vk::ImageLayout,
         new_layout: vk::ImageLayout,
+    ) {
+        self.transition_color_image_layout(command_buffer, image, old_layout, new_layout, 1);
+    }
+
+    fn transition_color_image_layout(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        image: vk::Image,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        layer_count: u32,
     ) {
         let (src_stage, src_access, dst_stage, dst_access) = match (old_layout, new_layout) {
             (vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -772,6 +572,26 @@ impl Renderer {
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags2::NONE,
                 vk::AccessFlags2::NONE,
+            ),
+
+            (
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            ) => (
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            ),
+
+            (
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ) => (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
             ),
 
             _ => panic!("unsupported layout transition"),
@@ -792,7 +612,7 @@ impl Renderer {
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count,
             });
 
         let dependency =

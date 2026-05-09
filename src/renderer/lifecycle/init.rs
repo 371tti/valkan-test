@@ -19,19 +19,21 @@ use crate::{
     APP_NAME, ENGINE_NAME,
     renderer::{
         ColorBlendConfig, DepthConfig, HotReload, MAX_FRAMES_IN_FLIGHT, ModelVertex, PipelineDesc,
-        QueueFamilyIndices, RendererConfig, ShaderSet, create_pipeline_cache,
+        QueueFamilyIndices, REFLECTION_PROBE_SIZE, RendererConfig, ShaderSet,
+        create_pipeline_cache,
     },
 };
 
 use super::{
-    ObjectPush, PipelineSlot, SceneUniform,
-    resource::{GpuAssets, SceneBindings},
+    PipelineSlot,
+    assets::{GpuAssets, PlanarReflectionTarget, ReflectionProbe, SceneBindings},
+    uniforms::{ObjectPush, SceneUniform},
 };
 
 const WANT_VALIDATION: bool = cfg!(debug_assertions);
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
-const VERT_SPV: &[u8] = include_bytes!("../../shaders/triangle.vert.spv");
-const FRAG_SPV: &[u8] = include_bytes!("../../shaders/triangle.frag.spv");
+const VERT_SPV: &[u8] = include_bytes!("../../../shaders/triangle.vert.spv");
+const FRAG_SPV: &[u8] = include_bytes!("../../../shaders/triangle.frag.spv");
 const VERT_SPV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/triangle.vert.spv");
 const FRAG_SPV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/triangle.frag.spv");
 
@@ -98,11 +100,79 @@ impl super::Renderer {
         let command_pool =
             create_command_pool(&logical_device, queue_family_indices.graphics_family);
         let pipeline_cache = create_pipeline_cache(&logical_device);
+        let reflection_probe = ReflectionProbe::new(
+            &instance,
+            &logical_device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            swapchain_format,
+            REFLECTION_PROBE_SIZE,
+        );
+        let fallback_reflection_probe = ReflectionProbe::new(
+            &instance,
+            &logical_device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            swapchain_format,
+            1,
+        );
+        let planar_reflection_extent = vk::Extent2D {
+            width: (swapchain_extent.width / 2).max(1),
+            height: (swapchain_extent.height / 2).max(1),
+        };
+        let planar_reflection = PlanarReflectionTarget::new(
+            &instance,
+            &logical_device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            swapchain_format,
+            planar_reflection_extent,
+        );
+        let fallback_planar_reflection = PlanarReflectionTarget::new(
+            &instance,
+            &logical_device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            swapchain_format,
+            vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+        );
         let scene_bindings = SceneBindings::new(
             &instance,
             &logical_device,
             physical_device,
             &SceneUniform::default(),
+            reflection_probe.descriptor(),
+            planar_reflection.descriptor(),
+        );
+        let probe_binding_count = ReflectionProbe::FACE_COUNT * MAX_FRAMES_IN_FLIGHT;
+        let probe_scene_bindings = SceneBindings::with_layout(
+            &instance,
+            &logical_device,
+            physical_device,
+            &SceneUniform::default(),
+            fallback_reflection_probe.descriptor(),
+            fallback_planar_reflection.descriptor(),
+            scene_bindings.layout,
+            probe_binding_count,
+            false,
+        );
+        let planar_scene_bindings = SceneBindings::with_layout(
+            &instance,
+            &logical_device,
+            physical_device,
+            &SceneUniform::default(),
+            fallback_reflection_probe.descriptor(),
+            fallback_planar_reflection.descriptor(),
+            scene_bindings.layout,
+            MAX_FRAMES_IN_FLIGHT,
+            false,
         );
         let assets = GpuAssets::new(
             &instance,
@@ -134,17 +204,38 @@ impl super::Renderer {
             vec![scene_bindings.layout, assets.texture_set_layout()],
             push_constants,
         )
-        .with_color_blend(ColorBlendConfig::alpha())
+        .with_color_blend(ColorBlendConfig::default())
         .with_depth(DepthConfig::default());
+        let transparent_pipeline_desc = pipeline_desc
+            .clone()
+            .with_color_blend(ColorBlendConfig::alpha())
+            .with_depth(DepthConfig {
+                write: false,
+                ..DepthConfig::default()
+            });
         let hot_reload = HotReload::new(&pipeline_desc.shaders, Duration::from_millis(250));
         let pipeline = pipeline_desc
             .build(&logical_device, pipeline_cache, swapchain_format)
             .expect("renderer init: failed to create graphics pipeline");
-        let pipelines = vec![PipelineSlot {
-            desc: pipeline_desc,
-            pipeline,
-            hot_reload,
-        }];
+        let transparent_hot_reload = HotReload::new(
+            &transparent_pipeline_desc.shaders,
+            Duration::from_millis(250),
+        );
+        let transparent_pipeline = transparent_pipeline_desc
+            .build(&logical_device, pipeline_cache, swapchain_format)
+            .expect("renderer init: failed to create transparent graphics pipeline");
+        let pipelines = vec![
+            PipelineSlot {
+                desc: pipeline_desc,
+                pipeline,
+                hot_reload,
+            },
+            PipelineSlot {
+                desc: transparent_pipeline_desc,
+                pipeline: transparent_pipeline,
+                hot_reload: transparent_hot_reload,
+            },
+        ];
 
         let swapchain_state = create_swapchain_state(
             &instance,
@@ -199,6 +290,12 @@ impl super::Renderer {
             swapchain: swapchain_state,
             pipeline_cache,
             scene_bindings,
+            probe_scene_bindings,
+            planar_scene_bindings,
+            reflection_probe,
+            fallback_reflection_probe,
+            planar_reflection,
+            fallback_planar_reflection,
             assets,
             pipelines,
             sync,
@@ -504,7 +601,7 @@ pub(crate) fn create_swapchain_state(
     let images_in_flight = vec![vk::Fence::null(); images.len()];
     let image_layouts = vec![vk::ImageLayout::UNDEFINED; images.len()];
     let render_finished_semaphores = create_semaphores(device, images.len());
-    let depth = super::resource::DepthTarget::new(
+    let depth = super::assets::DepthTarget::new(
         instance,
         device,
         physical_device,

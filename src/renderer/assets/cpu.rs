@@ -1,12 +1,10 @@
 use std::{
     collections::HashMap,
-    fs, io, mem,
+    fs, io,
     path::{Path, PathBuf},
 };
 
-use ash::{Instance, vk};
-
-use super::{MAX_FRAMES_IN_FLIGHT, Material, MaterialId, MeshId, ModelId, ModelVertex, TextureId};
+use crate::renderer::{Material, ModelVertex, TextureId};
 
 #[derive(Debug, Clone)]
 pub struct CpuMesh {
@@ -65,7 +63,7 @@ pub struct CpuTexture {
 }
 
 impl CpuTexture {
-    fn white() -> Self {
+    pub(in crate::renderer) fn white() -> Self {
         Self {
             pixels: vec![255, 255, 255, 255],
             width: 1,
@@ -75,7 +73,7 @@ impl CpuTexture {
         }
     }
 
-    fn flat_normal() -> Self {
+    pub(in crate::renderer) fn flat_normal() -> Self {
         Self {
             pixels: vec![128, 128, 255, 255],
             width: 1,
@@ -84,6 +82,35 @@ impl CpuTexture {
             srgb: false,
         }
     }
+
+    fn alpha_usage(&self) -> TextureAlphaUsage {
+        let mut has_transparent = false;
+        let mut has_partial = false;
+
+        for pixel in self.pixels.chunks_exact(4) {
+            match pixel[3] {
+                255 => {}
+                0 => has_transparent = true,
+                _ => {
+                    has_transparent = true;
+                    has_partial = true;
+                }
+            }
+        }
+
+        match (has_transparent, has_partial) {
+            (false, _) => TextureAlphaUsage::Opaque,
+            (true, false) => TextureAlphaUsage::Cutout,
+            (true, true) => TextureAlphaUsage::Blend,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextureAlphaUsage {
+    Opaque,
+    Cutout,
+    Blend,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -401,7 +428,12 @@ fn load_gltf_primitive(
 }
 
 fn material_from_gltf(material: gltf::Material<'_>, textures: &mut [CpuTexture]) -> Material {
+    if material.index().is_none() {
+        return Material::default();
+    }
+
     let pbr = material.pbr_metallic_roughness();
+    let alpha_blend = matches!(material.alpha_mode(), gltf::material::AlphaMode::Blend);
     let alpha_cutoff = match material.alpha_mode() {
         gltf::material::AlphaMode::Mask => material.alpha_cutoff().unwrap_or(0.5),
         _ => 0.0,
@@ -422,10 +454,12 @@ fn material_from_gltf(material: gltf::Material<'_>, textures: &mut [CpuTexture])
         .with_metallic(pbr.metallic_factor())
         .with_roughness(pbr.roughness_factor())
         .with_emissive(material.emissive_factor())
-        .with_alpha_cutoff(alpha_cutoff);
+        .with_alpha_cutoff(alpha_cutoff)
+        .with_alpha_blend(alpha_blend);
 
     if let Some(texture) = base_color_texture {
         material = material.with_base_color_texture(texture);
+        material = infer_base_color_alpha(material, texture, textures);
     }
     if let Some(texture) = metallic_roughness_texture {
         mark_texture_linear(textures, texture);
@@ -451,6 +485,22 @@ fn material_from_gltf(material: gltf::Material<'_>, textures: &mut [CpuTexture])
 fn mark_texture_linear(textures: &mut [CpuTexture], texture: TextureId) {
     if let Some(texture) = textures.get_mut(texture.0) {
         texture.srgb = false;
+    }
+}
+
+fn infer_base_color_alpha(
+    material: Material,
+    texture: TextureId,
+    textures: &[CpuTexture],
+) -> Material {
+    if material.alpha_blend || material.alpha_cutoff > f32::EPSILON {
+        return material;
+    }
+
+    match textures.get(texture.0).map(CpuTexture::alpha_usage) {
+        Some(TextureAlphaUsage::Cutout) => material.with_alpha_cutoff(0.5),
+        Some(TextureAlphaUsage::Blend) => material.with_alpha_blend(true),
+        Some(TextureAlphaUsage::Opaque) | None => material,
     }
 }
 
@@ -787,1177 +837,6 @@ impl MeshBuilder {
     }
 }
 
-pub(super) struct MeshBuffers {
-    pub vertex: GpuBuffer,
-    pub index: GpuBuffer,
-    pub index_count: u32,
-}
-
-impl MeshBuffers {
-    pub fn from_mesh(
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        mesh: &CpuMesh,
-    ) -> Self {
-        Self {
-            vertex: GpuBuffer::device_local(
-                instance,
-                device,
-                physical_device,
-                command_pool,
-                queue,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-                &mesh.vertices,
-            ),
-            index: GpuBuffer::device_local(
-                instance,
-                device,
-                physical_device,
-                command_pool,
-                queue,
-                vk::BufferUsageFlags::INDEX_BUFFER,
-                &mesh.indices,
-            ),
-            index_count: mesh.indices.len() as u32,
-        }
-    }
-
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        unsafe {
-            self.vertex.destroy(device);
-            self.index.destroy(device);
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct GpuPrimitive {
-    pub mesh: MeshId,
-    pub material: MaterialId,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct GpuModel {
-    pub primitives: Vec<GpuPrimitive>,
-}
-
-pub(super) struct GpuTexture {
-    view: vk::ImageView,
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    sampler: vk::Sampler,
-}
-
-impl GpuTexture {
-    fn from_texture(
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        texture: &CpuTexture,
-    ) -> Self {
-        let size = texture.pixels.len() as vk::DeviceSize;
-        let mut staging = GpuBuffer::new(
-            instance,
-            device,
-            physical_device,
-            size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
-
-        unsafe { staging.write_slice(device, &texture.pixels) };
-
-        let (image, memory) = create_texture_image(
-            instance,
-            device,
-            physical_device,
-            texture.width,
-            texture.height,
-            texture.srgb,
-        );
-        transition_texture_image(
-            device,
-            command_pool,
-            queue,
-            image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        );
-        copy_buffer_to_image(
-            device,
-            command_pool,
-            queue,
-            staging.buffer,
-            image,
-            texture.width,
-            texture.height,
-        );
-        transition_texture_image(
-            device,
-            command_pool,
-            queue,
-            image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        );
-
-        unsafe { staging.destroy(device) };
-
-        let view = create_texture_view(device, image, texture.srgb);
-        let sampler = create_texture_sampler(device, texture.sampler);
-
-        Self {
-            view,
-            image,
-            memory,
-            sampler,
-        }
-    }
-
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        if self.sampler != vk::Sampler::null() {
-            unsafe { device.destroy_sampler(self.sampler, None) };
-            self.sampler = vk::Sampler::null();
-        }
-
-        if self.view != vk::ImageView::null() {
-            unsafe { device.destroy_image_view(self.view, None) };
-            self.view = vk::ImageView::null();
-        }
-
-        if self.image != vk::Image::null() {
-            unsafe { device.destroy_image(self.image, None) };
-            self.image = vk::Image::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
-        }
-    }
-}
-
-struct GpuMaterial {
-    material: Material,
-    texture_set: vk::DescriptorSet,
-}
-
-pub(super) struct GpuAssets {
-    meshes: Vec<MeshBuffers>,
-    materials: Vec<GpuMaterial>,
-    textures: Vec<GpuTexture>,
-    models: Vec<GpuModel>,
-    texture_layout: vk::DescriptorSetLayout,
-    texture_pool: vk::DescriptorPool,
-}
-
-impl GpuAssets {
-    pub fn new(
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-    ) -> Self {
-        let texture_layout = create_texture_set_layout(device);
-        let texture_pool = create_texture_descriptor_pool(device);
-        let mut assets = Self {
-            meshes: Vec::new(),
-            materials: Vec::new(),
-            textures: Vec::new(),
-            models: Vec::new(),
-            texture_layout,
-            texture_pool,
-        };
-        assets.upload_texture(
-            instance,
-            device,
-            physical_device,
-            command_pool,
-            queue,
-            &CpuTexture::white(),
-        );
-        assets.upload_texture(
-            instance,
-            device,
-            physical_device,
-            command_pool,
-            queue,
-            &CpuTexture::flat_normal(),
-        );
-        assets.upload_material(device, Material::default());
-        assets.upload_model(
-            instance,
-            device,
-            physical_device,
-            command_pool,
-            queue,
-            &CpuModel::cube(),
-        );
-        assets
-    }
-
-    pub fn upload_mesh(
-        &mut self,
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        mesh: &CpuMesh,
-    ) -> MeshId {
-        self.meshes.push(MeshBuffers::from_mesh(
-            instance,
-            device,
-            physical_device,
-            command_pool,
-            queue,
-            mesh,
-        ));
-        MeshId(self.meshes.len() - 1)
-    }
-
-    pub fn upload_material(&mut self, device: &ash::Device, material: Material) -> MaterialId {
-        let texture_set = allocate_texture_set(
-            device,
-            self.texture_layout,
-            self.texture_pool,
-            &self.textures,
-            material,
-        );
-        self.materials.push(GpuMaterial {
-            material,
-            texture_set,
-        });
-        MaterialId(self.materials.len() - 1)
-    }
-
-    pub fn upload_texture(
-        &mut self,
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        texture: &CpuTexture,
-    ) -> TextureId {
-        self.textures.push(GpuTexture::from_texture(
-            instance,
-            device,
-            physical_device,
-            command_pool,
-            queue,
-            texture,
-        ));
-        TextureId(self.textures.len() - 1)
-    }
-
-    pub fn upload_model(
-        &mut self,
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        model: &CpuModel,
-    ) -> ModelId {
-        let textures = model
-            .textures
-            .iter()
-            .map(|texture| {
-                self.upload_texture(
-                    instance,
-                    device,
-                    physical_device,
-                    command_pool,
-                    queue,
-                    texture,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let primitives = model
-            .primitives
-            .iter()
-            .map(|primitive| {
-                let mut material = primitive.material;
-                material.base_color_texture = material
-                    .base_color_texture
-                    .and_then(|texture| textures.get(texture.0).copied());
-                material.metallic_roughness_texture = material
-                    .metallic_roughness_texture
-                    .and_then(|texture| textures.get(texture.0).copied());
-                material.normal_texture = material
-                    .normal_texture
-                    .and_then(|texture| textures.get(texture.0).copied());
-                material.occlusion_texture = material
-                    .occlusion_texture
-                    .and_then(|texture| textures.get(texture.0).copied());
-                material.emissive_texture = material
-                    .emissive_texture
-                    .and_then(|texture| textures.get(texture.0).copied());
-
-                GpuPrimitive {
-                    mesh: self.upload_mesh(
-                        instance,
-                        device,
-                        physical_device,
-                        command_pool,
-                        queue,
-                        &primitive.mesh,
-                    ),
-                    material: self.upload_material(device, material),
-                }
-            })
-            .collect();
-
-        self.models.push(GpuModel { primitives });
-        ModelId(self.models.len() - 1)
-    }
-
-    pub fn mesh(&self, id: MeshId) -> Option<&MeshBuffers> {
-        self.meshes.get(id.0)
-    }
-
-    pub fn material(&self, id: MaterialId) -> Material {
-        self.materials
-            .get(id.0)
-            .map(|material| material.material)
-            .unwrap_or_default()
-    }
-
-    pub fn model(&self, id: ModelId) -> Option<&GpuModel> {
-        self.models.get(id.0)
-    }
-
-    pub fn material_texture_set(&self, id: MaterialId) -> Option<vk::DescriptorSet> {
-        self.materials
-            .get(id.0)
-            .map(|material| material.texture_set)
-    }
-
-    pub fn texture_set_layout(&self) -> vk::DescriptorSetLayout {
-        self.texture_layout
-    }
-
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        for mesh in &mut self.meshes {
-            unsafe { mesh.destroy(device) };
-        }
-
-        for texture in &mut self.textures {
-            unsafe { texture.destroy(device) };
-        }
-
-        if self.texture_pool != vk::DescriptorPool::null() {
-            unsafe { device.destroy_descriptor_pool(self.texture_pool, None) };
-            self.texture_pool = vk::DescriptorPool::null();
-        }
-
-        if self.texture_layout != vk::DescriptorSetLayout::null() {
-            unsafe { device.destroy_descriptor_set_layout(self.texture_layout, None) };
-            self.texture_layout = vk::DescriptorSetLayout::null();
-        }
-    }
-}
-
-pub(super) struct GpuBuffer {
-    pub buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-}
-
-impl GpuBuffer {
-    pub fn host_uniform<T: Copy>(
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        value: &T,
-    ) -> Self {
-        let mut buffer = Self::new(
-            instance,
-            device,
-            physical_device,
-            mem::size_of::<T>() as vk::DeviceSize,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
-
-        unsafe { buffer.write(device, value) };
-        buffer
-    }
-
-    pub fn device_local<T: Copy>(
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        usage: vk::BufferUsageFlags,
-        data: &[T],
-    ) -> Self {
-        let size = mem::size_of_val(data) as vk::DeviceSize;
-        let mut staging = Self::new(
-            instance,
-            device,
-            physical_device,
-            size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
-
-        unsafe { staging.write_slice(device, data) };
-
-        let buffer = Self::new(
-            instance,
-            device,
-            physical_device,
-            size,
-            usage | vk::BufferUsageFlags::TRANSFER_DST,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-
-        copy_buffer(
-            device,
-            command_pool,
-            queue,
-            staging.buffer,
-            buffer.buffer,
-            size,
-        );
-
-        unsafe { staging.destroy(device) };
-        buffer
-    }
-
-    fn new(
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        size: vk::DeviceSize,
-        usage: vk::BufferUsageFlags,
-        properties: vk::MemoryPropertyFlags,
-    ) -> Self {
-        let info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let buffer = unsafe {
-            device
-                .create_buffer(&info, None)
-                .expect("renderer: failed to create buffer")
-        };
-
-        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let memory_type = find_memory_type(
-            instance,
-            physical_device,
-            requirements.memory_type_bits,
-            properties,
-        );
-
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc, None)
-                .expect("renderer: failed to allocate buffer memory")
-        };
-
-        unsafe {
-            device
-                .bind_buffer_memory(buffer, memory, 0)
-                .expect("renderer: failed to bind buffer memory")
-        };
-
-        Self { buffer, memory }
-    }
-
-    pub unsafe fn write<T: Copy>(&mut self, device: &ash::Device, data: &T) {
-        let size = mem::size_of::<T>() as vk::DeviceSize;
-        let mapped = unsafe {
-            device
-                .map_memory(self.memory, 0, size, vk::MemoryMapFlags::empty())
-                .expect("renderer: failed to map buffer memory")
-        };
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (data as *const T).cast::<u8>(),
-                mapped.cast::<u8>(),
-                size as usize,
-            );
-            device.unmap_memory(self.memory);
-        }
-    }
-
-    unsafe fn write_slice<T: Copy>(&mut self, device: &ash::Device, data: &[T]) {
-        let size = mem::size_of_val(data) as vk::DeviceSize;
-        let mapped = unsafe {
-            device
-                .map_memory(self.memory, 0, size, vk::MemoryMapFlags::empty())
-                .expect("renderer: failed to map buffer memory")
-        };
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr().cast::<u8>(),
-                mapped.cast::<u8>(),
-                size as usize,
-            );
-            device.unmap_memory(self.memory);
-        }
-    }
-
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        if self.buffer != vk::Buffer::null() {
-            unsafe { device.destroy_buffer(self.buffer, None) };
-            self.buffer = vk::Buffer::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
-        }
-    }
-}
-
-pub(super) struct SceneBindings {
-    pub layout: vk::DescriptorSetLayout,
-    pub sets: Vec<vk::DescriptorSet>,
-    pool: vk::DescriptorPool,
-    buffers: Vec<GpuBuffer>,
-    range: vk::DeviceSize,
-}
-
-impl SceneBindings {
-    pub fn new<T: Copy>(
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        initial: &T,
-    ) -> Self {
-        let binding = vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
-
-        let layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
-
-        let layout = unsafe {
-            device
-                .create_descriptor_set_layout(&layout_info, None)
-                .expect("renderer: failed to create scene descriptor layout")
-        };
-
-        let pool_size = vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
-        };
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(MAX_FRAMES_IN_FLIGHT as u32)
-            .pool_sizes(std::slice::from_ref(&pool_size));
-
-        let pool = unsafe {
-            device
-                .create_descriptor_pool(&pool_info, None)
-                .expect("renderer: failed to create scene descriptor pool")
-        };
-
-        let layouts = vec![layout; MAX_FRAMES_IN_FLIGHT];
-        let alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(pool)
-            .set_layouts(&layouts);
-        let sets = unsafe {
-            device
-                .allocate_descriptor_sets(&alloc)
-                .expect("renderer: failed to allocate scene descriptor sets")
-        };
-
-        let range = mem::size_of::<T>() as vk::DeviceSize;
-        let buffers = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| GpuBuffer::host_uniform(instance, device, physical_device, initial))
-            .collect::<Vec<_>>();
-
-        for (set, buffer) in sets.iter().zip(&buffers) {
-            let info = vk::DescriptorBufferInfo::default()
-                .buffer(buffer.buffer)
-                .range(range);
-            let write = vk::WriteDescriptorSet::default()
-                .dst_set(*set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(std::slice::from_ref(&info));
-
-            unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
-        }
-
-        Self {
-            layout,
-            sets,
-            pool,
-            buffers,
-            range,
-        }
-    }
-
-    pub fn update<T: Copy>(&mut self, device: &ash::Device, frame_index: usize, value: &T) {
-        debug_assert_eq!(self.range, mem::size_of::<T>() as vk::DeviceSize);
-        unsafe { self.buffers[frame_index].write(device, value) };
-    }
-
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        for buffer in &mut self.buffers {
-            unsafe { buffer.destroy(device) };
-        }
-
-        if self.pool != vk::DescriptorPool::null() {
-            unsafe { device.destroy_descriptor_pool(self.pool, None) };
-            self.pool = vk::DescriptorPool::null();
-        }
-
-        if self.layout != vk::DescriptorSetLayout::null() {
-            unsafe { device.destroy_descriptor_set_layout(self.layout, None) };
-            self.layout = vk::DescriptorSetLayout::null();
-        }
-    }
-}
-
-pub(super) struct DepthTarget {
-    pub view: vk::ImageView,
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-}
-
-impl DepthTarget {
-    pub fn new(
-        instance: &Instance,
-        device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        extent: vk::Extent2D,
-        format: vk::Format,
-    ) -> Self {
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let image = unsafe {
-            device
-                .create_image(&image_info, None)
-                .expect("renderer: failed to create depth image")
-        };
-
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = find_memory_type(
-            instance,
-            physical_device,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc, None)
-                .expect("renderer: failed to allocate depth memory")
-        };
-
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("renderer: failed to bind depth memory")
-        };
-
-        transition_depth_image(device, command_pool, queue, image);
-
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        let view = unsafe {
-            device
-                .create_image_view(&view_info, None)
-                .expect("renderer: failed to create depth view")
-        };
-
-        Self {
-            view,
-            image,
-            memory,
-        }
-    }
-
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        if self.view != vk::ImageView::null() {
-            unsafe { device.destroy_image_view(self.view, None) };
-            self.view = vk::ImageView::null();
-        }
-
-        if self.image != vk::Image::null() {
-            unsafe { device.destroy_image(self.image, None) };
-            self.image = vk::Image::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
-        }
-    }
-}
-
-fn create_texture_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
-    let bindings = (0..5)
-        .map(|binding| {
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(binding)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-        })
-        .collect::<Vec<_>>();
-
-    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-
-    unsafe {
-        device
-            .create_descriptor_set_layout(&info, None)
-            .expect("renderer: failed to create texture descriptor layout")
-    }
-}
-
-fn create_texture_descriptor_pool(device: &ash::Device) -> vk::DescriptorPool {
-    const MAX_MATERIALS: u32 = 1024;
-    const TEXTURES_PER_MATERIAL: u32 = 5;
-
-    let pool_size = vk::DescriptorPoolSize {
-        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        descriptor_count: MAX_MATERIALS * TEXTURES_PER_MATERIAL,
-    };
-    let info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(MAX_MATERIALS)
-        .pool_sizes(std::slice::from_ref(&pool_size));
-
-    unsafe {
-        device
-            .create_descriptor_pool(&info, None)
-            .expect("renderer: failed to create texture descriptor pool")
-    }
-}
-
-fn allocate_texture_set(
-    device: &ash::Device,
-    layout: vk::DescriptorSetLayout,
-    pool: vk::DescriptorPool,
-    textures: &[GpuTexture],
-    material: Material,
-) -> vk::DescriptorSet {
-    let layouts = [layout];
-    let alloc = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(pool)
-        .set_layouts(&layouts);
-    let set = unsafe {
-        device
-            .allocate_descriptor_sets(&alloc)
-            .expect("renderer: failed to allocate texture descriptor set")[0]
-    };
-    let texture_ids = [
-        material.base_color_texture.unwrap_or(TextureId::DEFAULT),
-        material
-            .metallic_roughness_texture
-            .unwrap_or(TextureId::DEFAULT),
-        material.normal_texture.unwrap_or(TextureId::NORMAL),
-        material.occlusion_texture.unwrap_or(TextureId::DEFAULT),
-        material.emissive_texture.unwrap_or(TextureId::DEFAULT),
-    ];
-    let image_infos = texture_ids
-        .into_iter()
-        .enumerate()
-        .map(|(index, texture)| {
-            let fallback = if index == 2 {
-                TextureId::NORMAL
-            } else {
-                TextureId::DEFAULT
-            };
-            let texture = textures
-                .get(texture.0)
-                .or_else(|| textures.get(fallback.0))
-                .expect("renderer: missing default texture");
-
-            vk::DescriptorImageInfo::default()
-                .sampler(texture.sampler)
-                .image_view(texture.view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        })
-        .collect::<Vec<_>>();
-    let writes = image_infos
-        .iter()
-        .enumerate()
-        .map(|(binding, image_info)| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(binding as u32)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(image_info))
-        })
-        .collect::<Vec<_>>();
-
-    unsafe { device.update_descriptor_sets(&writes, &[]) };
-    set
-}
-
-fn create_texture_image(
-    instance: &Instance,
-    device: &ash::Device,
-    physical_device: vk::PhysicalDevice,
-    width: u32,
-    height: u32,
-    srgb: bool,
-) -> (vk::Image, vk::DeviceMemory) {
-    let image_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(texture_format(srgb))
-        .extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    let image = unsafe {
-        device
-            .create_image(&image_info, None)
-            .expect("renderer: failed to create texture image")
-    };
-    let requirements = unsafe { device.get_image_memory_requirements(image) };
-    let memory_type = find_memory_type(
-        instance,
-        physical_device,
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    );
-    let alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type);
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc, None)
-            .expect("renderer: failed to allocate texture memory")
-    };
-
-    unsafe {
-        device
-            .bind_image_memory(image, memory, 0)
-            .expect("renderer: failed to bind texture memory")
-    };
-
-    (image, memory)
-}
-
-fn create_texture_view(device: &ash::Device, image: vk::Image, srgb: bool) -> vk::ImageView {
-    let info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(texture_format(srgb))
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-
-    unsafe {
-        device
-            .create_image_view(&info, None)
-            .expect("renderer: failed to create texture view")
-    }
-}
-
-fn texture_format(srgb: bool) -> vk::Format {
-    if srgb {
-        vk::Format::R8G8B8A8_SRGB
-    } else {
-        vk::Format::R8G8B8A8_UNORM
-    }
-}
-
-fn create_texture_sampler(device: &ash::Device, sampler: TextureSampler) -> vk::Sampler {
-    let info = vk::SamplerCreateInfo::default()
-        .mag_filter(texture_filter(sampler.mag_filter))
-        .min_filter(texture_filter(sampler.min_filter))
-        .address_mode_u(texture_wrap(sampler.wrap_s))
-        .address_mode_v(texture_wrap(sampler.wrap_t))
-        .address_mode_w(vk::SamplerAddressMode::REPEAT)
-        .anisotropy_enable(false)
-        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
-        .unnormalized_coordinates(false)
-        .compare_enable(false)
-        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-        .min_lod(0.0)
-        .max_lod(0.0);
-
-    unsafe {
-        device
-            .create_sampler(&info, None)
-            .expect("renderer: failed to create texture sampler")
-    }
-}
-
-fn texture_filter(filter: TextureFilter) -> vk::Filter {
-    match filter {
-        TextureFilter::Nearest => vk::Filter::NEAREST,
-        TextureFilter::Linear => vk::Filter::LINEAR,
-    }
-}
-
-fn texture_wrap(wrap: TextureWrap) -> vk::SamplerAddressMode {
-    match wrap {
-        TextureWrap::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
-        TextureWrap::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
-        TextureWrap::Repeat => vk::SamplerAddressMode::REPEAT,
-    }
-}
-
-fn copy_buffer(
-    device: &ash::Device,
-    command_pool: vk::CommandPool,
-    queue: vk::Queue,
-    src: vk::Buffer,
-    dst: vk::Buffer,
-    size: vk::DeviceSize,
-) {
-    submit_once(device, command_pool, queue, |command_buffer| {
-        let region = vk::BufferCopy::default().size(size);
-        unsafe { device.cmd_copy_buffer(command_buffer, src, dst, std::slice::from_ref(&region)) };
-    });
-}
-
-fn copy_buffer_to_image(
-    device: &ash::Device,
-    command_pool: vk::CommandPool,
-    queue: vk::Queue,
-    buffer: vk::Buffer,
-    image: vk::Image,
-    width: u32,
-    height: u32,
-) {
-    submit_once(device, command_pool, queue, |command_buffer| {
-        let region = vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
-
-        unsafe {
-            device.cmd_copy_buffer_to_image(
-                command_buffer,
-                buffer,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&region),
-            )
-        };
-    });
-}
-
-fn transition_texture_image(
-    device: &ash::Device,
-    command_pool: vk::CommandPool,
-    queue: vk::Queue,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-) {
-    let (src_stage, src_access, dst_stage, dst_access) = match (old_layout, new_layout) {
-        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
-            vk::PipelineStageFlags2::NONE,
-            vk::AccessFlags2::NONE,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-        ),
-        (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => (
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        ),
-        _ => panic!("unsupported texture layout transition"),
-    };
-
-    submit_once(device, command_pool, queue, |command_buffer| {
-        let barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(src_stage)
-            .src_access_mask(src_access)
-            .dst_stage_mask(dst_stage)
-            .dst_access_mask(dst_access)
-            .old_layout(old_layout)
-            .new_layout(new_layout)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        let dependency =
-            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
-
-        unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
-    });
-}
-
-fn transition_depth_image(
-    device: &ash::Device,
-    command_pool: vk::CommandPool,
-    queue: vk::Queue,
-    image: vk::Image,
-) {
-    submit_once(device, command_pool, queue, |command_buffer| {
-        let barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::NONE)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            )
-            .dst_access_mask(
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            )
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        let dependency =
-            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
-
-        unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
-    });
-}
-
-fn submit_once<F: FnOnce(vk::CommandBuffer)>(
-    device: &ash::Device,
-    command_pool: vk::CommandPool,
-    queue: vk::Queue,
-    record: F,
-) {
-    let alloc = vk::CommandBufferAllocateInfo::default()
-        .command_pool(command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
-
-    let command_buffer = unsafe {
-        device
-            .allocate_command_buffers(&alloc)
-            .expect("renderer: failed to allocate transient command buffer")[0]
-    };
-
-    let begin =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-    unsafe {
-        device
-            .begin_command_buffer(command_buffer, &begin)
-            .expect("renderer: failed to begin transient command buffer")
-    };
-
-    record(command_buffer);
-
-    unsafe {
-        device
-            .end_command_buffer(command_buffer)
-            .expect("renderer: failed to end transient command buffer")
-    };
-
-    let command_buffers = [command_buffer];
-    let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
-
-    unsafe {
-        device
-            .queue_submit(queue, std::slice::from_ref(&submit), vk::Fence::null())
-            .expect("renderer: failed to submit transient command buffer");
-        device
-            .queue_wait_idle(queue)
-            .expect("renderer: failed to wait transient command buffer");
-        device.free_command_buffers(command_pool, &command_buffers);
-    }
-}
-
-fn find_memory_type(
-    instance: &Instance,
-    physical_device: vk::PhysicalDevice,
-    type_filter: u32,
-    properties: vk::MemoryPropertyFlags,
-) -> u32 {
-    let memory = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-    (0..memory.memory_type_count)
-        .find(|&index| {
-            let supported = (type_filter & (1_u32 << index)) != 0;
-            let flags = memory.memory_types[index as usize].property_flags;
-            supported && flags.contains(properties)
-        })
-        .expect("renderer: failed to find suitable memory type")
-}
-
 fn split_statement(line: &str) -> Option<(&str, &str)> {
     let line = line.trim();
 
@@ -2032,8 +911,7 @@ fn mtl_texture_option_args(option: &str) -> usize {
     match option {
         "-mm" => 2,
         "-o" | "-s" | "-t" => 3,
-        "-blendu" | "-blendv" | "-boost" | "-texres" | "-clamp" | "-bm" | "-imfchan"
-        | "-type" => 1,
+        "-blendu" | "-blendv" | "-boost" | "-texres" | "-clamp" | "-bm" | "-imfchan" | "-type" => 1,
         _ => 0,
     }
 }
@@ -2103,12 +981,16 @@ fn load_mtl(
             }
             "d" => {
                 if let Some(material) = current_material_mut(&current, materials) {
-                    material.base_color[3] = parse_mtl_scalar(parts, 1.0).clamp(0.0, 1.0);
+                    let alpha = parse_mtl_scalar(parts, 1.0).clamp(0.0, 1.0);
+                    material.base_color[3] = alpha;
+                    material.alpha_blend = alpha < 0.999;
                 }
             }
             "Tr" => {
                 if let Some(material) = current_material_mut(&current, materials) {
-                    material.base_color[3] = 1.0 - parse_mtl_scalar(parts, 0.0).clamp(0.0, 1.0);
+                    let alpha = 1.0 - parse_mtl_scalar(parts, 0.0).clamp(0.0, 1.0);
+                    material.base_color[3] = alpha;
+                    material.alpha_blend = alpha < 0.999;
                 }
             }
             "Pm" => {
@@ -2140,6 +1022,7 @@ fn load_mtl(
                         let texture_id = TextureId(textures.len());
                         textures.push(texture);
                         material.base_color_texture = Some(texture_id);
+                        *material = infer_base_color_alpha(*material, texture_id, textures);
                     }
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(err),
@@ -2487,6 +1370,98 @@ f 1/1 2/2 3/3
     }
 
     #[test]
+    fn obj_base_color_texture_with_binary_alpha_uses_cutout() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("valkan-test-alpha-cutout-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let texture = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 0, 0, 0]).unwrap();
+        texture.save(dir.join("cutout.png")).unwrap();
+        fs::write(
+            dir.join("demo.mtl"),
+            "
+newmtl cutout
+map_Kd cutout.png
+",
+        )
+        .unwrap();
+
+        let model = CpuModel::from_obj_str(
+            "
+mtllib demo.mtl
+usemtl cutout
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+f 1/1 2/2 3/3
+",
+            dir.join("demo.obj"),
+        )
+        .unwrap();
+        let material = model.primitives[0].material;
+
+        assert_eq!(material.alpha_cutoff, 0.5);
+        assert!(!material.alpha_blend);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn partial_alpha_base_color_texture_uses_blend() {
+        let textures = vec![CpuTexture {
+            pixels: vec![255, 255, 255, 255, 255, 255, 255, 128],
+            width: 2,
+            height: 1,
+            sampler: TextureSampler::default(),
+            srgb: true,
+        }];
+        let material = infer_base_color_alpha(Material::default(), TextureId(0), &textures);
+
+        assert!(material.alpha_blend);
+        assert_eq!(material.alpha_cutoff, 0.0);
+    }
+
+    #[test]
+    fn obj_material_names_do_not_force_metallic() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("valkan-test-material-name-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("demo.mtl"),
+            "
+newmtl gold hair
+Kd 0.8 0.7 0.2
+",
+        )
+        .unwrap();
+
+        let model = CpuModel::from_obj_str(
+            "
+mtllib demo.mtl
+usemtl gold hair
+v 0 0 0
+v 1 0 0
+v 0 1 0
+f 1 2 3
+",
+            dir.join("demo.obj"),
+        )
+        .unwrap();
+
+        assert_eq!(model.primitives[0].material.metallic, 0.0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn gltf_loads_mesh_and_pbr_material() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2590,6 +1565,62 @@ f 1/1 2/2 3/3
         assert_eq!(primitive.material.emissive_texture, Some(TextureId(4)));
         assert!((primitive.material.normal_scale - 0.5).abs() < 0.001);
         assert!((primitive.material.occlusion_strength - 0.25).abs() < 0.001);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gltf_missing_material_uses_non_metal_default() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("valkan-test-gltf-default-material-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut bin = Vec::new();
+        for value in [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+        for index in [0_u16, 1, 2] {
+            bin.extend_from_slice(&index.to_le_bytes());
+        }
+        fs::write(dir.join("mesh.bin"), &bin).unwrap();
+        fs::write(
+            dir.join("model.gltf"),
+            format!(
+                r#"{{
+    "asset": {{"version": "2.0"}},
+    "scene": 0,
+    "scenes": [{{"nodes": [0]}}],
+    "nodes": [{{"mesh": 0}}],
+    "meshes": [{{
+        "primitives": [{{
+            "attributes": {{"POSITION": 0}},
+            "indices": 1
+        }}]
+    }}],
+    "buffers": [{{"uri": "mesh.bin", "byteLength": {}}}],
+    "bufferViews": [
+        {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+        {{"buffer": 0, "byteOffset": 36, "byteLength": 6}}
+    ],
+    "accessors": [
+        {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}},
+        {{"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}}
+    ]
+}}"#,
+                bin.len()
+            ),
+        )
+        .unwrap();
+
+        let model = CpuModel::load_gltf(dir.join("model.gltf")).unwrap();
+        let material = model.primitives[0].material;
+
+        assert_eq!(material.metallic, 0.0);
+        assert_eq!(material.roughness, Material::default().roughness);
+        assert_eq!(material.specular, Material::default().specular);
 
         let _ = fs::remove_dir_all(dir);
     }

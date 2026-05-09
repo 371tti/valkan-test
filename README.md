@@ -1,45 +1,95 @@
-# Graphicsの学習用
+# Vulkan/Ash learning project
 
-Step 1: winitでウィンドウを出す
-Step 2: ash::Entry / Instance を作る
-Step 3: Validation Layer を有効化
-Step 4: Surface を作る
-Step 5: PhysicalDevice を選ぶ
-Step 6: LogicalDevice / Queue を作る
-Step 7: Swapchain を作る
-Step 8: CommandBuffer で clear color
-Step 9: 三角形
-Step 10: Buffer / Uniform / Texture / Depth
+Rust + `winit` + `ash` で、Vulkan の初期化からモデル描画までを追うための学習用プロジェクトです。
 
-## 基本構造
-一般的なグラフィックスプログラムの構造だからここらへんは理解すべきなんだろなと Valkanに限らない
+## 実装ステップ
 
-1. CPUが描画に必要なデータ(ポリゴン, テクスチャ, GPUパイプラインの構成など)を構築
-2. GPUにコマンド(描画命令,データ転送命令など)を送る
-3. GPUがコマンドを実行して指定のパイプラインで描画する
-4. GPUが描画結果をフレームバッファ(VRAM上の描画領域)に出力する
-5. OS(のウィンドウシステム)がフレームバッファの内容をウィンドウに表示する
+1. `winit` でウィンドウとイベントループを作る
+2. `ash::Entry` / `Instance` を作る
+3. Debug validation layer を有効化する
+4. Window から Vulkan surface を作る
+5. Physical device と queue family を選ぶ
+6. Logical device / queue を作る
+7. Swapchain / depth target / command buffer を作る
+8. Shader module と graphics pipeline を作る
+9. CPU 側の mesh / texture / material を GPU resource へアップロードする
+10. Reflection pass / main pass を command buffer に記録して present する
 
-## 用語定義
-[用語定義](./words-def.md)をよめー
+## Tree
 
-## 手順
-まずwindowを出す
-ここはwinit(クロスプラットフォームなウィンドウライブラリ)を使ってまずイベントループ(キー入力とかOSのWMからのイベントを処理するためのループ)を作ってからウィンドウを作成する
+```text
+src/
+  app/
+    mod.rs          # winit の ApplicationHandler、ウィンドウのライフサイクル、フレーム時間管理
+    input.rs        # winit のキー入力を scene のキー割り当てへ変換
+  demo/
+    scene.rs        # SceneController のサンプル実装
+    camera.rs       # フリーカメラの入力と移動
+    model_loading.rs
+    math.rs
+  renderer/
+    mod.rs          # Renderer の状態と公開 API
+    lifecycle/
+      init.rs       # Vulkan の instance/device/swapchain/pipeline 作成
+      drop.rs       # Vulkan リソースの破棄順序
+    passes/
+      reflections.rs
+      draw.rs       # reflection pass + main pass のコマンド記録
+    assets/
+      cpu.rs        # glTF/OBJ/MTL/image を CPU 側データとして読み込み
+      gpu.rs        # バッファ、テクスチャ、ディスクリプタ、レンダーターゲット
+      mod.rs
+    pipeline/
+      mod.rs        # シェーダ読み込み、ホットリロード、グラフィックスパイプライン構築
+    scene/
+      mod.rs        # render-scene のデータモデルと数学型
+    uniforms.rs     # scene の uniform buffer とオブジェクトの push constants
+    math.rs         # renderer 内部向けの 3D 補助関数
+```
+
+## 描画パイプラインの流れ
+
+1. `app` が window/input/timing を管理し、毎フレーム `SceneController::scene` を呼ぶ
+2. `demo` がカメラと読み込むモデルを決めて `RenderScene` を返す
+3. `renderer::assets::cpu` が glTF/OBJ/MTL/image を CPU データへ変換する
+4. `renderer::assets::gpu` が CPU データを Vulkan buffer/image/descriptor へアップロードする
+5. `renderer::passes::reflections` が反射用の camera/uniform/target を準備する
+6. `renderer::passes::draw` が reflection pass と main pass の command buffer を記録する
+7. `Renderer::draw` が acquire -> submit -> present の順に GPU へ渡す
 
 ## draw の中身
-1. CPUが fence を待つ
-   → この frame slot を再利用してよいか確認する
 
-2. acquire_next_image
-   → 今回描いてよい Swapchain Image を取得する
-   → そのImageが使えるようになったら image_available_semaphore がsignalされる
+1. CPU が fence を待ち、今の frame slot を再利用できることを確認する
+2. `acquire_next_image` で描画対象の swapchain image を取得する
+3. reflection target と scene uniform を更新する
+4. command buffer に reflection pass と main pass を記録する
+5. `queue_submit` で描画を送る
+6. `queue_present` で描画結果を window system に渡す
 
-3. queue_submit
-   → image_available_semaphore をwaitする
-   → つまり「Imageが描画可能になるまで描画開始しない」
-   → 描画が終わったら render_finished_semaphore をsignalする
+## モデルの読み込み
 
-4. queue_present
-   → render_finished_semaphore をwaitする
-   → つまり「描画完了後に画面表示へ渡す」
+起動時は次の順でモデルを探します。
+
+1. `MODEL_PATH` 環境変数
+2. `assets/model.glb`
+3. `assets/model.gltf`
+4. `assets/model.obj`
+
+モデルが見つからない場合は組み込みの cube を描画します。
+
+## 用語
+
+[words-def.md](./words-def.md) よめー 
+
+# めも
+
+src/renderer/
+  lifecycle/   # init / drop
+  passes/      # draw / reflections
+  assets/      # cpu.rs: 読み込み, gpu.rs: アップロード/descriptor
+  pipeline/    # graphics pipeline
+  scene/       # RenderScene / Camera / Material
+  uniforms.rs
+  math.rs
+
+上にまとめる. ok./

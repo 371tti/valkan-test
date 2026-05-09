@@ -32,6 +32,7 @@ pub struct PipelineId(pub usize);
 
 impl PipelineId {
     pub const LIT_MESH: Self = Self(0);
+    pub const LIT_MESH_TRANSPARENT: Self = Self(1);
 }
 
 pub trait SceneController {
@@ -55,12 +56,17 @@ pub enum SceneMessage {
     Resized { width: u32, height: u32 },
     RedrawRequested,
     Keyboard { key: SceneKey, pressed: bool },
+    MouseMotion { delta: [f32; 2] },
+    MouseWheel { delta: f32 },
     User(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SceneKey {
+    Escape,
     Space,
+    ShiftLeft,
+    ControlLeft,
     ArrowUp,
     ArrowDown,
     ArrowLeft,
@@ -78,6 +84,7 @@ pub enum SceneKey {
 pub struct RenderScene {
     pub camera: Camera,
     pub light: DirectionalLight,
+    pub reflections: ReflectionSettings,
     pub objects: Vec<RenderObject>,
     pub models: Vec<RenderModel>,
 }
@@ -87,8 +94,78 @@ impl Default for RenderScene {
         Self {
             camera: Camera::default(),
             light: DirectionalLight::default(),
+            reflections: ReflectionSettings::default(),
             objects: Vec::new(),
             models: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReflectionSettings {
+    pub box_projection: BoxReflectionSettings,
+    pub planar: PlanarReflectionSettings,
+}
+
+impl Default for ReflectionSettings {
+    fn default() -> Self {
+        Self {
+            box_projection: BoxReflectionSettings::default(),
+            planar: PlanarReflectionSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BoxReflectionSettings {
+    pub enabled: bool,
+    pub parallax_correction: bool,
+    pub resolution: u32,
+    pub intensity: f32,
+    pub roughness_fallback: f32,
+    pub bounds_padding: f32,
+}
+
+impl Default for BoxReflectionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            parallax_correction: true,
+            resolution: 256,
+            intensity: 1.0,
+            roughness_fallback: 0.35,
+            bounds_padding: 0.03,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlanarReflectionSettings {
+    pub enabled: bool,
+    pub plane_origin: [f32; 3],
+    pub plane_normal: [f32; 3],
+    pub resolution_scale: f32,
+    pub intensity: f32,
+    pub max_roughness: f32,
+    pub normal_alignment: f32,
+    pub distance_fade: f32,
+    pub clip_bias: f32,
+    pub uv_flip_y: bool,
+}
+
+impl Default for PlanarReflectionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            plane_origin: [0.0, 0.0, 0.0],
+            plane_normal: [0.0, 1.0, 0.0],
+            resolution_scale: 1.0,
+            intensity: 1.0,
+            max_roughness: 0.75,
+            normal_alignment: 0.35,
+            distance_fade: 3.5,
+            clip_bias: 0.03,
+            uv_flip_y: false,
         }
     }
 }
@@ -124,6 +201,7 @@ pub struct Material {
     pub normal_scale: f32,
     pub occlusion_strength: f32,
     pub alpha_cutoff: f32,
+    pub alpha_blend: bool,
 }
 
 impl Material {
@@ -143,6 +221,7 @@ impl Material {
             normal_scale: 1.0,
             occlusion_strength: 1.0,
             alpha_cutoff: 0.0,
+            alpha_blend: false,
         }
     }
 
@@ -222,6 +301,15 @@ impl Material {
         self.alpha_cutoff = alpha_cutoff.clamp(0.0, 1.0);
         self
     }
+
+    pub fn with_alpha_blend(mut self, alpha_blend: bool) -> Self {
+        self.alpha_blend = alpha_blend;
+        self
+    }
+
+    pub fn is_translucent(&self) -> bool {
+        self.alpha_blend || self.base_color[3] < 0.999
+    }
 }
 
 impl Default for Material {
@@ -263,6 +351,13 @@ impl Camera {
     pub fn view_projection(&self, aspect: f32) -> Mat4 {
         mat4_mul(
             perspective(self.fov_y, aspect, self.near, self.far),
+            look_at(self.eye, self.target, self.up),
+        )
+    }
+
+    pub fn cubemap_view_projection(&self) -> Mat4 {
+        mat4_mul(
+            perspective_for_cubemap(self.fov_y, 1.0, self.near, self.far),
             look_at(self.eye, self.target, self.up),
         )
     }
@@ -353,6 +448,14 @@ fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> Mat4 {
 }
 
 fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    perspective_with_y_scale(fov_y, aspect, near, far, -1.0)
+}
+
+fn perspective_for_cubemap(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    perspective_with_y_scale(fov_y, aspect, near, far, 1.0)
+}
+
+fn perspective_with_y_scale(fov_y: f32, aspect: f32, near: f32, far: f32, y_scale: f32) -> Mat4 {
     let f = 1.0 / (fov_y * 0.5).tan();
 
     [
@@ -361,7 +464,7 @@ fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
         0.0,
         0.0,
         0.0,
-        -f,
+        f * y_scale,
         0.0,
         0.0,
         0.0,
