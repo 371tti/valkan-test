@@ -64,7 +64,7 @@ impl FreeCamera {
         }
 
         self.speed_multiplier =
-            (self.speed_multiplier * 1.18_f32.powf(wheel_delta)).clamp(0.15, 12.0);
+            (self.speed_multiplier * 1.18_f32.powf(wheel_delta)).clamp(0.01, 120.0);
     }
 
     pub fn stop(&mut self) {
