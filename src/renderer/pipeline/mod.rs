@@ -49,7 +49,6 @@ impl std::error::Error for PipelineError {
 
 #[derive(Debug, Clone)]
 pub enum ShaderCode {
-    Embedded(&'static [u8]),
     WatchedSpv {
         path: PathBuf,
         fallback: &'static [u8],
@@ -57,10 +56,6 @@ pub enum ShaderCode {
 }
 
 impl ShaderCode {
-    pub fn embedded(bytes: &'static [u8]) -> Self {
-        Self::Embedded(bytes)
-    }
-
     pub fn watched_spv(path: impl Into<PathBuf>, fallback: &'static [u8]) -> Self {
         Self::WatchedSpv {
             path: path.into(),
@@ -70,7 +65,6 @@ impl ShaderCode {
 
     fn load(&self) -> Result<Cow<'_, [u8]>, PipelineError> {
         match self {
-            Self::Embedded(bytes) => Ok(Cow::Borrowed(bytes)),
             Self::WatchedSpv { path, fallback } => match fs::read(path) {
                 Ok(bytes) => Ok(Cow::Owned(bytes)),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Cow::Borrowed(fallback)),
@@ -83,23 +77,21 @@ impl ShaderCode {
     }
 
     fn modified(&self) -> Result<Option<SystemTime>, PipelineError> {
-        let Self::WatchedSpv { path, .. } = self else {
-            return Ok(None);
-        };
-
-        match fs::metadata(path) {
-            Ok(meta) => meta
-                .modified()
-                .map(Some)
-                .map_err(|source| PipelineError::Io {
+        match self {
+            Self::WatchedSpv { path, .. } => match fs::metadata(path) {
+                Ok(meta) => meta
+                    .modified()
+                    .map(Some)
+                    .map_err(|source| PipelineError::Io {
+                        path: path.clone(),
+                        source,
+                    }),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(source) => Err(PipelineError::Io {
                     path: path.clone(),
                     source,
                 }),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(PipelineError::Io {
-                path: path.clone(),
-                source,
-            }),
+            },
         }
     }
 }
@@ -120,11 +112,6 @@ impl ShaderStage {
             entry: "main",
             code,
         }
-    }
-
-    pub fn with_entry(mut self, entry: &'static str) -> Self {
-        self.entry = entry;
-        self
     }
 }
 
@@ -251,6 +238,17 @@ pub struct RasterizationConfig {
     pub cull_mode: vk::CullModeFlags,
     pub front_face: vk::FrontFace,
     pub line_width: f32,
+    pub depth_bias_constant: f32,
+    pub depth_bias_slope: f32,
+}
+
+impl RasterizationConfig {
+    pub fn shadow() -> Self {
+        Self {
+            cull_mode: vk::CullModeFlags::NONE,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for RasterizationConfig {
@@ -260,6 +258,8 @@ impl Default for RasterizationConfig {
             cull_mode: vk::CullModeFlags::BACK,
             front_face: vk::FrontFace::COUNTER_CLOCKWISE,
             line_width: 1.0,
+            depth_bias_constant: 0.0,
+            depth_bias_slope: 0.0,
         }
     }
 }
@@ -329,6 +329,7 @@ pub struct PipelineDesc {
     pub topology: vk::PrimitiveTopology,
     pub rasterization: RasterizationConfig,
     pub color_blend: ColorBlendConfig,
+    pub color_attachment: bool,
     pub depth: Option<DepthConfig>,
 }
 
@@ -342,6 +343,7 @@ impl PipelineDesc {
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             rasterization: RasterizationConfig::default(),
             color_blend: ColorBlendConfig::default(),
+            color_attachment: true,
             depth: None,
         }
     }
@@ -373,6 +375,11 @@ impl PipelineDesc {
 
     pub fn with_rasterization(mut self, rasterization: RasterizationConfig) -> Self {
         self.rasterization = rasterization;
+        self
+    }
+
+    pub fn without_color_attachment(mut self) -> Self {
+        self.color_attachment = false;
         self
     }
 
@@ -459,7 +466,13 @@ impl GraphicsPipeline {
             .polygon_mode(desc.rasterization.polygon_mode)
             .cull_mode(desc.rasterization.cull_mode)
             .front_face(desc.rasterization.front_face)
-            .line_width(desc.rasterization.line_width);
+            .line_width(desc.rasterization.line_width)
+            .depth_bias_enable(
+                desc.rasterization.depth_bias_constant != 0.0
+                    || desc.rasterization.depth_bias_slope != 0.0,
+            )
+            .depth_bias_constant_factor(desc.rasterization.depth_bias_constant)
+            .depth_bias_slope_factor(desc.rasterization.depth_bias_slope);
 
         let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -474,8 +487,14 @@ impl GraphicsPipeline {
             .dst_alpha_blend_factor(desc.color_blend.dst_alpha)
             .alpha_blend_op(desc.color_blend.alpha_op);
 
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(std::slice::from_ref(&color_blend_attachment));
+        let color_blend_attachments = desc
+            .color_attachment
+            .then_some(color_blend_attachment)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
 
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state =
@@ -495,8 +514,10 @@ impl GraphicsPipeline {
         };
 
         let color_formats = [color_format];
-        let mut rendering =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        let mut rendering = vk::PipelineRenderingCreateInfo::default();
+        if desc.color_attachment {
+            rendering = rendering.color_attachment_formats(&color_formats);
+        }
         if let Some(depth) = desc.depth {
             rendering = rendering.depth_attachment_format(depth.format);
         }
@@ -547,6 +568,9 @@ impl GraphicsPipeline {
         })
     }
 
+    /// # Safety
+    ///
+    /// The pipeline must not be in use by any in-flight command buffer.
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         if self.handle != vk::Pipeline::null() {
             unsafe { device.destroy_pipeline(self.handle, None) };
@@ -609,15 +633,6 @@ impl HotReload {
             interval,
             last_check: Instant::now(),
             stamp: shaders.watch_stamp().unwrap_or(None),
-        }
-    }
-
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            interval: Duration::ZERO,
-            last_check: Instant::now(),
-            stamp: None,
         }
     }
 

@@ -1,7 +1,5 @@
 use valkan_test::renderer::{Camera, SceneKey};
 
-use super::math::{add_scaled, cross, lerp3, normalize, normalize_or_zero, scale};
-
 #[derive(Debug, Clone)]
 pub struct FreeCamera {
     position: [f32; 3],
@@ -71,6 +69,23 @@ impl FreeCamera {
         self.velocity = [0.0; 3];
     }
 
+    pub fn frame_sphere(&mut self, center: [f32; 3], radius: f32) {
+        let radius = radius.max(1.0);
+        let eye = [
+            center[0],
+            center[1] + radius * 0.24,
+            center[2] + radius * 2.45,
+        ];
+        let forward =
+            normalize_or_zero([center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]]);
+
+        self.position = eye;
+        self.velocity = [0.0; 3];
+        self.yaw = forward[0].atan2(forward[2]);
+        self.pitch = forward[1].asin().clamp(-1.35, 1.35);
+        self.speed_multiplier = (radius / 28.0).clamp(0.15, 40.0);
+    }
+
     pub fn update(&mut self, delta_time: f32) {
         let mouse_sensitivity = 0.0022;
         let move_speed = if self.sprinting { 8.5 } else { 5.2 } * self.speed_multiplier;
@@ -83,7 +98,7 @@ impl FreeCamera {
         self.pitch = self.pitch.clamp(-1.35, 1.35);
 
         let forward = self.flat_forward();
-        let right = normalize(cross(forward, [0.0, 1.0, 0.0]));
+        let right = normalize_or_zero(cross(forward, [0.0, 1.0, 0.0]));
         let mut input = [0.0; 3];
 
         if self.moving_forward {
@@ -105,7 +120,7 @@ impl FreeCamera {
             input[1] -= 1.0;
         }
 
-        let desired_velocity = scale(normalize_or_zero(input), move_speed);
+        let desired_velocity = scaled(normalize_or_zero(input), move_speed);
         let response = if input == [0.0; 3] {
             damping
         } else {
@@ -142,4 +157,40 @@ impl FreeCamera {
 
         [yaw_sin, 0.0, yaw_cos]
     }
+}
+
+fn add_scaled(target: &mut [f32; 3], value: [f32; 3], scale: f32) {
+    target[0] += value[0] * scale;
+    target[1] += value[1] * scale;
+    target[2] += value[2] * scale;
+}
+
+fn scaled(value: [f32; 3], scale: f32) -> [f32; 3] {
+    [value[0] * scale, value[1] * scale, value[2] * scale]
+}
+
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
+}
+
+fn normalize_or_zero(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+
+    if len <= f32::EPSILON {
+        return [0.0; 3];
+    }
+
+    [v[0] / len, v[1] / len, v[2] / len]
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }

@@ -25,9 +25,7 @@ const DEFAULT_TITLE: &str = "TEST";
 pub struct WindowConfig {
     title: String,
     size_px: PhysicalSize<u32>,
-    max_size_px: Option<PhysicalSize<u32>>,
     min_size_px: Option<PhysicalSize<u32>>,
-    resizable: bool,
     transparent: bool,
 }
 
@@ -41,6 +39,17 @@ pub struct App {
     mouse_captured: bool,
 
     config: WindowConfig,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            title: DEFAULT_TITLE.into(),
+            size_px: PhysicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            min_size_px: None,
+            transparent: false,
+        }
+    }
 }
 
 impl App {
@@ -59,29 +68,6 @@ impl App {
         }
     }
 
-    pub fn send_message(&mut self, message: SceneMessage) {
-        self.scene.on_message(message);
-    }
-}
-
-impl Default for WindowConfig {
-    fn default() -> Self {
-        Self {
-            title: DEFAULT_TITLE.into(),
-            size_px: PhysicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
-            max_size_px: None,
-            min_size_px: None,
-            resizable: true,
-            transparent: false,
-        }
-    }
-}
-
-impl App {
-    pub fn window(&self) -> Option<Arc<Window>> {
-        self.window.as_ref().map(Arc::clone)
-    }
-
     pub fn window_title<S: Into<String>>(mut self, title: S) -> Self {
         self.config.title = title.into();
         self
@@ -92,76 +78,14 @@ impl App {
         self
     }
 
-    pub fn window_max_size(mut self, width: u32, height: u32) -> Self {
-        self.config.max_size_px = Some(PhysicalSize::new(width, height));
-        self
-    }
-
     pub fn window_min_size(mut self, width: u32, height: u32) -> Self {
         self.config.min_size_px = Some(PhysicalSize::new(width, height));
-        self
-    }
-
-    pub fn window_resizable(mut self, resizable: bool) -> Self {
-        self.config.resizable = resizable;
         self
     }
 
     pub fn window_transparent(mut self, transparent: bool) -> Self {
         self.config.transparent = transparent;
         self
-    }
-
-    pub fn set_window_title<S: Into<String>>(&self, title: S) {
-        if let Some(window) = &self.window {
-            window.set_title(&title.into());
-        }
-    }
-
-    /// Requests a new inner size and returns the best known size immediately.
-    ///
-    /// `request_inner_size` is asynchronous on some platforms; the authoritative
-    /// value still arrives through `WindowEvent::Resized`.
-    pub fn req_window_size(&self, width: u32, height: u32) -> PhysicalSize<u32> {
-        if let Some(window) = &self.window {
-            if let Some(size) = window.request_inner_size(PhysicalSize::new(width, height)) {
-                return size;
-            }
-
-            return window.inner_size();
-        }
-
-        self.config.size_px
-    }
-
-    pub fn set_window_resizable(&self, resizable: bool) {
-        if let Some(window) = &self.window {
-            window.set_resizable(resizable);
-        }
-    }
-
-    pub fn set_window_max_size(&self, width: u32, height: u32) {
-        if let Some(window) = &self.window {
-            window.set_max_inner_size(Some(PhysicalSize::new(width, height)));
-        }
-    }
-
-    pub fn clear_window_max_size(&self) {
-        if let Some(window) = &self.window {
-            window.set_max_inner_size(None::<PhysicalSize<u32>>);
-        }
-    }
-
-    pub fn set_window_min_size(&self, width: u32, height: u32) {
-        if let Some(window) = &self.window {
-            window.set_min_inner_size(Some(PhysicalSize::new(width, height)));
-        }
-    }
-
-    pub fn clear_window_min_size(&self) {
-        if let Some(window) = &self.window {
-            window.set_min_inner_size(None::<PhysicalSize<u32>>);
-        }
     }
 
     fn is_drawable_size(size: PhysicalSize<u32>) -> bool {
@@ -189,11 +113,17 @@ impl App {
             .duration_since(self.last_frame_at)
             .as_secs_f32()
             .min(1.0 / 15.0);
+        let metering = self
+            .renderer
+            .as_ref()
+            .map(Renderer::camera_metering)
+            .unwrap_or_default();
         let context = SceneContext {
             elapsed: now.duration_since(self.started_at).as_secs_f32(),
             delta_time,
             frame: self.frame,
             window_size: [size.width, size.height],
+            metering,
         };
 
         self.last_frame_at = now;
@@ -244,12 +174,7 @@ impl ApplicationHandler for App {
         let mut attrs = WindowAttributes::default()
             .with_inner_size(self.config.size_px)
             .with_title(self.config.title.clone())
-            .with_resizable(self.config.resizable)
             .with_transparent(self.config.transparent);
-
-        if let Some(max_size) = self.config.max_size_px {
-            attrs = attrs.with_max_inner_size(max_size);
-        }
 
         if let Some(min_size) = self.config.min_size_px {
             attrs = attrs.with_min_inner_size(min_size);
@@ -351,10 +276,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            if Self::is_drawable_size(window.inner_size()) {
-                window.request_redraw();
-            }
+        if let Some(window) = &self.window
+            && Self::is_drawable_size(window.inner_size())
+        {
+            window.request_redraw();
         }
     }
 }

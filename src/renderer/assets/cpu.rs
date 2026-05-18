@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::renderer::{Material, ModelVertex, TextureId};
+use crate::renderer::{Material, ModelVertex, TextureId, mat4_mul};
 
 #[derive(Debug, Clone)]
 pub struct CpuMesh {
@@ -703,18 +703,6 @@ fn gltf_node_transform(transform: gltf::scene::Transform) -> [f32; 16] {
     ]
 }
 
-fn mat4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
-    let mut out = [0.0; 16];
-
-    for col in 0..4 {
-        for row in 0..4 {
-            out[col * 4 + row] = (0..4).map(|i| a[i * 4 + row] * b[col * 4 + i]).sum();
-        }
-    }
-
-    out
-}
-
 fn transform_position(matrix: [f32; 16], position: [f32; 3]) -> [f32; 3] {
     [
         matrix[0] * position[0] + matrix[4] * position[1] + matrix[8] * position[2] + matrix[12],
@@ -974,6 +962,14 @@ fn load_mtl(
                     material.emissive_color = parse_mtl_rgb(parts, [0.0; 3]);
                 }
             }
+            "illum" => {
+                if let Some(material) = current_material_mut(&current, materials) {
+                    let illumination_model = parse_mtl_scalar(parts, 2.0);
+                    if illumination_model <= 1.0 {
+                        apply_matte_defaults(material);
+                    }
+                }
+            }
             "Ns" => {
                 if let Some(material) = current_material_mut(&current, materials) {
                     material.roughness = shininess_to_roughness(parse_mtl_scalar(parts, 32.0));
@@ -1075,6 +1071,12 @@ fn parse_mtl_rgb<'a>(mut parts: impl Iterator<Item = &'a str>, default: [f32; 3]
 
 fn parse_mtl_scalar<'a>(mut parts: impl Iterator<Item = &'a str>, default: f32) -> f32 {
     parse_mtl_value(parts.next(), default)
+}
+
+fn apply_matte_defaults(material: &mut Material) {
+    material.metallic = 0.0;
+    material.roughness = material.roughness.max(0.92);
+    material.specular = material.specular.min(0.08);
 }
 
 fn parse_mtl_value(value: Option<&str>, default: f32) -> f32 {
@@ -1230,6 +1232,136 @@ fn normalize_or(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
 
     [v[0] / len, v[1] / len, v[2] / len]
 }
+
+const S: f32 = 0.75;
+
+const CUBE_VERTICES: [ModelVertex; 24] = [
+    ModelVertex {
+        position: [-S, -S, S],
+        normal: [0.0, 0.0, 1.0],
+        uv: [0.0, 1.0],
+    },
+    ModelVertex {
+        position: [S, -S, S],
+        normal: [0.0, 0.0, 1.0],
+        uv: [1.0, 1.0],
+    },
+    ModelVertex {
+        position: [S, S, S],
+        normal: [0.0, 0.0, 1.0],
+        uv: [1.0, 0.0],
+    },
+    ModelVertex {
+        position: [-S, S, S],
+        normal: [0.0, 0.0, 1.0],
+        uv: [0.0, 0.0],
+    },
+    ModelVertex {
+        position: [S, -S, -S],
+        normal: [0.0, 0.0, -1.0],
+        uv: [0.0, 1.0],
+    },
+    ModelVertex {
+        position: [-S, -S, -S],
+        normal: [0.0, 0.0, -1.0],
+        uv: [1.0, 1.0],
+    },
+    ModelVertex {
+        position: [-S, S, -S],
+        normal: [0.0, 0.0, -1.0],
+        uv: [1.0, 0.0],
+    },
+    ModelVertex {
+        position: [S, S, -S],
+        normal: [0.0, 0.0, -1.0],
+        uv: [0.0, 0.0],
+    },
+    ModelVertex {
+        position: [-S, -S, -S],
+        normal: [-1.0, 0.0, 0.0],
+        uv: [0.0, 1.0],
+    },
+    ModelVertex {
+        position: [-S, -S, S],
+        normal: [-1.0, 0.0, 0.0],
+        uv: [1.0, 1.0],
+    },
+    ModelVertex {
+        position: [-S, S, S],
+        normal: [-1.0, 0.0, 0.0],
+        uv: [1.0, 0.0],
+    },
+    ModelVertex {
+        position: [-S, S, -S],
+        normal: [-1.0, 0.0, 0.0],
+        uv: [0.0, 0.0],
+    },
+    ModelVertex {
+        position: [S, -S, S],
+        normal: [1.0, 0.0, 0.0],
+        uv: [0.0, 1.0],
+    },
+    ModelVertex {
+        position: [S, -S, -S],
+        normal: [1.0, 0.0, 0.0],
+        uv: [1.0, 1.0],
+    },
+    ModelVertex {
+        position: [S, S, -S],
+        normal: [1.0, 0.0, 0.0],
+        uv: [1.0, 0.0],
+    },
+    ModelVertex {
+        position: [S, S, S],
+        normal: [1.0, 0.0, 0.0],
+        uv: [0.0, 0.0],
+    },
+    ModelVertex {
+        position: [-S, S, S],
+        normal: [0.0, 1.0, 0.0],
+        uv: [0.0, 1.0],
+    },
+    ModelVertex {
+        position: [S, S, S],
+        normal: [0.0, 1.0, 0.0],
+        uv: [1.0, 1.0],
+    },
+    ModelVertex {
+        position: [S, S, -S],
+        normal: [0.0, 1.0, 0.0],
+        uv: [1.0, 0.0],
+    },
+    ModelVertex {
+        position: [-S, S, -S],
+        normal: [0.0, 1.0, 0.0],
+        uv: [0.0, 0.0],
+    },
+    ModelVertex {
+        position: [-S, -S, -S],
+        normal: [0.0, -1.0, 0.0],
+        uv: [0.0, 1.0],
+    },
+    ModelVertex {
+        position: [S, -S, -S],
+        normal: [0.0, -1.0, 0.0],
+        uv: [1.0, 1.0],
+    },
+    ModelVertex {
+        position: [S, -S, S],
+        normal: [0.0, -1.0, 0.0],
+        uv: [1.0, 0.0],
+    },
+    ModelVertex {
+        position: [-S, -S, S],
+        normal: [0.0, -1.0, 0.0],
+        uv: [0.0, 0.0],
+    },
+];
+
+const CUBE_INDICES: [u32; 36] = [
+    0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4, 8, 9, 10, 10, 11, 8, 12, 13, 14, 14, 15, 12, 16, 17, 18,
+    18, 19, 16, 20, 21, 22, 22, 23, 20,
+];
 
 #[cfg(test)]
 mod tests {
@@ -1462,6 +1594,45 @@ f 1 2 3
     }
 
     #[test]
+    fn obj_illum_one_uses_matte_defaults() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("valkan-test-matte-illum-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("demo.mtl"),
+            "
+newmtl matte_wall
+Kd 0.7 0.7 0.7
+illum 1
+",
+        )
+        .unwrap();
+
+        let model = CpuModel::from_obj_str(
+            "
+mtllib demo.mtl
+usemtl matte_wall
+v 0 0 0
+v 1 0 0
+v 0 1 0
+f 1 2 3
+",
+            dir.join("demo.obj"),
+        )
+        .unwrap();
+        let material = model.primitives[0].material;
+
+        assert_eq!(material.metallic, 0.0);
+        assert!(material.roughness >= 0.92);
+        assert!(material.specular <= 0.08);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn gltf_loads_mesh_and_pbr_material() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1652,133 +1823,3 @@ f 1 2 3
         }
     }
 }
-
-const S: f32 = 0.75;
-
-const CUBE_VERTICES: [ModelVertex; 24] = [
-    ModelVertex {
-        position: [-S, -S, S],
-        normal: [0.0, 0.0, 1.0],
-        uv: [0.0, 1.0],
-    },
-    ModelVertex {
-        position: [S, -S, S],
-        normal: [0.0, 0.0, 1.0],
-        uv: [1.0, 1.0],
-    },
-    ModelVertex {
-        position: [S, S, S],
-        normal: [0.0, 0.0, 1.0],
-        uv: [1.0, 0.0],
-    },
-    ModelVertex {
-        position: [-S, S, S],
-        normal: [0.0, 0.0, 1.0],
-        uv: [0.0, 0.0],
-    },
-    ModelVertex {
-        position: [S, -S, -S],
-        normal: [0.0, 0.0, -1.0],
-        uv: [0.0, 1.0],
-    },
-    ModelVertex {
-        position: [-S, -S, -S],
-        normal: [0.0, 0.0, -1.0],
-        uv: [1.0, 1.0],
-    },
-    ModelVertex {
-        position: [-S, S, -S],
-        normal: [0.0, 0.0, -1.0],
-        uv: [1.0, 0.0],
-    },
-    ModelVertex {
-        position: [S, S, -S],
-        normal: [0.0, 0.0, -1.0],
-        uv: [0.0, 0.0],
-    },
-    ModelVertex {
-        position: [-S, -S, -S],
-        normal: [-1.0, 0.0, 0.0],
-        uv: [0.0, 1.0],
-    },
-    ModelVertex {
-        position: [-S, -S, S],
-        normal: [-1.0, 0.0, 0.0],
-        uv: [1.0, 1.0],
-    },
-    ModelVertex {
-        position: [-S, S, S],
-        normal: [-1.0, 0.0, 0.0],
-        uv: [1.0, 0.0],
-    },
-    ModelVertex {
-        position: [-S, S, -S],
-        normal: [-1.0, 0.0, 0.0],
-        uv: [0.0, 0.0],
-    },
-    ModelVertex {
-        position: [S, -S, S],
-        normal: [1.0, 0.0, 0.0],
-        uv: [0.0, 1.0],
-    },
-    ModelVertex {
-        position: [S, -S, -S],
-        normal: [1.0, 0.0, 0.0],
-        uv: [1.0, 1.0],
-    },
-    ModelVertex {
-        position: [S, S, -S],
-        normal: [1.0, 0.0, 0.0],
-        uv: [1.0, 0.0],
-    },
-    ModelVertex {
-        position: [S, S, S],
-        normal: [1.0, 0.0, 0.0],
-        uv: [0.0, 0.0],
-    },
-    ModelVertex {
-        position: [-S, S, S],
-        normal: [0.0, 1.0, 0.0],
-        uv: [0.0, 1.0],
-    },
-    ModelVertex {
-        position: [S, S, S],
-        normal: [0.0, 1.0, 0.0],
-        uv: [1.0, 1.0],
-    },
-    ModelVertex {
-        position: [S, S, -S],
-        normal: [0.0, 1.0, 0.0],
-        uv: [1.0, 0.0],
-    },
-    ModelVertex {
-        position: [-S, S, -S],
-        normal: [0.0, 1.0, 0.0],
-        uv: [0.0, 0.0],
-    },
-    ModelVertex {
-        position: [-S, -S, -S],
-        normal: [0.0, -1.0, 0.0],
-        uv: [0.0, 1.0],
-    },
-    ModelVertex {
-        position: [S, -S, -S],
-        normal: [0.0, -1.0, 0.0],
-        uv: [1.0, 1.0],
-    },
-    ModelVertex {
-        position: [S, -S, S],
-        normal: [0.0, -1.0, 0.0],
-        uv: [1.0, 0.0],
-    },
-    ModelVertex {
-        position: [-S, -S, S],
-        normal: [0.0, -1.0, 0.0],
-        uv: [0.0, 0.0],
-    },
-];
-
-const CUBE_INDICES: [u32; 36] = [
-    0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4, 8, 9, 10, 10, 11, 8, 12, 13, 14, 14, 15, 12, 16, 17, 18,
-    18, 19, 16, 20, 21, 22, 22, 23, 20,
-];

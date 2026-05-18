@@ -3,10 +3,8 @@ use std::mem;
 use ash::vk;
 
 use super::{
-    MAX_EMISSIVE_LIGHTS, RenderObject, RenderScene, TextureId,
-    assets::GpuAssets,
-    math::{transform_point, transformed_radius},
-    reflections::PreparedReflections,
+    Camera, DirectionalLight, Material, RenderObject, RenderScene, TextureId,
+    reflections::PreparedReflections, shadows::PreparedShadow,
 };
 
 #[repr(C)]
@@ -20,32 +18,57 @@ pub(super) struct SceneUniform {
     reflection_probe_pos_radius: [f32; 4],
     reflection_probe_box_min: [f32; 4],
     reflection_probe_box_max: [f32; 4],
-    point_light_count: [f32; 4],
-    point_light_pos_radius: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
-    point_light_color_power: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
     pub(super) planar_view_proj: [f32; 16],
     reflection_params: [f32; 4],
     planar_plane: [f32; 4],
     planar_params: [f32; 4],
     planar_texture_info: [f32; 4],
+    shadow_view_proj: [f32; 16],
+    shadow_params: [f32; 4],
+    debug_params: [f32; 4],
+    camera_response: [f32; 4],
+    white_balance: [f32; 4],
+    gi_probe_pos_radius: [f32; 4],
+    gi_params: [f32; 4],
+    gi_sh: [[f32; 4]; 9],
+    camera_basis_x: [f32; 4],
+    camera_basis_y: [f32; 4],
+    camera_basis_z: [f32; 4],
+    post_params: [f32; 4],
 }
 
 impl SceneUniform {
     pub(super) fn new(
         scene: &RenderScene,
         extent: vk::Extent2D,
-        assets: &GpuAssets,
         reflections: PreparedReflections,
+        shadow: PreparedShadow,
     ) -> Self {
         let mut uniform = Self::base(scene, extent);
         uniform.set_reflection_info(reflections, false);
-        uniform.collect_emissive_lights(scene, assets);
+        uniform.set_shadow_info(shadow);
+        uniform
+    }
+
+    pub(super) fn shadow(scene: &RenderScene, shadow: PreparedShadow) -> Self {
+        let mut uniform = Self::base(
+            scene,
+            vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+        );
+        uniform.view_proj = shadow.view_proj;
+        uniform.set_shadow_info(shadow);
         uniform
     }
 
     pub(super) fn base(scene: &RenderScene, extent: vk::Extent2D) -> Self {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let light = scene.light;
+        let camera_response = scene.camera_response;
+        let basis = camera_basis(scene.camera);
+        let tan_half_fov = (scene.camera.fov_y * 0.5).tan();
 
         Self {
             view_proj: scene.camera.view_projection(aspect),
@@ -86,14 +109,48 @@ impl SceneUniform {
                 scene.camera.target[2] + 1.0,
                 0.0,
             ],
-            point_light_count: [0.0; 4],
-            point_light_pos_radius: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
-            point_light_color_power: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
             planar_view_proj: scene.camera.view_projection(aspect),
             reflection_params: [0.0, 0.0, 0.35, 0.0],
             planar_plane: [0.0, 1.0, 0.0, 0.0],
             planar_params: [0.0, 0.75, 0.35, 3.5],
             planar_texture_info: [0.0, 0.03, 0.0, 0.0],
+            shadow_view_proj: identity_mat4(),
+            shadow_params: [0.0; 4],
+            debug_params: [
+                scene.debug_mode.shader_value(),
+                scene.camera.near,
+                scene.camera.far,
+                0.0,
+            ],
+            camera_response: [
+                camera_response.exposure.max(0.0),
+                camera_response.contrast.max(0.0),
+                camera_response.saturation.max(0.0),
+                camera_response.enabled as u8 as f32,
+            ],
+            white_balance: [
+                camera_response.white_balance[0].max(0.0),
+                camera_response.white_balance[1].max(0.0),
+                camera_response.white_balance[2].max(0.0),
+                0.0,
+            ],
+            gi_probe_pos_radius: [
+                scene.camera.target[0],
+                scene.camera.target[1],
+                scene.camera.target[2],
+                scene.camera.far.max(1.0),
+            ],
+            gi_params: [1.0, 1.0, 0.18, 0.14],
+            gi_sh: irradiance_sh(light),
+            camera_basis_x: [
+                basis.right[0],
+                basis.right[1],
+                basis.right[2],
+                scene.camera.near,
+            ],
+            camera_basis_y: [basis.up[0], basis.up[1], basis.up[2], scene.camera.far],
+            camera_basis_z: [basis.forward[0], basis.forward[1], basis.forward[2], 0.0],
+            post_params: [aspect, tan_half_fov, 1.0, 0.0],
         }
     }
 
@@ -127,6 +184,12 @@ impl SceneUniform {
             reflections.probe.roughness_fallback,
             reflections.probe.enabled as u8 as f32,
         ];
+        self.gi_probe_pos_radius = [
+            reflection.center[0],
+            reflection.center[1],
+            reflection.center[2],
+            reflection.radius.max(1.0),
+        ];
         self.planar_view_proj = reflections.planar.view_proj;
         self.planar_plane = [
             reflections.planar.normal[0],
@@ -148,61 +211,14 @@ impl SceneUniform {
         ];
     }
 
-    pub(super) fn collect_emissive_lights(&mut self, scene: &RenderScene, assets: &GpuAssets) {
-        for object in &scene.objects {
-            self.push_emissive_light(assets, *object);
-        }
-
-        for model in &scene.models {
-            let Some(gpu_model) = assets.model(model.model) else {
-                continue;
-            };
-
-            for primitive in &gpu_model.primitives {
-                self.push_emissive_light(
-                    assets,
-                    RenderObject {
-                        mesh: primitive.mesh,
-                        pipeline: model.pipeline,
-                        transform: model.transform,
-                        material: primitive.material,
-                    },
-                );
-            }
-        }
-    }
-
-    fn push_emissive_light(&mut self, assets: &GpuAssets, object: RenderObject) {
-        let index = self.point_light_count[0] as usize;
-        if index >= MAX_EMISSIVE_LIGHTS {
-            return;
-        }
-
-        let material = assets.material(object.material);
-        let power = material
-            .emissive_color
-            .iter()
-            .copied()
-            .fold(0.0_f32, f32::max);
-        if power <= 0.001 {
-            return;
-        }
-
-        let Some(mesh) = assets.mesh(object.mesh) else {
-            return;
-        };
-
-        let matrix = object.transform.matrix();
-        let position = transform_point(matrix, mesh.center);
-        let radius = transformed_radius(object.transform, mesh.radius).max(0.35);
-        self.point_light_pos_radius[index] = [position[0], position[1], position[2], radius];
-        self.point_light_color_power[index] = [
-            material.emissive_color[0],
-            material.emissive_color[1],
-            material.emissive_color[2],
-            1.5 + power * 3.5,
+    pub(super) fn set_shadow_info(&mut self, shadow: PreparedShadow) {
+        self.shadow_view_proj = shadow.view_proj;
+        self.shadow_params = [
+            shadow.resolution,
+            shadow.bias,
+            shadow.strength.clamp(0.0, 1.0),
+            1.0,
         ];
-        self.point_light_count[0] += 1.0;
     }
 }
 
@@ -229,10 +245,98 @@ pub(super) struct ObjectPush {
     pub(super) texture_info: [f32; 4],
 }
 
+impl ObjectPush {
+    pub(super) fn new(object: RenderObject, material: Material) -> Self {
+        Self {
+            model: object.transform.matrix(),
+            base_color: material.base_color,
+            emissive_color: [
+                material.emissive_color[0],
+                material.emissive_color[1],
+                material.emissive_color[2],
+                0.0,
+            ],
+            material: [
+                material.metallic,
+                material.roughness,
+                material.specular,
+                material.ambient_occlusion,
+            ],
+            texture_flags: [
+                has_texture(material.base_color_texture),
+                has_texture(material.metallic_roughness_texture),
+                has_texture(material.normal_texture),
+                has_texture(material.occlusion_texture),
+            ],
+            texture_info: [
+                has_texture(material.emissive_texture),
+                material.normal_scale,
+                material.occlusion_strength,
+                material.alpha_cutoff,
+            ],
+        }
+    }
+}
+
 pub(super) fn bytes_of<T>(value: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), mem::size_of::<T>()) }
 }
 
 pub(super) fn has_texture(texture: Option<TextureId>) -> f32 {
     texture.is_some() as u8 as f32
+}
+
+struct CameraBasis {
+    right: [f32; 3],
+    up: [f32; 3],
+    forward: [f32; 3],
+}
+
+fn camera_basis(camera: Camera) -> CameraBasis {
+    let forward = normalize3([
+        camera.target[0] - camera.eye[0],
+        camera.target[1] - camera.eye[1],
+        camera.target[2] - camera.eye[2],
+    ]);
+    let right = normalize3(cross3(forward, camera.up));
+    let up = cross3(right, forward);
+
+    CameraBasis { right, up, forward }
+}
+
+fn irradiance_sh(light: DirectionalLight) -> [[f32; 4]; 9] {
+    let mut sh = [[0.0; 4]; 9];
+    let scale = std::f32::consts::PI / 0.282_095;
+
+    sh[0] = [
+        light.ambient[0] * scale,
+        light.ambient[1] * scale,
+        light.ambient[2] * scale,
+        0.0,
+    ];
+    sh
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = dot3(v, v).sqrt().max(f32::EPSILON);
+
+    [v[0] / len, v[1] / len, v[2] / len]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn identity_mat4() -> [f32; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]
 }

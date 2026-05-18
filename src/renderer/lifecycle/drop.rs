@@ -11,18 +11,24 @@ impl Drop for super::Renderer {
             }
 
             self.cleanup_swapchain();
+            self.camera_meter.destroy(&self.logical_device);
 
             self.assets.destroy(&self.logical_device);
+            self.shadow_map.destroy(&self.logical_device);
             self.reflection_probe.destroy(&self.logical_device);
             self.fallback_reflection_probe.destroy(&self.logical_device);
             self.planar_reflection.destroy(&self.logical_device);
             self.fallback_planar_reflection
                 .destroy(&self.logical_device);
+            self.scene_target.destroy(&self.logical_device);
 
             for slot in &mut self.pipelines {
                 slot.pipeline.destroy(&self.logical_device);
             }
+            self.shadow_pipeline.pipeline.destroy(&self.logical_device);
+            self.post_pipeline.pipeline.destroy(&self.logical_device);
 
+            self.shadow_scene_bindings.destroy(&self.logical_device);
             self.probe_scene_bindings.destroy(&self.logical_device);
             self.planar_scene_bindings.destroy(&self.logical_device);
             self.scene_bindings.destroy(&self.logical_device);

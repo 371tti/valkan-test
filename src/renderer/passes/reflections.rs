@@ -1,11 +1,15 @@
 use ash::vk;
 
 use super::{
-    BoxReflectionSettings, Camera, PlanarReflectionSettings, RenderObject, RenderScene, Renderer,
+    BoxReflectionSettings, Camera, CameraResponse, PlanarReflectionSettings, RenderDebugMode,
+    RenderObject, RenderScene, Renderer,
+    assets::SceneImageDescriptors,
     math::{
-        desired_reflection_probe_size, distance_squared, dot3, normalize_or, normalize_or_zero,
-        reflect_camera, reflection_probe_face_axes, transform_point, transformed_radius,
+        desired_reflection_probe_size, distance_squared, dot3, for_each_render_object,
+        normalize_or, normalize_or_zero, reflect_camera, reflection_probe_face_axes,
+        transform_point, transformed_radius,
     },
+    shadows::PreparedShadow,
     uniforms::SceneUniform,
 };
 
@@ -59,10 +63,16 @@ impl SceneBounds {
 
     fn include_sphere(&mut self, center: [f32; 3], radius: f32) {
         let radius = radius.max(0.01);
-        for axis in 0..3 {
-            self.min[axis] = self.min[axis].min(center[axis] - radius);
-            self.max[axis] = self.max[axis].max(center[axis] + radius);
-        }
+        self.min = [
+            self.min[0].min(center[0] - radius),
+            self.min[1].min(center[1] - radius),
+            self.min[2].min(center[2] - radius),
+        ];
+        self.max = [
+            self.max[0].max(center[0] + radius),
+            self.max[1].max(center[1] + radius),
+            self.max[2].max(center[2] + radius),
+        ];
         self.has_value = true;
     }
 
@@ -156,6 +166,7 @@ impl Renderer {
                     self.swapchain.format,
                     desired_probe_size,
                 );
+                self.reflection_probe_face_cursor = 0;
             }
 
             if rebuild_planar {
@@ -172,7 +183,7 @@ impl Renderer {
             }
         }
 
-        self.update_reflection_descriptors();
+        self.update_scene_image_descriptors();
     }
 
     fn desired_planar_reflection_extent(&self, planar: PlanarReflectionSettings) -> vk::Extent2D {
@@ -196,21 +207,46 @@ impl Renderer {
         }
     }
 
-    pub(super) fn update_reflection_descriptors(&self) {
-        self.scene_bindings.update_reflections(
+    pub(super) fn update_scene_image_descriptors(&self) {
+        self.scene_bindings.update_scene_images(
             &self.logical_device,
-            self.reflection_probe.descriptor(),
-            self.planar_reflection.descriptor(),
+            SceneImageDescriptors {
+                cube_reflection: self.reflection_probe.descriptor(),
+                planar_reflection: self.planar_reflection.descriptor(),
+                shadow_map: self.shadow_map.descriptor(),
+                scene_color: self.scene_target.color_descriptor(),
+                scene_depth: self.scene_target.depth_descriptor(),
+            },
         );
-        self.probe_scene_bindings.update_reflections(
+        self.shadow_scene_bindings.update_scene_images(
             &self.logical_device,
-            self.fallback_reflection_probe.descriptor(),
-            self.fallback_planar_reflection.descriptor(),
+            SceneImageDescriptors {
+                cube_reflection: self.fallback_reflection_probe.descriptor(),
+                planar_reflection: self.fallback_planar_reflection.descriptor(),
+                shadow_map: self.shadow_map.descriptor(),
+                scene_color: self.scene_target.color_descriptor(),
+                scene_depth: self.scene_target.depth_descriptor(),
+            },
         );
-        self.planar_scene_bindings.update_reflections(
+        self.probe_scene_bindings.update_scene_images(
             &self.logical_device,
-            self.fallback_reflection_probe.descriptor(),
-            self.fallback_planar_reflection.descriptor(),
+            SceneImageDescriptors {
+                cube_reflection: self.fallback_reflection_probe.descriptor(),
+                planar_reflection: self.fallback_planar_reflection.descriptor(),
+                shadow_map: self.shadow_map.descriptor(),
+                scene_color: self.scene_target.color_descriptor(),
+                scene_depth: self.scene_target.depth_descriptor(),
+            },
+        );
+        self.planar_scene_bindings.update_scene_images(
+            &self.logical_device,
+            SceneImageDescriptors {
+                cube_reflection: self.fallback_reflection_probe.descriptor(),
+                planar_reflection: self.fallback_planar_reflection.descriptor(),
+                shadow_map: self.shadow_map.descriptor(),
+                scene_color: self.scene_target.color_descriptor(),
+                scene_depth: self.scene_target.depth_descriptor(),
+            },
         );
     }
 
@@ -252,34 +288,14 @@ impl Renderer {
             scene.camera.target[2] - scene.camera.eye[2],
         ]);
 
-        for object in &scene.objects {
+        for_each_render_object(scene, &self.assets, |object| {
             self.consider_reflection_probe_object(
                 &mut bounds,
-                *object,
+                object,
                 scene.camera.eye,
                 camera_forward,
             );
-        }
-
-        for model in &scene.models {
-            let Some(gpu_model) = self.assets.model(model.model) else {
-                continue;
-            };
-
-            for primitive in &gpu_model.primitives {
-                self.consider_reflection_probe_object(
-                    &mut bounds,
-                    RenderObject {
-                        mesh: primitive.mesh,
-                        pipeline: model.pipeline,
-                        transform: model.transform,
-                        material: primitive.material,
-                    },
-                    scene.camera.eye,
-                    camera_forward,
-                );
-            }
-        }
+        });
 
         bounds.info(scene.camera.target, None, scene.reflections.box_projection)
     }
@@ -298,11 +314,11 @@ impl Renderer {
 
         let material = self.assets.material(object.material);
         let reflectivity = material.metallic
-            + material
-                .metallic_roughness_texture
-                .is_some()
-                .then_some(0.5)
-                .unwrap_or(0.0);
+            + if material.metallic_roughness_texture.is_some() {
+                0.5
+            } else {
+                0.0
+            };
         if reflectivity <= 0.2 {
             return;
         }
@@ -311,9 +327,7 @@ impl Renderer {
     }
 
     fn object_center_radius(&self, object: RenderObject) -> Option<([f32; 3], f32)> {
-        let Some(mesh) = self.assets.mesh(object.mesh) else {
-            return None;
-        };
+        let mesh = self.assets.mesh(object.mesh)?;
         let matrix = object.transform.matrix();
         let center = transform_point(matrix, mesh.center);
         let radius = transformed_radius(object.transform, mesh.radius);
@@ -325,8 +339,8 @@ impl Renderer {
 impl SceneUniform {
     pub(super) fn reflection_probe_face(
         scene: &RenderScene,
-        assets: &super::assets::GpuAssets,
         reflections: PreparedReflections,
+        shadow: PreparedShadow,
         face: usize,
     ) -> Self {
         let (direction, up) = reflection_probe_face_axes(face);
@@ -346,8 +360,10 @@ impl SceneUniform {
         let mut uniform = Self::base(
             &RenderScene {
                 camera,
+                camera_response: CameraResponse::disabled(),
                 light: scene.light,
                 reflections: scene.reflections,
+                debug_mode: RenderDebugMode::Default,
                 objects: Vec::new(),
                 models: Vec::new(),
             },
@@ -360,22 +376,24 @@ impl SceneUniform {
         uniform.planar_view_proj = reflections.planar.view_proj;
         uniform.camera_pos = [center[0], center[1], center[2], 0.0];
         uniform.set_reflection_info(reflections, false);
-        uniform.collect_emissive_lights(scene, assets);
+        uniform.set_shadow_info(shadow);
         uniform
     }
 
     pub(super) fn planar_reflection(
         scene: &RenderScene,
         extent: vk::Extent2D,
-        assets: &super::assets::GpuAssets,
         reflections: PreparedReflections,
+        shadow: PreparedShadow,
     ) -> Self {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let mut uniform = Self::base(
             &RenderScene {
                 camera: reflections.planar.camera,
+                camera_response: CameraResponse::disabled(),
                 light: scene.light,
                 reflections: scene.reflections,
+                debug_mode: RenderDebugMode::Default,
                 objects: Vec::new(),
                 models: Vec::new(),
             },
@@ -390,7 +408,7 @@ impl SceneUniform {
             0.0,
         ];
         uniform.set_reflection_info(reflections, true);
-        uniform.collect_emissive_lights(scene, assets);
+        uniform.set_shadow_info(shadow);
         uniform
     }
 }

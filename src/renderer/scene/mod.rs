@@ -33,6 +33,7 @@ pub struct PipelineId(pub usize);
 impl PipelineId {
     pub const LIT_MESH: Self = Self(0);
     pub const LIT_MESH_TRANSPARENT: Self = Self(1);
+    pub const LIT_MESH_WIREFRAME: Self = Self(2);
 }
 
 pub trait SceneController {
@@ -42,11 +43,35 @@ pub trait SceneController {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct CameraMetering {
+    pub valid: bool,
+    pub average_luminance: f32,
+    pub center_luminance: f32,
+    pub highlight_fraction: f32,
+    pub average_color: [f32; 3],
+    pub white_balance_confidence: f32,
+}
+
+impl Default for CameraMetering {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            average_luminance: 0.18,
+            center_luminance: 0.18,
+            highlight_fraction: 0.0,
+            average_color: [0.18; 3],
+            white_balance_confidence: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct SceneContext {
     pub elapsed: f32,
     pub delta_time: f32,
     pub frame: u64,
     pub window_size: [u32; 2],
+    pub metering: CameraMetering,
 }
 
 #[derive(Debug, Clone)]
@@ -77,43 +102,97 @@ pub enum SceneKey {
     KeyD,
     KeyQ,
     KeyE,
+    F12,
     Other,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum RenderDebugMode {
+    #[default]
+    Default,
+    Wireframe,
+    Depth,
+    Normals,
+    ShadowMask,
+    NoTexture,
+}
+
+impl RenderDebugMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Default => Self::Wireframe,
+            Self::Wireframe => Self::Depth,
+            Self::Depth => Self::Normals,
+            Self::Normals => Self::ShadowMask,
+            Self::ShadowMask => Self::NoTexture,
+            Self::NoTexture => Self::Default,
+        }
+    }
+
+    pub fn shader_value(self) -> f32 {
+        match self {
+            Self::Default => 0.0,
+            Self::Wireframe => 1.0,
+            Self::Depth => 2.0,
+            Self::Normals => 3.0,
+            Self::ShadowMask => 4.0,
+            Self::NoTexture => 5.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct RenderScene {
     pub camera: Camera,
+    pub camera_response: CameraResponse,
     pub light: DirectionalLight,
     pub reflections: ReflectionSettings,
+    pub debug_mode: RenderDebugMode,
     pub objects: Vec<RenderObject>,
     pub models: Vec<RenderModel>,
 }
 
-impl Default for RenderScene {
-    fn default() -> Self {
+#[derive(Debug, Clone, Copy)]
+pub struct CameraResponse {
+    pub enabled: bool,
+    pub exposure: f32,
+    pub white_balance: [f32; 3],
+    pub contrast: f32,
+    pub saturation: f32,
+}
+
+impl CameraResponse {
+    pub const fn disabled() -> Self {
         Self {
-            camera: Camera::default(),
-            light: DirectionalLight::default(),
-            reflections: ReflectionSettings::default(),
-            objects: Vec::new(),
-            models: Vec::new(),
+            enabled: false,
+            exposure: 1.0,
+            white_balance: [1.0; 3],
+            contrast: 1.0,
+            saturation: 1.0,
+        }
+    }
+
+    pub const fn enabled(exposure: f32, white_balance: [f32; 3]) -> Self {
+        Self {
+            enabled: true,
+            exposure,
+            white_balance,
+            contrast: 1.06,
+            saturation: 1.04,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+impl Default for CameraResponse {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ReflectionSettings {
     pub box_projection: BoxReflectionSettings,
     pub planar: PlanarReflectionSettings,
-}
-
-impl Default for ReflectionSettings {
-    fn default() -> Self {
-        Self {
-            box_projection: BoxReflectionSettings::default(),
-            planar: PlanarReflectionSettings::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,7 +210,7 @@ impl Default for BoxReflectionSettings {
         Self {
             enabled: true,
             parallax_correction: true,
-            resolution: 256,
+            resolution: 128,
             intensity: 1.0,
             roughness_fallback: 0.35,
             bounds_padding: 0.03,
@@ -156,10 +235,10 @@ pub struct PlanarReflectionSettings {
 impl Default for PlanarReflectionSettings {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             plane_origin: [0.0, 0.0, 0.0],
             plane_normal: [0.0, 1.0, 0.0],
-            resolution_scale: 1.0,
+            resolution_scale: 0.5,
             intensity: 1.0,
             max_roughness: 0.75,
             normal_alignment: 0.35,
@@ -227,8 +306,8 @@ impl Material {
 
     pub const fn matte(base_color: [f32; 4]) -> Self {
         Self {
-            roughness: 0.9,
-            specular: 0.25,
+            roughness: 0.96,
+            specular: 0.08,
             ..Self::new(base_color)
         }
     }
@@ -332,10 +411,12 @@ impl Default for DirectionalLight {
             direction: [-0.35, -0.75, -0.55],
             color: [1.0, 0.94, 0.86],
             intensity: 1.2,
-            ambient: [0.08, 0.1, 0.14],
+            ambient: [0.035, 0.04, 0.055],
         }
     }
 }
+
+pub const DEFAULT_CAMERA_FAR: f32 = 5_000.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
@@ -371,7 +452,7 @@ impl Default for Camera {
             up: [0.0, 1.0, 0.0],
             fov_y: 60.0_f32.to_radians(),
             near: 0.1,
-            far: 100.0,
+            far: DEFAULT_CAMERA_FAR,
         }
     }
 }

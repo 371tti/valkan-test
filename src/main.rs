@@ -16,7 +16,7 @@ fn main() {
         .window_title("Ash Vulkan")
         .window_size(2400, 1600)
         .window_min_size(240, 160)
-        .window_transparent(true);
+        .window_transparent(false);
 
     event_loop.run_app(&mut app).unwrap();
 }

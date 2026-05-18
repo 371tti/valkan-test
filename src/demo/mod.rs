@@ -1,5 +1,4 @@
 mod camera;
-mod math;
 mod model_loading;
 mod scene;
 

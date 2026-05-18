@@ -18,6 +18,7 @@ pub(super) fn scene_key(physical_key: PhysicalKey) -> SceneKey {
         PhysicalKey::Code(KeyCode::KeyD) => SceneKey::KeyD,
         PhysicalKey::Code(KeyCode::KeyQ) => SceneKey::KeyQ,
         PhysicalKey::Code(KeyCode::KeyE) => SceneKey::KeyE,
+        PhysicalKey::Code(KeyCode::F12) => SceneKey::F12,
         _ => SceneKey::Other,
     }
 }

@@ -4,11 +4,14 @@ use ash::vk;
 
 use super::{
     PipelineSlot, ReflectionProbe, RenderObject, RenderScene, Renderer, SceneBindings,
-    math::{model_object, transform_point},
-    uniforms::{ObjectPush, bytes_of, has_texture},
+    math::{distance_squared, for_each_render_object, transform_point},
+    rendering::{
+        clear_color_attachment, clear_depth_attachment, render_area, set_viewport_and_scissor,
+    },
+    uniforms::{ObjectPush, bytes_of},
 };
 use crate::renderer::reflections::PreparedReflections;
-use crate::renderer::{MaterialId, PipelineId};
+use crate::renderer::{MaterialId, PipelineId, RenderDebugMode};
 
 #[derive(Clone, Copy)]
 struct TransparentDraw {
@@ -16,110 +19,95 @@ struct TransparentDraw {
     distance2: f32,
 }
 
-fn distance_squared(a: [f32; 3], b: [f32; 3]) -> f32 {
-    let dx = a[0] - b[0];
-    let dy = a[1] - b[1];
-    let dz = a[2] - b[2];
-
-    dx * dx + dy * dy + dz * dz
-}
-
-fn draw_object(
-    device: &ash::Device,
-    pipelines: &[PipelineSlot],
-    assets: &super::assets::GpuAssets,
-    scene_bindings: &SceneBindings,
+struct DrawContext<'a> {
+    device: &'a ash::Device,
+    pipelines: &'a [PipelineSlot],
+    assets: &'a super::assets::GpuAssets,
+    scene_bindings: &'a SceneBindings,
     command_buffer: vk::CommandBuffer,
     frame_index: usize,
-    object: RenderObject,
-    bound_pipeline: &mut Option<PipelineId>,
-    bound_material: &mut Option<MaterialId>,
-) {
-    let Some(mesh) = assets.mesh(object.mesh) else {
+    debug_mode: RenderDebugMode,
+}
+
+#[derive(Default)]
+struct DrawBindings {
+    pipeline: Option<PipelineId>,
+    material: Option<MaterialId>,
+}
+
+fn draw_object(context: &DrawContext<'_>, object: RenderObject, bindings: &mut DrawBindings) {
+    let Some(mesh) = context.assets.mesh(object.mesh) else {
         return;
     };
-    let material = assets.material(object.material);
-    let pipeline = if object.pipeline == PipelineId::LIT_MESH && material.is_translucent() {
+    let material = context.assets.material(object.material);
+    let pipeline = if context.debug_mode == RenderDebugMode::Wireframe {
+        PipelineId::LIT_MESH_WIREFRAME
+    } else if object.pipeline == PipelineId::LIT_MESH && material.is_translucent() {
         PipelineId::LIT_MESH_TRANSPARENT
     } else {
         object.pipeline
     };
-    let Some(slot) = pipelines.get(pipeline.0) else {
+    let Some(slot) = context.pipelines.get(pipeline.0) else {
         return;
     };
 
     unsafe {
-        if *bound_pipeline != Some(pipeline) {
-            device.cmd_bind_pipeline(
-                command_buffer,
+        if bindings.pipeline != Some(pipeline) {
+            context.device.cmd_bind_pipeline(
+                context.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 slot.pipeline.handle,
             );
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
+            context.device.cmd_bind_descriptor_sets(
+                context.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 slot.pipeline.layout,
                 0,
-                std::slice::from_ref(&scene_bindings.sets[frame_index]),
+                std::slice::from_ref(&context.scene_bindings.sets[context.frame_index]),
                 &[],
             );
-            *bound_pipeline = Some(pipeline);
-            *bound_material = None;
+            bindings.pipeline = Some(pipeline);
+            bindings.material = None;
         }
 
-        if *bound_material != Some(object.material) {
-            if let Some(texture_set) = assets.material_texture_set(object.material) {
-                device.cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    slot.pipeline.layout,
-                    1,
-                    std::slice::from_ref(&texture_set),
-                    &[],
-                );
-                *bound_material = Some(object.material);
-            }
+        if bindings.material != Some(object.material)
+            && let Some(texture_set) = context.assets.material_texture_set(object.material)
+        {
+            context.device.cmd_bind_descriptor_sets(
+                context.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                slot.pipeline.layout,
+                1,
+                std::slice::from_ref(&texture_set),
+                &[],
+            );
+            bindings.material = Some(object.material);
         }
 
-        let push = ObjectPush {
-            model: object.transform.matrix(),
-            base_color: material.base_color,
-            emissive_color: [
-                material.emissive_color[0],
-                material.emissive_color[1],
-                material.emissive_color[2],
-                0.0,
-            ],
-            material: [
-                material.metallic,
-                material.roughness,
-                material.specular,
-                material.ambient_occlusion,
-            ],
-            texture_flags: [
-                has_texture(material.base_color_texture),
-                has_texture(material.metallic_roughness_texture),
-                has_texture(material.normal_texture),
-                has_texture(material.occlusion_texture),
-            ],
-            texture_info: [
-                has_texture(material.emissive_texture),
-                material.normal_scale,
-                material.occlusion_strength,
-                material.alpha_cutoff,
-            ],
-        };
-        device.cmd_push_constants(
-            command_buffer,
+        let push = ObjectPush::new(object, material);
+        context.device.cmd_push_constants(
+            context.command_buffer,
             slot.pipeline.layout,
             vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             0,
             bytes_of(&push),
         );
 
-        device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex.buffer], &[0]);
-        device.cmd_bind_index_buffer(command_buffer, mesh.index.buffer, 0, vk::IndexType::UINT32);
-        device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+        context.device.cmd_bind_vertex_buffers(
+            context.command_buffer,
+            0,
+            &[mesh.vertex.buffer],
+            &[0],
+        );
+        context.device.cmd_bind_index_buffer(
+            context.command_buffer,
+            mesh.index.buffer,
+            0,
+            vk::IndexType::UINT32,
+        );
+        context
+            .device
+            .cmd_draw_indexed(context.command_buffer, mesh.index_count, 1, 0, 0, 0);
     }
 }
 
@@ -145,6 +133,133 @@ fn collect_transparent_draw(
 }
 
 impl Renderer {
+    fn record_scene_target(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        frame_index: usize,
+        scene: &RenderScene,
+    ) {
+        self.transition_color_image_layout(
+            command_buffer,
+            self.scene_target.image(),
+            self.scene_target.color_layout(),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            1,
+        );
+        self.scene_target
+            .set_color_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        self.transition_depth_image_layout(
+            command_buffer,
+            self.scene_target.depth.image(),
+            self.scene_target.depth_layout(),
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        );
+        self.scene_target
+            .set_depth_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        unsafe {
+            let color_attachment = clear_color_attachment(
+                self.scene_target.view,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                [0.0, 0.0, 0.0, 1.0],
+            );
+            let depth_attachment = clear_depth_attachment(
+                self.scene_target.depth.view,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::AttachmentStoreOp::STORE,
+            );
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(render_area(self.scene_target.extent))
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&color_attachment))
+                .depth_attachment(&depth_attachment);
+
+            self.logical_device
+                .cmd_begin_rendering(command_buffer, &rendering_info);
+            set_viewport_and_scissor(
+                &self.logical_device,
+                command_buffer,
+                self.scene_target.extent,
+            );
+            self.draw_scene_geometry(
+                command_buffer,
+                &self.scene_bindings,
+                frame_index,
+                scene,
+                scene.camera.eye,
+                scene.debug_mode,
+            );
+            self.logical_device.cmd_end_rendering(command_buffer);
+        }
+
+        self.transition_color_image_layout(
+            command_buffer,
+            self.scene_target.image(),
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            1,
+        );
+        self.scene_target
+            .set_color_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        self.transition_depth_image_layout(
+            command_buffer,
+            self.scene_target.depth.image(),
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+        );
+        self.scene_target
+            .set_depth_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    }
+
+    fn record_postprocess(&self, command_buffer: vk::CommandBuffer, frame_index: usize) {
+        unsafe {
+            self.logical_device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.post_pipeline.pipeline.handle,
+            );
+            self.logical_device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.post_pipeline.pipeline.layout,
+                0,
+                std::slice::from_ref(&self.scene_bindings.sets[frame_index]),
+                &[],
+            );
+            self.logical_device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        }
+    }
+
+    fn finish_swapchain_image(&mut self, command_buffer: vk::CommandBuffer, image_index: usize) {
+        let image = self.swapchain.images[image_index];
+
+        if self.camera_meter.should_sample() {
+            self.transition_image_layout(
+                command_buffer,
+                image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+            self.camera_meter
+                .record_copy(&self.logical_device, command_buffer, image, image_index);
+            self.transition_image_layout(
+                command_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            );
+        } else {
+            self.transition_image_layout(
+                command_buffer,
+                image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            );
+        }
+
+        self.swapchain.image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
+    }
+
     fn record_reflection_probe(
         &mut self,
         command_buffer: vk::CommandBuffer,
@@ -156,22 +271,14 @@ impl Renderer {
             return;
         }
 
-        let binding_base = frame_index * ReflectionProbe::FACE_COUNT;
+        let face = self.reflection_probe_face_cursor % ReflectionProbe::FACE_COUNT;
+        let binding_index = frame_index * ReflectionProbe::FACE_COUNT + face;
 
-        self.record_reflection_probe_faces(
-            command_buffer,
-            self.reflection_probe.image(),
-            self.reflection_probe.layout(),
-            self.reflection_probe.extent,
-            &self.reflection_probe.face_views,
-            self.reflection_probe.depth.view,
-            &self.probe_scene_bindings,
-            binding_base,
-            scene,
-            reflections.probe.center,
-        );
+        self.record_reflection_probe_face(command_buffer, binding_index, face, scene, reflections);
         self.reflection_probe
             .set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        self.reflection_probe_face_cursor =
+            (self.reflection_probe_face_cursor + 1) % ReflectionProbe::FACE_COUNT;
     }
 
     fn record_planar_reflection(
@@ -194,50 +301,23 @@ impl Renderer {
         );
 
         unsafe {
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: self.planar_reflection.extent.width as f32,
-                height: self.planar_reflection.extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: self.planar_reflection.extent,
-            };
-
-            self.logical_device
-                .cmd_set_viewport(command_buffer, 0, &[viewport]);
-            self.logical_device
-                .cmd_set_scissor(command_buffer, 0, &[scissor]);
-
-            let color_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(self.planar_reflection.view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.025, 0.035, 0.05, 1.0],
-                    },
-                });
-            let depth_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(self.planar_reflection.depth.view)
-                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                });
+            set_viewport_and_scissor(
+                &self.logical_device,
+                command_buffer,
+                self.planar_reflection.extent,
+            );
+            let color_attachment = clear_color_attachment(
+                self.planar_reflection.view,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                [0.0, 0.0, 0.0, 1.0],
+            );
+            let depth_attachment = clear_depth_attachment(
+                self.planar_reflection.depth.view,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::AttachmentStoreOp::DONT_CARE,
+            );
             let rendering_info = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.planar_reflection.extent,
-                })
+                .render_area(render_area(self.planar_reflection.extent))
                 .layer_count(1)
                 .color_attachments(std::slice::from_ref(&color_attachment))
                 .depth_attachment(&depth_attachment);
@@ -250,6 +330,7 @@ impl Renderer {
                 frame_index,
                 scene,
                 reflections.planar.camera.eye,
+                RenderDebugMode::Default,
             );
             self.logical_device.cmd_end_rendering(command_buffer);
         }
@@ -265,93 +346,60 @@ impl Renderer {
             .set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 
-    fn record_reflection_probe_faces(
+    fn record_reflection_probe_face(
         &self,
         command_buffer: vk::CommandBuffer,
-        image: vk::Image,
-        old_layout: vk::ImageLayout,
-        extent: vk::Extent2D,
-        face_views: &[vk::ImageView],
-        depth_view: vk::ImageView,
-        scene_bindings: &SceneBindings,
-        binding_base: usize,
+        binding_index: usize,
+        face: usize,
         scene: &RenderScene,
-        probe_center: [f32; 3],
+        reflections: PreparedReflections,
     ) {
+        let probe = &self.reflection_probe;
+        let face = face.min(ReflectionProbe::FACE_COUNT - 1);
+        let face_view = probe.face_views[face];
+
         self.transition_color_image_layout(
             command_buffer,
-            image,
-            old_layout,
+            probe.image(),
+            probe.layout(),
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             ReflectionProbe::FACE_COUNT as u32,
         );
 
         unsafe {
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: extent.width as f32,
-                height: extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            };
+            set_viewport_and_scissor(&self.logical_device, command_buffer, probe.extent);
+            let color_attachment = clear_color_attachment(
+                face_view,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                [0.0, 0.0, 0.0, 1.0],
+            );
+            let depth_attachment = clear_depth_attachment(
+                probe.depth.view,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::AttachmentStoreOp::DONT_CARE,
+            );
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(render_area(probe.extent))
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&color_attachment))
+                .depth_attachment(&depth_attachment);
 
             self.logical_device
-                .cmd_set_viewport(command_buffer, 0, &[viewport]);
-            self.logical_device
-                .cmd_set_scissor(command_buffer, 0, &[scissor]);
-
-            for face in 0..ReflectionProbe::FACE_COUNT {
-                let color_attachment = vk::RenderingAttachmentInfo::default()
-                    .image_view(face_views[face])
-                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .clear_value(vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.04, 0.06, 0.09, 1.0],
-                        },
-                    });
-                let depth_attachment = vk::RenderingAttachmentInfo::default()
-                    .image_view(depth_view)
-                    .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .clear_value(vk::ClearValue {
-                        depth_stencil: vk::ClearDepthStencilValue {
-                            depth: 1.0,
-                            stencil: 0,
-                        },
-                    });
-                let rendering_info = vk::RenderingInfo::default()
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent,
-                    })
-                    .layer_count(1)
-                    .color_attachments(std::slice::from_ref(&color_attachment))
-                    .depth_attachment(&depth_attachment);
-
-                self.logical_device
-                    .cmd_begin_rendering(command_buffer, &rendering_info);
-                self.draw_scene_geometry(
-                    command_buffer,
-                    scene_bindings,
-                    binding_base + face,
-                    scene,
-                    probe_center,
-                );
-                self.logical_device.cmd_end_rendering(command_buffer);
-            }
+                .cmd_begin_rendering(command_buffer, &rendering_info);
+            self.draw_scene_geometry(
+                command_buffer,
+                &self.probe_scene_bindings,
+                binding_index,
+                scene,
+                reflections.probe.center,
+                RenderDebugMode::Default,
+            );
+            self.logical_device.cmd_end_rendering(command_buffer);
         }
 
         self.transition_color_image_layout(
             command_buffer,
-            image,
+            probe.image(),
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             ReflectionProbe::FACE_COUNT as u32,
@@ -365,49 +413,25 @@ impl Renderer {
         binding_index: usize,
         scene: &RenderScene,
         camera_eye: [f32; 3],
+        debug_mode: RenderDebugMode,
     ) {
-        let mut bound_pipeline = None;
-        let mut bound_material = None;
+        let context = DrawContext {
+            device: &self.logical_device,
+            pipelines: &self.pipelines,
+            assets: &self.assets,
+            scene_bindings,
+            command_buffer,
+            frame_index: binding_index,
+            debug_mode,
+        };
+        let mut bindings = DrawBindings::default();
         let mut transparent = Vec::new();
 
-        for object in &scene.objects {
-            if !collect_transparent_draw(&self.assets, &mut transparent, camera_eye, *object) {
-                draw_object(
-                    &self.logical_device,
-                    &self.pipelines,
-                    &self.assets,
-                    scene_bindings,
-                    command_buffer,
-                    binding_index,
-                    *object,
-                    &mut bound_pipeline,
-                    &mut bound_material,
-                );
+        for_each_render_object(scene, &self.assets, |object| {
+            if !collect_transparent_draw(&self.assets, &mut transparent, camera_eye, object) {
+                draw_object(&context, object, &mut bindings);
             }
-        }
-
-        for model in &scene.models {
-            let Some(gpu_model) = self.assets.model(model.model) else {
-                continue;
-            };
-
-            for primitive in &gpu_model.primitives {
-                let object = model_object(model.transform, model.pipeline, primitive);
-                if !collect_transparent_draw(&self.assets, &mut transparent, camera_eye, object) {
-                    draw_object(
-                        &self.logical_device,
-                        &self.pipelines,
-                        &self.assets,
-                        scene_bindings,
-                        command_buffer,
-                        binding_index,
-                        object,
-                        &mut bound_pipeline,
-                        &mut bound_material,
-                    );
-                }
-            }
-        }
+        });
 
         transparent.sort_by(|a, b| {
             b.distance2
@@ -416,17 +440,7 @@ impl Renderer {
         });
 
         for item in transparent {
-            draw_object(
-                &self.logical_device,
-                &self.pipelines,
-                &self.assets,
-                scene_bindings,
-                command_buffer,
-                binding_index,
-                item.object,
-                &mut bound_pipeline,
-                &mut bound_material,
-            );
+            draw_object(&context, item.object, &mut bindings);
         }
     }
 
@@ -446,9 +460,10 @@ impl Renderer {
                 .begin_command_buffer(command_buffer, &begin_info)
                 .expect("failed to begin command buffer");
 
+            self.record_shadow_map(command_buffer, frame_index, scene);
             self.record_reflection_probe(command_buffer, frame_index, scene, reflections);
             self.record_planar_reflection(command_buffer, frame_index, scene, reflections);
-
+            self.record_scene_target(command_buffer, frame_index, scene);
             let image = self.swapchain.images[image_index];
             let old_layout = self.swapchain.image_layouts[image_index];
 
@@ -459,77 +474,24 @@ impl Renderer {
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             );
 
-            let color_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(self.swapchain.image_views[image_index])
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 0.0],
-                    },
-                });
-
-            let depth_attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(self.swapchain.depth.view)
-                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .clear_value(vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                });
-
+            let color_attachment = clear_color_attachment(
+                self.swapchain.image_views[image_index],
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                [0.0, 0.0, 0.0, 1.0],
+            );
             let rendering_info = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.swapchain.extent,
-                })
+                .render_area(render_area(self.swapchain.extent))
                 .layer_count(1)
-                .color_attachments(std::slice::from_ref(&color_attachment))
-                .depth_attachment(&depth_attachment);
+                .color_attachments(std::slice::from_ref(&color_attachment));
 
             self.logical_device
                 .cmd_begin_rendering(command_buffer, &rendering_info);
 
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: self.swapchain.extent.width as f32,
-                height: self.swapchain.extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: self.swapchain.extent,
-            };
-
-            self.logical_device
-                .cmd_set_viewport(command_buffer, 0, &[viewport]);
-            self.logical_device
-                .cmd_set_scissor(command_buffer, 0, &[scissor]);
-
-            self.draw_scene_geometry(
-                command_buffer,
-                &self.scene_bindings,
-                frame_index,
-                scene,
-                scene.camera.eye,
-            );
+            set_viewport_and_scissor(&self.logical_device, command_buffer, self.swapchain.extent);
+            self.record_postprocess(command_buffer, frame_index);
             self.logical_device.cmd_end_rendering(command_buffer);
 
-            self.transition_image_layout(
-                command_buffer,
-                image,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-            );
-
-            self.swapchain.image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
+            self.finish_swapchain_image(command_buffer, image_index);
 
             self.logical_device
                 .end_command_buffer(command_buffer)

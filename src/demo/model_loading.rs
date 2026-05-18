@@ -10,10 +10,10 @@ pub fn load_scene_model(renderer: &mut Renderer) -> ModelId {
 fn model_paths() -> Vec<String> {
     let mut paths = Vec::new();
 
-    if let Ok(path) = std::env::var(MODEL_PATH_ENV) {
-        if !path.trim().is_empty() {
-            paths.push(path);
-        }
+    if let Ok(path) = std::env::var(MODEL_PATH_ENV)
+        && !path.trim().is_empty()
+    {
+        paths.push(path);
     }
 
     paths.extend(MODEL_CANDIDATES.iter().map(|path| (*path).to_string()));

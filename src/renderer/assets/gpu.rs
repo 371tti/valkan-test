@@ -494,6 +494,22 @@ impl GpuBuffer {
         buffer
     }
 
+    pub fn host_transfer_dst(
+        instance: &Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        size: vk::DeviceSize,
+    ) -> Self {
+        Self::new(
+            instance,
+            device,
+            physical_device,
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    }
+
     fn new(
         instance: &Instance,
         device: &ash::Device,
@@ -576,6 +592,26 @@ impl GpuBuffer {
         }
     }
 
+    pub unsafe fn with_mapped_bytes<T>(
+        &self,
+        device: &ash::Device,
+        size: vk::DeviceSize,
+        read: impl FnOnce(&[u8]) -> T,
+    ) -> T {
+        let mapped = unsafe {
+            device
+                .map_memory(self.memory, 0, size, vk::MemoryMapFlags::empty())
+                .expect("renderer: failed to map buffer memory")
+        };
+
+        let bytes = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), size as usize) };
+        let result = read(bytes);
+
+        unsafe { device.unmap_memory(self.memory) };
+
+        result
+    }
+
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         if self.buffer != vk::Buffer::null() {
             unsafe { device.destroy_buffer(self.buffer, None) };
@@ -598,53 +634,65 @@ pub(in crate::renderer) struct SceneBindings {
     owns_layout: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::renderer) struct SceneImageDescriptors {
+    pub cube_reflection: vk::DescriptorImageInfo,
+    pub planar_reflection: vk::DescriptorImageInfo,
+    pub shadow_map: vk::DescriptorImageInfo,
+    pub scene_color: vk::DescriptorImageInfo,
+    pub scene_depth: vk::DescriptorImageInfo,
+}
+
+pub(in crate::renderer) struct SceneBindingDesc {
+    pub images: SceneImageDescriptors,
+    pub layout: vk::DescriptorSetLayout,
+    pub count: usize,
+    pub owns_layout: bool,
+}
+
 impl SceneBindings {
     pub fn new<T: Copy>(
         instance: &Instance,
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         initial: &T,
-        cube_reflection: vk::DescriptorImageInfo,
-        planar_reflection: vk::DescriptorImageInfo,
+        images: SceneImageDescriptors,
     ) -> Self {
         let layout = create_scene_set_layout(device);
-        Self::with_layout(
+        Self::with_desc(
             instance,
             device,
             physical_device,
             initial,
-            cube_reflection,
-            planar_reflection,
-            layout,
-            MAX_FRAMES_IN_FLIGHT,
-            true,
+            SceneBindingDesc {
+                images,
+                layout,
+                count: MAX_FRAMES_IN_FLIGHT,
+                owns_layout: true,
+            },
         )
     }
 
-    pub fn with_layout<T: Copy>(
+    pub fn with_desc<T: Copy>(
         instance: &Instance,
         device: &ash::Device,
         physical_device: vk::PhysicalDevice,
         initial: &T,
-        cube_reflection: vk::DescriptorImageInfo,
-        planar_reflection: vk::DescriptorImageInfo,
-        layout: vk::DescriptorSetLayout,
-        count: usize,
-        owns_layout: bool,
+        desc: SceneBindingDesc,
     ) -> Self {
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: count as u32,
+                descriptor_count: desc.count as u32,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: (count * 2) as u32,
+                descriptor_count: (desc.count * 5) as u32,
             },
         ];
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(count as u32)
+            .max_sets(desc.count as u32)
             .pool_sizes(&pool_sizes);
 
         let pool = unsafe {
@@ -653,7 +701,7 @@ impl SceneBindings {
                 .expect("renderer: failed to create scene descriptor pool")
         };
 
-        let layouts = vec![layout; count];
+        let layouts = vec![desc.layout; desc.count];
         let alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
@@ -664,7 +712,7 @@ impl SceneBindings {
         };
 
         let range = mem::size_of::<T>() as vk::DeviceSize;
-        let buffers = (0..count)
+        let buffers = (0..desc.count)
             .map(|_| GpuBuffer::host_uniform(instance, device, physical_device, initial))
             .collect::<Vec<_>>();
 
@@ -681,23 +729,50 @@ impl SceneBindings {
                 .dst_set(*set)
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(&cube_reflection));
+                .image_info(std::slice::from_ref(&desc.images.cube_reflection));
             let planar_write = vk::WriteDescriptorSet::default()
                 .dst_set(*set)
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(&planar_reflection));
+                .image_info(std::slice::from_ref(&desc.images.planar_reflection));
+            let shadow_write = vk::WriteDescriptorSet::default()
+                .dst_set(*set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&desc.images.shadow_map));
+            let scene_color_write = vk::WriteDescriptorSet::default()
+                .dst_set(*set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&desc.images.scene_color));
+            let scene_depth_write = vk::WriteDescriptorSet::default()
+                .dst_set(*set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&desc.images.scene_depth));
 
-            unsafe { device.update_descriptor_sets(&[write, reflection_write, planar_write], &[]) };
+            unsafe {
+                device.update_descriptor_sets(
+                    &[
+                        write,
+                        reflection_write,
+                        planar_write,
+                        shadow_write,
+                        scene_color_write,
+                        scene_depth_write,
+                    ],
+                    &[],
+                )
+            };
         }
 
         Self {
-            layout,
+            layout: desc.layout,
             sets,
             pool,
             buffers,
             range,
-            owns_layout,
+            owns_layout: desc.owns_layout,
         }
     }
 
@@ -706,27 +781,43 @@ impl SceneBindings {
         unsafe { self.buffers[frame_index].write(device, value) };
     }
 
-    pub fn update_reflections(
-        &self,
-        device: &ash::Device,
-        cube_reflection: vk::DescriptorImageInfo,
-        planar_reflection: vk::DescriptorImageInfo,
-    ) {
-        let mut writes = Vec::with_capacity(self.sets.len() * 2);
+    pub fn update_scene_images(&self, device: &ash::Device, images: SceneImageDescriptors) {
+        let mut writes = Vec::with_capacity(self.sets.len() * 5);
         for set in &self.sets {
             writes.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(*set)
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(std::slice::from_ref(&cube_reflection)),
+                    .image_info(std::slice::from_ref(&images.cube_reflection)),
             );
             writes.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(*set)
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(std::slice::from_ref(&planar_reflection)),
+                    .image_info(std::slice::from_ref(&images.planar_reflection)),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&images.shadow_map)),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&images.scene_color)),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(5)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&images.scene_depth)),
             );
         }
 
@@ -767,6 +858,21 @@ fn create_scene_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(4)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(5)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
     ];
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
@@ -793,6 +899,49 @@ impl DepthTarget {
         extent: vk::Extent2D,
         format: vk::Format,
     ) -> Self {
+        Self::new_with_usage(
+            instance,
+            device,
+            physical_device,
+            command_pool,
+            queue,
+            extent,
+            format,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        )
+    }
+
+    fn sampled(
+        instance: &Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        extent: vk::Extent2D,
+        format: vk::Format,
+    ) -> Self {
+        Self::new_with_usage(
+            instance,
+            device,
+            physical_device,
+            command_pool,
+            queue,
+            extent,
+            format,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        )
+    }
+
+    fn new_with_usage(
+        instance: &Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Self {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -805,7 +954,7 @@ impl DepthTarget {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let image = unsafe {
@@ -865,7 +1014,148 @@ impl DepthTarget {
         }
     }
 
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
+
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        if self.view != vk::ImageView::null() {
+            unsafe { device.destroy_image_view(self.view, None) };
+            self.view = vk::ImageView::null();
+        }
+
+        if self.image != vk::Image::null() {
+            unsafe { device.destroy_image(self.image, None) };
+            self.image = vk::Image::null();
+        }
+
+        if self.memory != vk::DeviceMemory::null() {
+            unsafe { device.free_memory(self.memory, None) };
+            self.memory = vk::DeviceMemory::null();
+        }
+    }
+}
+
+pub(in crate::renderer) struct ShadowMap {
+    pub view: vk::ImageView,
+    pub sampler: vk::Sampler,
+    pub extent: vk::Extent2D,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    layout: vk::ImageLayout,
+}
+
+impl ShadowMap {
+    pub fn new(
+        instance: &Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        size: u32,
+    ) -> Self {
+        let extent = vk::Extent2D {
+            width: size.max(1),
+            height: size.max(1),
+        };
+        let format = vk::Format::D32_SFLOAT;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let image = unsafe {
+            device
+                .create_image(&image_info, None)
+                .expect("renderer: failed to create shadow map image")
+        };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let memory_type = find_memory_type(
+            instance,
+            physical_device,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = unsafe {
+            device
+                .allocate_memory(&alloc, None)
+                .expect("renderer: failed to allocate shadow map memory")
+        };
+
+        unsafe {
+            device
+                .bind_image_memory(image, memory, 0)
+                .expect("renderer: failed to bind shadow map memory")
+        };
+
+        transition_depth_image(device, command_pool, queue, image);
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = unsafe {
+            device
+                .create_image_view(&view_info, None)
+                .expect("renderer: failed to create shadow map view")
+        };
+        let sampler = create_shadow_sampler(device);
+
+        Self {
+            view,
+            sampler,
+            extent,
+            image,
+            memory,
+            layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        }
+    }
+
+    pub fn descriptor(&self) -> vk::DescriptorImageInfo {
+        vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(self.view)
+            .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+    }
+
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    pub fn layout(&self) -> vk::ImageLayout {
+        self.layout
+    }
+
+    pub fn set_layout(&mut self, layout: vk::ImageLayout) {
+        self.layout = layout;
+    }
+
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        if self.sampler != vk::Sampler::null() {
+            unsafe { device.destroy_sampler(self.sampler, None) };
+            self.sampler = vk::Sampler::null();
+        }
+
         if self.view != vk::ImageView::null() {
             unsafe { device.destroy_image_view(self.view, None) };
             self.view = vk::ImageView::null();
@@ -1203,6 +1493,224 @@ impl PlanarReflectionTarget {
     }
 }
 
+pub(in crate::renderer) struct SceneRenderTarget {
+    pub view: vk::ImageView,
+    pub sampler: vk::Sampler,
+    pub depth: DepthTarget,
+    pub depth_sampler: vk::Sampler,
+    pub extent: vk::Extent2D,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    color_layout: vk::ImageLayout,
+    depth_layout: vk::ImageLayout,
+}
+
+impl SceneRenderTarget {
+    pub fn new(
+        instance: &Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        format: vk::Format,
+        extent: vk::Extent2D,
+    ) -> Self {
+        let extent = vk::Extent2D {
+            width: extent.width.max(1),
+            height: extent.height.max(1),
+        };
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let image = unsafe {
+            device
+                .create_image(&image_info, None)
+                .expect("renderer: failed to create scene color image")
+        };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let memory_type = find_memory_type(
+            instance,
+            physical_device,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        let memory = unsafe {
+            device
+                .allocate_memory(&alloc, None)
+                .expect("renderer: failed to allocate scene color memory")
+        };
+
+        unsafe {
+            device
+                .bind_image_memory(image, memory, 0)
+                .expect("renderer: failed to bind scene color memory")
+        };
+
+        let view = create_planar_reflection_view(device, image, format);
+        let sampler = create_texture_sampler(
+            device,
+            TextureSampler {
+                mag_filter: TextureFilter::Linear,
+                min_filter: TextureFilter::Linear,
+                wrap_s: TextureWrap::ClampToEdge,
+                wrap_t: TextureWrap::ClampToEdge,
+            },
+        );
+        let depth = DepthTarget::sampled(
+            instance,
+            device,
+            physical_device,
+            command_pool,
+            queue,
+            extent,
+            vk::Format::D32_SFLOAT,
+        );
+        let depth_sampler = create_texture_sampler(
+            device,
+            TextureSampler {
+                mag_filter: TextureFilter::Linear,
+                min_filter: TextureFilter::Linear,
+                wrap_s: TextureWrap::ClampToEdge,
+                wrap_t: TextureWrap::ClampToEdge,
+            },
+        );
+
+        initialize_planar_reflection_image(device, command_pool, queue, image);
+
+        Self {
+            view,
+            sampler,
+            depth,
+            depth_sampler,
+            extent,
+            image,
+            memory,
+            color_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            depth_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        }
+    }
+
+    pub fn color_descriptor(&self) -> vk::DescriptorImageInfo {
+        vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(self.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+    }
+
+    pub fn depth_descriptor(&self) -> vk::DescriptorImageInfo {
+        vk::DescriptorImageInfo::default()
+            .sampler(self.depth_sampler)
+            .image_view(self.depth.view)
+            .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+    }
+
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    pub fn color_layout(&self) -> vk::ImageLayout {
+        self.color_layout
+    }
+
+    pub fn set_color_layout(&mut self, layout: vk::ImageLayout) {
+        self.color_layout = layout;
+    }
+
+    pub fn depth_layout(&self) -> vk::ImageLayout {
+        self.depth_layout
+    }
+
+    pub fn set_depth_layout(&mut self, layout: vk::ImageLayout) {
+        self.depth_layout = layout;
+    }
+
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+        unsafe { self.depth.destroy(device) };
+
+        if self.depth_sampler != vk::Sampler::null() {
+            unsafe { device.destroy_sampler(self.depth_sampler, None) };
+            self.depth_sampler = vk::Sampler::null();
+        }
+
+        if self.view != vk::ImageView::null() {
+            unsafe { device.destroy_image_view(self.view, None) };
+            self.view = vk::ImageView::null();
+        }
+
+        if self.sampler != vk::Sampler::null() {
+            unsafe { device.destroy_sampler(self.sampler, None) };
+            self.sampler = vk::Sampler::null();
+        }
+
+        if self.image != vk::Image::null() {
+            unsafe { device.destroy_image(self.image, None) };
+            self.image = vk::Image::null();
+        }
+
+        if self.memory != vk::DeviceMemory::null() {
+            unsafe { device.free_memory(self.memory, None) };
+            self.memory = vk::DeviceMemory::null();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ImageTransition {
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+    layer_count: u32,
+}
+
+impl ImageTransition {
+    fn transfer_dst(layer_count: u32) -> Self {
+        Self {
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            src_stage: vk::PipelineStageFlags2::NONE,
+            src_access: vk::AccessFlags2::NONE,
+            dst_stage: vk::PipelineStageFlags2::TRANSFER,
+            dst_access: vk::AccessFlags2::TRANSFER_WRITE,
+            layer_count,
+        }
+    }
+
+    fn shader_read(layer_count: u32) -> Self {
+        Self {
+            old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            src_stage: vk::PipelineStageFlags2::TRANSFER,
+            src_access: vk::AccessFlags2::TRANSFER_WRITE,
+            dst_stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            dst_access: vk::AccessFlags2::SHADER_SAMPLED_READ,
+            layer_count,
+        }
+    }
+}
+
 fn initialize_planar_reflection_image(
     device: &ash::Device,
     command_pool: vk::CommandPool,
@@ -1210,16 +1718,11 @@ fn initialize_planar_reflection_image(
     image: vk::Image,
 ) {
     submit_once(device, command_pool, queue, |command_buffer| {
-        planar_reflection_barrier(
+        image_barrier(
             device,
             command_buffer,
             image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::PipelineStageFlags2::NONE,
-            vk::AccessFlags2::NONE,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
+            ImageTransition::transfer_dst(1),
         );
 
         unsafe {
@@ -1228,7 +1731,7 @@ fn initialize_planar_reflection_image(
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &vk::ClearColorValue {
-                    float32: [0.025, 0.035, 0.05, 1.0],
+                    float32: [0.0, 0.0, 0.0, 1.0],
                 },
                 &[vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -1240,16 +1743,11 @@ fn initialize_planar_reflection_image(
             );
         }
 
-        planar_reflection_barrier(
+        image_barrier(
             device,
             command_buffer,
             image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            ImageTransition::shader_read(1),
         );
     });
 }
@@ -1261,16 +1759,13 @@ fn initialize_reflection_probe_image(
     image: vk::Image,
 ) {
     submit_once(device, command_pool, queue, |command_buffer| {
-        reflection_probe_barrier(
+        let layer_count = ReflectionProbe::FACE_COUNT as u32;
+
+        image_barrier(
             device,
             command_buffer,
             image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::PipelineStageFlags2::NONE,
-            vk::AccessFlags2::NONE,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
+            ImageTransition::transfer_dst(layer_count),
         );
 
         unsafe {
@@ -1279,89 +1774,47 @@ fn initialize_reflection_probe_image(
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &vk::ClearColorValue {
-                    float32: [0.03, 0.045, 0.065, 1.0],
+                    float32: [0.0, 0.0, 0.0, 1.0],
                 },
                 &[vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
                     level_count: 1,
                     base_array_layer: 0,
-                    layer_count: ReflectionProbe::FACE_COUNT as u32,
+                    layer_count,
                 }],
             );
         }
 
-        reflection_probe_barrier(
+        image_barrier(
             device,
             command_buffer,
             image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::TRANSFER,
-            vk::AccessFlags2::TRANSFER_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            ImageTransition::shader_read(layer_count),
         );
     });
 }
 
-fn reflection_probe_barrier(
+fn image_barrier(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    src_stage: vk::PipelineStageFlags2,
-    src_access: vk::AccessFlags2,
-    dst_stage: vk::PipelineStageFlags2,
-    dst_access: vk::AccessFlags2,
+    transition: ImageTransition,
 ) {
     let barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(src_stage)
-        .src_access_mask(src_access)
-        .dst_stage_mask(dst_stage)
-        .dst_access_mask(dst_access)
-        .old_layout(old_layout)
-        .new_layout(new_layout)
+        .src_stage_mask(transition.src_stage)
+        .src_access_mask(transition.src_access)
+        .dst_stage_mask(transition.dst_stage)
+        .dst_access_mask(transition.dst_access)
+        .old_layout(transition.old_layout)
+        .new_layout(transition.new_layout)
         .image(image)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: ReflectionProbe::FACE_COUNT as u32,
-        });
-    let dependency =
-        vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
-
-    unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
-}
-
-fn planar_reflection_barrier(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    src_stage: vk::PipelineStageFlags2,
-    src_access: vk::AccessFlags2,
-    dst_stage: vk::PipelineStageFlags2,
-    dst_access: vk::AccessFlags2,
-) {
-    let barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(src_stage)
-        .src_access_mask(src_access)
-        .dst_stage_mask(dst_stage)
-        .dst_access_mask(dst_access)
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .image(image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
+            layer_count: transition.layer_count,
         });
     let dependency =
         vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
@@ -1623,6 +2076,28 @@ fn create_texture_sampler(device: &ash::Device, sampler: TextureSampler) -> vk::
     }
 }
 
+fn create_shadow_sampler(device: &ash::Device) -> vk::Sampler {
+    let info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::NEAREST)
+        .min_filter(vk::Filter::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .anisotropy_enable(false)
+        .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+        .unnormalized_coordinates(false)
+        .compare_enable(false)
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .min_lod(0.0)
+        .max_lod(0.0);
+
+    unsafe {
+        device
+            .create_sampler(&info, None)
+            .expect("renderer: failed to create shadow sampler")
+    }
+}
+
 fn texture_filter(filter: TextureFilter) -> vk::Filter {
     match filter {
         TextureFilter::Nearest => vk::Filter::NEAREST,
@@ -1823,7 +2298,7 @@ fn submit_once<F: FnOnce(vk::CommandBuffer)>(
     }
 }
 
-fn find_memory_type(
+pub(in crate::renderer) fn find_memory_type(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
     type_filter: u32,

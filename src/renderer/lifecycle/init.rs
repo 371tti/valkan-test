@@ -19,14 +19,17 @@ use crate::{
     APP_NAME, ENGINE_NAME,
     renderer::{
         ColorBlendConfig, DepthConfig, HotReload, MAX_FRAMES_IN_FLIGHT, ModelVertex, PipelineDesc,
-        QueueFamilyIndices, REFLECTION_PROBE_SIZE, RendererConfig, ShaderSet,
+        QueueFamilyIndices, REFLECTION_PROBE_SIZE, RasterizationConfig, SHADOW_MAP_SIZE, ShaderSet,
         create_pipeline_cache,
     },
 };
 
 use super::{
     PipelineSlot,
-    assets::{GpuAssets, PlanarReflectionTarget, ReflectionProbe, SceneBindings},
+    assets::{
+        GpuAssets, PlanarReflectionTarget, ReflectionProbe, SceneBindingDesc, SceneBindings,
+        SceneImageDescriptors, SceneRenderTarget, ShadowMap,
+    },
     uniforms::{ObjectPush, SceneUniform},
 };
 
@@ -34,8 +37,42 @@ const WANT_VALIDATION: bool = cfg!(debug_assertions);
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 const VERT_SPV: &[u8] = include_bytes!("../../../shaders/triangle.vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("../../../shaders/triangle.frag.spv");
+const SHADOW_FRAG_SPV: &[u8] = include_bytes!("../../../shaders/shadow.frag.spv");
+const POST_VERT_SPV: &[u8] = include_bytes!("../../../shaders/post.vert.spv");
+const POST_FRAG_SPV: &[u8] = include_bytes!("../../../shaders/post.frag.spv");
 const VERT_SPV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/triangle.vert.spv");
 const FRAG_SPV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/triangle.frag.spv");
+const SHADOW_FRAG_SPV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/shadow.frag.spv");
+const POST_VERT_SPV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/post.vert.spv");
+const POST_FRAG_SPV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/post.frag.spv");
+
+pub(crate) struct SwapchainCreateContext<'a> {
+    pub window: &'a Window,
+    pub device: &'a ash::Device,
+    pub physical_device: vk::PhysicalDevice,
+    pub surface_loader: &'a surface::Instance,
+    pub surface: vk::SurfaceKHR,
+    pub swapchain_loader: &'a swapchain::Device,
+    pub indices: QueueFamilyIndices,
+}
+
+pub(crate) struct CreatedSwapchain {
+    pub handle: vk::SwapchainKHR,
+    pub images: Vec<vk::Image>,
+    pub image_views: Vec<vk::ImageView>,
+    pub format: vk::Format,
+    pub extent: vk::Extent2D,
+    pub transfer_src_supported: bool,
+}
+
+pub(crate) struct SwapchainStateContext<'a> {
+    pub instance: &'a Instance,
+    pub device: &'a ash::Device,
+    pub physical_device: vk::PhysicalDevice,
+    pub command_pool: vk::CommandPool,
+    pub graphics_queue: vk::Queue,
+    pub swapchain: CreatedSwapchain,
+}
 
 impl super::Renderer {
     pub fn new(window_ref: Arc<Window>) -> Self {
@@ -61,9 +98,19 @@ impl super::Renderer {
 
         let (physical_device, queue_family_indices) =
             pick_physical_device(&instance, &surface_loader, surface);
+        let wireframe_supported = supports_fill_mode_non_solid(&instance, physical_device);
+        if !wireframe_supported {
+            log::warn!(
+                "renderer init: fillModeNonSolid is unsupported; wireframe debug falls back to solid"
+            );
+        }
 
-        let logical_device =
-            create_logical_device(&instance, physical_device, queue_family_indices);
+        let logical_device = create_logical_device(
+            &instance,
+            physical_device,
+            queue_family_indices,
+            wireframe_supported,
+        );
         let graphics_queue =
             unsafe { logical_device.get_device_queue(queue_family_indices.graphics_family, 0) };
         let present_queue =
@@ -72,41 +119,40 @@ impl super::Renderer {
 
         let swapchain_loader = swapchain::Device::new(&instance, &logical_device);
 
-        let (
-            swapchain,
-            swapchain_images,
-            swapchain_image_views,
-            swapchain_format,
-            swapchain_extent,
-        ) = create_swapchain(
-            &window_ref,
-            &instance,
-            &logical_device,
+        let swapchain = create_swapchain(SwapchainCreateContext {
+            window: &window_ref,
+            device: &logical_device,
             physical_device,
-            &surface_loader,
+            surface_loader: &surface_loader,
             surface,
-            &swapchain_loader,
-            queue_family_indices,
-            None,
-            None,
-        );
+            swapchain_loader: &swapchain_loader,
+            indices: queue_family_indices,
+        });
         log::debug!(
             "renderer init: swapchain created: {}x{}, images: {}",
-            swapchain_extent.width,
-            swapchain_extent.height,
-            swapchain_images.len()
+            swapchain.extent.width,
+            swapchain.extent.height,
+            swapchain.images.len()
         );
 
         let command_pool =
             create_command_pool(&logical_device, queue_family_indices.graphics_family);
         let pipeline_cache = create_pipeline_cache(&logical_device);
+        let shadow_map = ShadowMap::new(
+            &instance,
+            &logical_device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            SHADOW_MAP_SIZE,
+        );
         let reflection_probe = ReflectionProbe::new(
             &instance,
             &logical_device,
             physical_device,
             command_pool,
             graphics_queue,
-            swapchain_format,
+            swapchain.format,
             REFLECTION_PROBE_SIZE,
         );
         let fallback_reflection_probe = ReflectionProbe::new(
@@ -115,12 +161,12 @@ impl super::Renderer {
             physical_device,
             command_pool,
             graphics_queue,
-            swapchain_format,
+            swapchain.format,
             1,
         );
         let planar_reflection_extent = vk::Extent2D {
-            width: (swapchain_extent.width / 2).max(1),
-            height: (swapchain_extent.height / 2).max(1),
+            width: 1,
+            height: 1,
         };
         let planar_reflection = PlanarReflectionTarget::new(
             &instance,
@@ -128,7 +174,7 @@ impl super::Renderer {
             physical_device,
             command_pool,
             graphics_queue,
-            swapchain_format,
+            swapchain.format,
             planar_reflection_extent,
         );
         let fallback_planar_reflection = PlanarReflectionTarget::new(
@@ -137,42 +183,88 @@ impl super::Renderer {
             physical_device,
             command_pool,
             graphics_queue,
-            swapchain_format,
+            swapchain.format,
             vk::Extent2D {
                 width: 1,
                 height: 1,
             },
+        );
+        let scene_target = SceneRenderTarget::new(
+            &instance,
+            &logical_device,
+            physical_device,
+            command_pool,
+            graphics_queue,
+            swapchain.format,
+            swapchain.extent,
         );
         let scene_bindings = SceneBindings::new(
             &instance,
             &logical_device,
             physical_device,
             &SceneUniform::default(),
-            reflection_probe.descriptor(),
-            planar_reflection.descriptor(),
+            SceneImageDescriptors {
+                cube_reflection: reflection_probe.descriptor(),
+                planar_reflection: planar_reflection.descriptor(),
+                shadow_map: shadow_map.descriptor(),
+                scene_color: scene_target.color_descriptor(),
+                scene_depth: scene_target.depth_descriptor(),
+            },
+        );
+        let shadow_scene_bindings = SceneBindings::with_desc(
+            &instance,
+            &logical_device,
+            physical_device,
+            &SceneUniform::default(),
+            SceneBindingDesc {
+                images: SceneImageDescriptors {
+                    cube_reflection: fallback_reflection_probe.descriptor(),
+                    planar_reflection: fallback_planar_reflection.descriptor(),
+                    shadow_map: shadow_map.descriptor(),
+                    scene_color: scene_target.color_descriptor(),
+                    scene_depth: scene_target.depth_descriptor(),
+                },
+                layout: scene_bindings.layout,
+                count: MAX_FRAMES_IN_FLIGHT,
+                owns_layout: false,
+            },
         );
         let probe_binding_count = ReflectionProbe::FACE_COUNT * MAX_FRAMES_IN_FLIGHT;
-        let probe_scene_bindings = SceneBindings::with_layout(
+        let probe_scene_bindings = SceneBindings::with_desc(
             &instance,
             &logical_device,
             physical_device,
             &SceneUniform::default(),
-            fallback_reflection_probe.descriptor(),
-            fallback_planar_reflection.descriptor(),
-            scene_bindings.layout,
-            probe_binding_count,
-            false,
+            SceneBindingDesc {
+                images: SceneImageDescriptors {
+                    cube_reflection: fallback_reflection_probe.descriptor(),
+                    planar_reflection: fallback_planar_reflection.descriptor(),
+                    shadow_map: shadow_map.descriptor(),
+                    scene_color: scene_target.color_descriptor(),
+                    scene_depth: scene_target.depth_descriptor(),
+                },
+                layout: scene_bindings.layout,
+                count: probe_binding_count,
+                owns_layout: false,
+            },
         );
-        let planar_scene_bindings = SceneBindings::with_layout(
+        let planar_scene_bindings = SceneBindings::with_desc(
             &instance,
             &logical_device,
             physical_device,
             &SceneUniform::default(),
-            fallback_reflection_probe.descriptor(),
-            fallback_planar_reflection.descriptor(),
-            scene_bindings.layout,
-            MAX_FRAMES_IN_FLIGHT,
-            false,
+            SceneBindingDesc {
+                images: SceneImageDescriptors {
+                    cube_reflection: fallback_reflection_probe.descriptor(),
+                    planar_reflection: fallback_planar_reflection.descriptor(),
+                    shadow_map: shadow_map.descriptor(),
+                    scene_color: scene_target.color_descriptor(),
+                    scene_depth: scene_target.depth_descriptor(),
+                },
+                layout: scene_bindings.layout,
+                count: MAX_FRAMES_IN_FLIGHT,
+                owns_layout: false,
+            },
         );
         let assets = GpuAssets::new(
             &instance,
@@ -202,7 +294,7 @@ impl super::Renderer {
         .with_vertex_layout(ModelVertex::layout())
         .with_layout(
             vec![scene_bindings.layout, assets.texture_set_layout()],
-            push_constants,
+            push_constants.clone(),
         )
         .with_color_blend(ColorBlendConfig::default())
         .with_depth(DepthConfig::default());
@@ -213,43 +305,102 @@ impl super::Renderer {
                 write: false,
                 ..DepthConfig::default()
             });
-        let hot_reload = HotReload::new(&pipeline_desc.shaders, Duration::from_millis(250));
-        let pipeline = pipeline_desc
-            .build(&logical_device, pipeline_cache, swapchain_format)
-            .expect("renderer init: failed to create graphics pipeline");
-        let transparent_hot_reload = HotReload::new(
-            &transparent_pipeline_desc.shaders,
-            Duration::from_millis(250),
-        );
-        let transparent_pipeline = transparent_pipeline_desc
-            .build(&logical_device, pipeline_cache, swapchain_format)
-            .expect("renderer init: failed to create transparent graphics pipeline");
+        let wireframe_pipeline_desc =
+            pipeline_desc
+                .clone()
+                .with_rasterization(RasterizationConfig {
+                    polygon_mode: if wireframe_supported {
+                        vk::PolygonMode::LINE
+                    } else {
+                        vk::PolygonMode::FILL
+                    },
+                    ..RasterizationConfig::default()
+                });
+        let shadow_pipeline_desc = PipelineDesc::new(ShaderSet::watched_graphics(
+            "shadow_map",
+            VERT_SPV_PATH,
+            VERT_SPV,
+            SHADOW_FRAG_SPV_PATH,
+            SHADOW_FRAG_SPV,
+        ))
+        .with_vertex_layout(ModelVertex::layout())
+        .with_layout(
+            vec![scene_bindings.layout, assets.texture_set_layout()],
+            push_constants.clone(),
+        )
+        .with_rasterization(RasterizationConfig::shadow())
+        .without_color_attachment()
+        .with_depth(DepthConfig::default());
+        let post_pipeline_desc = PipelineDesc::new(ShaderSet::watched_graphics(
+            "postprocess",
+            POST_VERT_SPV_PATH,
+            POST_VERT_SPV,
+            POST_FRAG_SPV_PATH,
+            POST_FRAG_SPV,
+        ))
+        .with_layout(vec![scene_bindings.layout], push_constants.clone())
+        .with_rasterization(RasterizationConfig {
+            cull_mode: vk::CullModeFlags::NONE,
+            ..RasterizationConfig::default()
+        })
+        .with_color_blend(ColorBlendConfig::default());
         let pipelines = vec![
-            PipelineSlot {
-                desc: pipeline_desc,
-                pipeline,
-                hot_reload,
-            },
-            PipelineSlot {
-                desc: transparent_pipeline_desc,
-                pipeline: transparent_pipeline,
-                hot_reload: transparent_hot_reload,
-            },
+            build_pipeline_slot(
+                &logical_device,
+                pipeline_cache,
+                swapchain.format,
+                pipeline_desc,
+                "lit mesh pipeline",
+            ),
+            build_pipeline_slot(
+                &logical_device,
+                pipeline_cache,
+                swapchain.format,
+                transparent_pipeline_desc,
+                "transparent mesh pipeline",
+            ),
+            build_pipeline_slot(
+                &logical_device,
+                pipeline_cache,
+                swapchain.format,
+                wireframe_pipeline_desc,
+                "wireframe mesh pipeline",
+            ),
         ];
-
-        let swapchain_state = create_swapchain_state(
-            &instance,
+        let shadow_pipeline = build_pipeline_slot(
             &logical_device,
+            pipeline_cache,
+            swapchain.format,
+            shadow_pipeline_desc,
+            "shadow pipeline",
+        );
+        let post_pipeline = build_pipeline_slot(
+            &logical_device,
+            pipeline_cache,
+            swapchain.format,
+            post_pipeline_desc,
+            "postprocess pipeline",
+        );
+
+        let swapchain_state = create_swapchain_state(SwapchainStateContext {
+            instance: &instance,
+            device: &logical_device,
             physical_device,
             command_pool,
             graphics_queue,
             swapchain,
-            swapchain_images,
-            swapchain_image_views,
-            swapchain_format,
-            swapchain_extent,
+        });
+        let camera_meter = super::metering::CameraMeter::new(
+            &instance,
+            &logical_device,
+            physical_device,
+            super::metering::CameraMeterConfig {
+                image_count: swapchain_state.images.len(),
+                extent: swapchain_state.extent,
+                format: swapchain_state.format,
+                transfer_src_supported: swapchain_state.transfer_src_supported,
+            },
         );
-
         let frames = image_available_semaphores
             .into_iter()
             .zip(in_flight_fences)
@@ -290,20 +441,45 @@ impl super::Renderer {
             swapchain: swapchain_state,
             pipeline_cache,
             scene_bindings,
+            shadow_scene_bindings,
             probe_scene_bindings,
             planar_scene_bindings,
+            shadow_map,
             reflection_probe,
             fallback_reflection_probe,
             planar_reflection,
             fallback_planar_reflection,
+            scene_target,
+            reflection_probe_face_cursor: 0,
             assets,
             pipelines,
+            shadow_pipeline,
+            post_pipeline,
+            camera_meter,
             sync,
-            config: RendererConfig::default(),
             debug_utils_loader,
             debug_messenger,
             needs_swapchain_rebuild: false,
         }
+    }
+}
+
+fn build_pipeline_slot(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    format: vk::Format,
+    desc: PipelineDesc,
+    name: &str,
+) -> PipelineSlot {
+    let hot_reload = HotReload::new(&desc.shaders, Duration::from_millis(250));
+    let pipeline = desc
+        .build(device, cache, format)
+        .unwrap_or_else(|err| panic!("renderer init: failed to create {name}: {err}"));
+
+    PipelineSlot {
+        desc,
+        pipeline,
+        hot_reload,
     }
 }
 
@@ -415,6 +591,7 @@ fn create_logical_device(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
     indices: QueueFamilyIndices,
+    wireframe_supported: bool,
 ) -> ash::Device {
     let queue_priority = [1.0_f32];
 
@@ -435,7 +612,11 @@ fn create_logical_device(
 
     let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
 
-    let features = vk::PhysicalDeviceFeatures::default();
+    let mut features = vk::PhysicalDeviceFeatures::default();
+    if wireframe_supported {
+        features.fill_mode_non_solid = vk::TRUE;
+    }
+
     let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true);
@@ -453,50 +634,33 @@ fn create_logical_device(
     }
 }
 
-pub fn create_swapchain(
-    window: &Window,
-    _instance: &Instance,
-    device: &ash::Device,
-    physical_device: vk::PhysicalDevice,
-    surface_loader: &surface::Instance,
-    surface: vk::SurfaceKHR,
-    swapchain_loader: &swapchain::Device,
-    indices: QueueFamilyIndices,
-    preferred_surface_format: Option<vk::SurfaceFormatKHR>,
-    preferred_present_mode: Option<vk::PresentModeKHR>,
-) -> (
-    vk::SwapchainKHR,
-    Vec<vk::Image>,
-    Vec<vk::ImageView>,
-    vk::Format,
-    vk::Extent2D,
-) {
-    let support = query_swapchain_support(physical_device, surface_loader, surface);
+fn supports_fill_mode_non_solid(instance: &Instance, physical_device: vk::PhysicalDevice) -> bool {
+    unsafe { instance.get_physical_device_features(physical_device) }.fill_mode_non_solid
+        == vk::TRUE
+}
 
-    let surface_format = match preferred_surface_format {
-        Some(format) if support.formats.contains(&format) => format,
-        Some(format) => {
-            log::warn!(
-                "renderer: preferred surface format {:?} not supported; falling back",
-                format
-            );
-            choose_surface_format(&support.formats)
-        }
-        None => choose_surface_format(&support.formats),
-    };
+pub fn create_swapchain(context: SwapchainCreateContext<'_>) -> CreatedSwapchain {
+    let support = query_swapchain_support(
+        context.physical_device,
+        context.surface_loader,
+        context.surface,
+    );
 
-    let present_mode = match preferred_present_mode {
-        Some(mode) if support.present_modes.contains(&mode) => mode,
-        Some(mode) => {
-            log::warn!(
-                "renderer: preferred present mode {:?} not supported; falling back",
-                mode
-            );
-            choose_present_mode(&support.present_modes)
-        }
-        None => choose_present_mode(&support.present_modes),
-    };
-    let extent = choose_extent(window, &support.capabilities);
+    let surface_format = choose_surface_format(&support.formats);
+    let present_mode = choose_present_mode(&support.present_modes);
+    let extent = choose_extent(context.window, &support.capabilities);
+    let transfer_src_supported = support
+        .capabilities
+        .supported_usage_flags
+        .contains(vk::ImageUsageFlags::TRANSFER_SRC);
+    let mut image_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    if transfer_src_supported {
+        image_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+    } else {
+        log::warn!(
+            "active camera disabled: surface does not support transfer-src swapchain images"
+        );
+    }
 
     let mut image_count = support.capabilities.min_image_count + 1;
 
@@ -504,25 +668,25 @@ pub fn create_swapchain(
         image_count = image_count.min(support.capabilities.max_image_count);
     }
 
-    let queue_family_indices = [indices.graphics_family, indices.present_family];
+    let queue_family_indices = [
+        context.indices.graphics_family,
+        context.indices.present_family,
+    ];
 
     let mut create_info = vk::SwapchainCreateInfoKHR::default()
-        .surface(surface)
+        .surface(context.surface)
         .min_image_count(image_count)
         .image_format(surface_format.format)
         .image_color_space(surface_format.color_space)
         .image_extent(extent)
         .image_array_layers(1)
-        .image_usage(
-            vk::ImageUsageFlags::COLOR_ATTACHMENT // このimageをレンダーターゲット/フレームバッファとして定義
-            | vk::ImageUsageFlags::TRANSFER_DST, // このイメージは転送先として使用できる(vkCmdClearとかの対象 リサイズでのクリアとかのため)
-        )
+        .image_usage(image_usage)
         .pre_transform(support.capabilities.current_transform)
         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
         .present_mode(present_mode)
         .clipped(true);
 
-    if indices.graphics_family != indices.present_family {
+    if context.indices.graphics_family != context.indices.present_family {
         create_info = create_info
             .image_sharing_mode(vk::SharingMode::CONCURRENT)
             .queue_family_indices(&queue_family_indices);
@@ -531,29 +695,32 @@ pub fn create_swapchain(
     }
 
     let swapchain = unsafe {
-        swapchain_loader
+        context
+            .swapchain_loader
             .create_swapchain(&create_info, None)
             .expect("renderer init: failed to create swapchain")
     };
 
     let images = unsafe {
-        swapchain_loader
+        context
+            .swapchain_loader
             .get_swapchain_images(swapchain)
             .expect("renderer init: failed to get swapchain images")
     };
 
     let image_views = images
         .iter()
-        .map(|&image| create_image_view(device, image, surface_format.format))
+        .map(|&image| create_image_view(context.device, image, surface_format.format))
         .collect();
 
-    (
-        swapchain,
+    CreatedSwapchain {
+        handle: swapchain,
         images,
         image_views,
-        surface_format.format,
+        format: surface_format.format,
         extent,
-    )
+        transfer_src_supported,
+    }
 }
 
 fn create_command_pool(device: &ash::Device, graphics_queue_family: u32) -> vk::CommandPool {
@@ -585,34 +752,33 @@ pub fn create_command_buffers(
     }
 }
 
-pub(crate) fn create_swapchain_state(
-    instance: &Instance,
-    device: &ash::Device,
-    physical_device: vk::PhysicalDevice,
-    command_pool: vk::CommandPool,
-    graphics_queue: vk::Queue,
-    swapchain: vk::SwapchainKHR,
-    images: Vec<vk::Image>,
-    image_views: Vec<vk::ImageView>,
-    format: vk::Format,
-    extent: vk::Extent2D,
-) -> super::SwapchainState {
-    let command_buffers = create_command_buffers(device, command_pool, images.len() as u32);
+pub(crate) fn create_swapchain_state(context: SwapchainStateContext<'_>) -> super::SwapchainState {
+    let CreatedSwapchain {
+        handle,
+        images,
+        image_views,
+        format,
+        extent,
+        transfer_src_supported,
+    } = context.swapchain;
+
+    let command_buffers =
+        create_command_buffers(context.device, context.command_pool, images.len() as u32);
     let images_in_flight = vec![vk::Fence::null(); images.len()];
     let image_layouts = vec![vk::ImageLayout::UNDEFINED; images.len()];
-    let render_finished_semaphores = create_semaphores(device, images.len());
+    let render_finished_semaphores = create_semaphores(context.device, images.len());
     let depth = super::assets::DepthTarget::new(
-        instance,
-        device,
-        physical_device,
-        command_pool,
-        graphics_queue,
+        context.instance,
+        context.device,
+        context.physical_device,
+        context.command_pool,
+        context.graphics_queue,
         extent,
         DepthConfig::default().format,
     );
 
     super::SwapchainState {
-        swapchain,
+        swapchain: handle,
         images,
         image_views,
         format,
@@ -622,6 +788,7 @@ pub(crate) fn create_swapchain_state(
         image_layouts,
         images_in_flight,
         render_finished_semaphores,
+        transfer_src_supported,
     }
 }
 
