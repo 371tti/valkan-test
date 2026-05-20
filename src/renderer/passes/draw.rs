@@ -3,8 +3,11 @@ use std::cmp::Ordering;
 use ash::vk;
 
 use super::{
-    PipelineSlot, ReflectionProbe, RenderObject, RenderScene, Renderer, SceneBindings,
-    math::{distance_squared, for_each_render_object, transform_point},
+    Camera, PipelineSlot, ReflectionProbe, RenderObject, RenderScene, Renderer, SceneBindings,
+    math::{
+        distance_squared, for_each_visible_render_object, reflection_probe_face_axes,
+        transform_point,
+    },
     rendering::{
         clear_color_attachment, clear_depth_attachment, render_area, set_viewport_and_scissor,
     },
@@ -40,13 +43,7 @@ fn draw_object(context: &DrawContext<'_>, object: RenderObject, bindings: &mut D
         return;
     };
     let material = context.assets.material(object.material);
-    let pipeline = if context.debug_mode == RenderDebugMode::Wireframe {
-        PipelineId::LIT_MESH_WIREFRAME
-    } else if object.pipeline == PipelineId::LIT_MESH && material.is_translucent() {
-        PipelineId::LIT_MESH_TRANSPARENT
-    } else {
-        object.pipeline
-    };
+    let pipeline = material_pipeline(object.pipeline, material, context.debug_mode);
     let Some(slot) = context.pipelines.get(pipeline.0) else {
         return;
     };
@@ -111,6 +108,26 @@ fn draw_object(context: &DrawContext<'_>, object: RenderObject, bindings: &mut D
     }
 }
 
+fn material_pipeline(
+    requested: PipelineId,
+    material: crate::renderer::Material,
+    debug_mode: RenderDebugMode,
+) -> PipelineId {
+    if debug_mode == RenderDebugMode::Wireframe {
+        return PipelineId::LIT_MESH_WIREFRAME;
+    }
+    if requested != PipelineId::LIT_MESH {
+        return requested;
+    }
+
+    match (material.is_translucent(), material.double_sided) {
+        (true, true) => PipelineId::LIT_MESH_TRANSPARENT_DOUBLE_SIDED,
+        (true, false) => PipelineId::LIT_MESH_TRANSPARENT,
+        (false, true) => PipelineId::LIT_MESH_DOUBLE_SIDED,
+        (false, false) => PipelineId::LIT_MESH,
+    }
+}
+
 fn collect_transparent_draw(
     assets: &super::assets::GpuAssets,
     transparent: &mut Vec<TransparentDraw>,
@@ -130,6 +147,28 @@ fn collect_transparent_draw(
         distance2: distance_squared(camera_eye, center),
     });
     true
+}
+
+fn reflection_probe_camera(
+    scene: &RenderScene,
+    reflections: PreparedReflections,
+    face: usize,
+) -> Camera {
+    let (direction, up) = reflection_probe_face_axes(face);
+    let center = reflections.probe.center;
+
+    Camera {
+        eye: center,
+        target: [
+            center[0] + direction[0],
+            center[1] + direction[1],
+            center[2] + direction[2],
+        ],
+        up,
+        fov_y: 90.0_f32.to_radians(),
+        near: 0.05,
+        far: scene.camera.far.max(5000.0),
+    }
 }
 
 impl Renderer {
@@ -186,7 +225,8 @@ impl Renderer {
                 &self.scene_bindings,
                 frame_index,
                 scene,
-                scene.camera.eye,
+                scene.camera,
+                self.scene_target.extent,
                 scene.debug_mode,
             );
             self.logical_device.cmd_end_rendering(command_buffer);
@@ -329,7 +369,8 @@ impl Renderer {
                 &self.planar_scene_bindings,
                 frame_index,
                 scene,
-                reflections.planar.camera.eye,
+                reflections.planar.camera,
+                self.planar_reflection.extent,
                 RenderDebugMode::Default,
             );
             self.logical_device.cmd_end_rendering(command_buffer);
@@ -391,7 +432,8 @@ impl Renderer {
                 &self.probe_scene_bindings,
                 binding_index,
                 scene,
-                reflections.probe.center,
+                reflection_probe_camera(scene, reflections, face),
+                probe.extent,
                 RenderDebugMode::Default,
             );
             self.logical_device.cmd_end_rendering(command_buffer);
@@ -412,9 +454,11 @@ impl Renderer {
         scene_bindings: &SceneBindings,
         binding_index: usize,
         scene: &RenderScene,
-        camera_eye: [f32; 3],
+        camera: Camera,
+        extent: vk::Extent2D,
         debug_mode: RenderDebugMode,
     ) {
+        let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let context = DrawContext {
             device: &self.logical_device,
             pipelines: &self.pipelines,
@@ -427,8 +471,8 @@ impl Renderer {
         let mut bindings = DrawBindings::default();
         let mut transparent = Vec::new();
 
-        for_each_render_object(scene, &self.assets, |object| {
-            if !collect_transparent_draw(&self.assets, &mut transparent, camera_eye, object) {
+        for_each_visible_render_object(scene, &self.assets, camera, aspect, |object| {
+            if !collect_transparent_draw(&self.assets, &mut transparent, camera.eye, object) {
                 draw_object(&context, object, &mut bindings);
             }
         });
@@ -451,6 +495,8 @@ impl Renderer {
         frame_index: usize,
         scene: &RenderScene,
         reflections: PreparedReflections,
+        shadow: super::shadows::PreparedShadow,
+        pass_updates: super::PassUpdates,
     ) {
         unsafe {
             let begin_info = vk::CommandBufferBeginInfo::default()
@@ -460,9 +506,21 @@ impl Renderer {
                 .begin_command_buffer(command_buffer, &begin_info)
                 .expect("failed to begin command buffer");
 
-            self.record_shadow_map(command_buffer, frame_index, scene);
-            self.record_reflection_probe(command_buffer, frame_index, scene, reflections);
-            self.record_planar_reflection(command_buffer, frame_index, scene, reflections);
+            if pass_updates.shadow_map() {
+                self.record_shadow_map(
+                    command_buffer,
+                    frame_index,
+                    scene,
+                    shadow,
+                    pass_updates.shadow_cascades,
+                );
+            }
+            if pass_updates.reflection_probe {
+                self.record_reflection_probe(command_buffer, frame_index, scene, reflections);
+            }
+            if pass_updates.planar_reflection {
+                self.record_planar_reflection(command_buffer, frame_index, scene, reflections);
+            }
             self.record_scene_target(command_buffer, frame_index, scene);
             let image = self.swapchain.images[image_index];
             let old_layout = self.swapchain.image_layouts[image_index];

@@ -19,21 +19,29 @@ mod assets;
 mod draw;
 #[path = "lifecycle/drop.rs"]
 mod drop;
+#[path = "lifecycle/frame.rs"]
 mod frame;
+#[path = "gpu/image_layout.rs"]
 mod image_layout;
 #[path = "lifecycle/init.rs"]
 mod init;
+#[path = "scene/math.rs"]
 mod math;
+#[path = "camera/metering.rs"]
 mod metering;
 mod pipeline;
+#[path = "pipeline/reload.rs"]
 mod pipeline_reload;
 #[path = "passes/reflections.rs"]
 mod reflections;
+#[path = "passes/rendering.rs"]
 mod rendering;
 mod scene;
 #[path = "passes/shadows.rs"]
 mod shadows;
+#[path = "lifecycle/swapchain.rs"]
 mod swapchain_lifecycle;
+#[path = "scene/uniforms.rs"]
 mod uniforms;
 
 pub use assets::{
@@ -46,17 +54,23 @@ pub use pipeline::{
 };
 pub use scene::{
     BoxReflectionSettings, Camera, CameraMetering, CameraResponse, DEFAULT_CAMERA_FAR,
-    DirectionalLight, Material, MaterialId, MeshId, ModelId, PipelineId, PlanarReflectionSettings,
-    ReflectionSettings, RenderDebugMode, RenderModel, RenderObject, RenderScene, SceneContext,
-    SceneController, SceneKey, SceneMessage, TextureId, Transform, mat4_mul,
+    DirectionalLight, Mat4, Material, MaterialAlpha, MaterialId, MaterialTextures, MeshId, ModelId,
+    PipelineId, PlanarReflectionSettings, ReflectionSettings, RenderDebugMode, RenderModel,
+    RenderObject, RenderScene, SceneContext, SceneController, SceneKey, SceneMessage, TextureId,
+    Transform, mat4_mul,
 };
 
 /// CPUがGPU完了を待たずに先行して準備できるフレーム数(1..4程度が一般的)
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const REFLECTION_PROBE_SIZE: u32 = 128;
-const SHADOW_MAP_SIZE: u32 = 8192;
-const PLANAR_REFLECTION_MIN_SIZE: u32 = 64;
-const PLANAR_REFLECTION_MAX_SIZE: u32 = 4096;
+const SHADOW_MAP_SIZE: u32 = 4096;
+const SHADOW_CASCADE_COUNT: usize = 4;
+const SHADOW_CASCADE_GRID: u32 = 2;
+const SHADOW_CASCADE_UPDATE_INTERVALS: [u32; SHADOW_CASCADE_COUNT] = [1, 2, 6, 12];
+const PLANAR_REFLECTION_MIN_SIZE: u32 = 128;
+const PLANAR_REFLECTION_MAX_SIZE: u32 = 2048;
+const REFLECTION_PROBE_UPDATE_INTERVAL: u32 = 4;
+const PLANAR_REFLECTION_UPDATE_INTERVAL: u32 = 3;
 
 struct SwapchainState {
     swapchain: vk::SwapchainKHR,
@@ -94,6 +108,110 @@ struct PipelineSlot {
     hot_reload: HotReload,
 }
 
+struct PassSchedule {
+    cached_shadow: Option<shadows::PreparedShadow>,
+    shadow_update_frame: u32,
+    reflection_probe_frames_until_update: u32,
+    planar_reflection_frames_until_update: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PassUpdates {
+    shadow_cascades: [bool; SHADOW_CASCADE_COUNT],
+    reflection_probe: bool,
+    planar_reflection: bool,
+}
+
+impl PassUpdates {
+    fn shadow_map(&self) -> bool {
+        self.shadow_cascades.iter().any(|&update| update)
+    }
+}
+
+impl PassSchedule {
+    fn new() -> Self {
+        Self {
+            cached_shadow: None,
+            shadow_update_frame: 0,
+            reflection_probe_frames_until_update: 0,
+            planar_reflection_frames_until_update: 0,
+        }
+    }
+
+    fn shadow_frame(
+        &mut self,
+        prepared: shadows::PreparedShadow,
+    ) -> (shadows::PreparedShadow, [bool; SHADOW_CASCADE_COUNT]) {
+        let first_frame = self.cached_shadow.is_none();
+        let mut shadow = self.cached_shadow.unwrap_or(prepared);
+        let mut updates = [false; SHADOW_CASCADE_COUNT];
+
+        for cascade in 0..SHADOW_CASCADE_COUNT {
+            let interval = SHADOW_CASCADE_UPDATE_INTERVALS[cascade].max(1);
+            if first_frame || self.shadow_update_frame.is_multiple_of(interval) {
+                shadow.cascades[cascade] = prepared.cascades[cascade];
+                updates[cascade] = true;
+            }
+        }
+
+        shadow.camera_pos = prepared.camera_pos;
+        shadow.camera_forward = prepared.camera_forward;
+        shadow.atlas_size = prepared.atlas_size;
+        shadow.cascade_count = prepared.cascade_count;
+        shadow.strength = prepared.strength;
+        self.cached_shadow = Some(shadow);
+        self.shadow_update_frame = self.shadow_update_frame.wrapping_add(1);
+
+        (shadow, updates)
+    }
+
+    fn reset_scene_dependent(&mut self) {
+        self.cached_shadow = None;
+        self.shadow_update_frame = 0;
+        self.reflection_probe_frames_until_update = 0;
+        self.planar_reflection_frames_until_update = 0;
+    }
+
+    fn reset_reflection_probe(&mut self) {
+        self.reflection_probe_frames_until_update = 0;
+    }
+
+    fn reset_planar_reflection(&mut self) {
+        self.planar_reflection_frames_until_update = 0;
+    }
+
+    fn should_update_reflection_probe(&mut self, enabled: bool) -> bool {
+        update_due(
+            &mut self.reflection_probe_frames_until_update,
+            enabled,
+            REFLECTION_PROBE_UPDATE_INTERVAL,
+        )
+    }
+
+    fn should_update_planar_reflection(&mut self, enabled: bool) -> bool {
+        update_due(
+            &mut self.planar_reflection_frames_until_update,
+            enabled,
+            PLANAR_REFLECTION_UPDATE_INTERVAL,
+        )
+    }
+}
+
+fn update_due(counter: &mut u32, enabled: bool, interval: u32) -> bool {
+    if !enabled {
+        *counter = 0;
+        return false;
+    }
+
+    if *counter == 0 {
+        *counter = interval.saturating_sub(1);
+        true
+    } else {
+        *counter -= 1;
+        false
+    }
+}
+
 pub struct Renderer {
     _entry: Entry,
     window_ref: Arc<Window>,
@@ -129,6 +247,7 @@ pub struct Renderer {
     shadow_pipeline: PipelineSlot,
     post_pipeline: PipelineSlot,
     camera_meter: CameraMeter,
+    pass_schedule: PassSchedule,
 
     command_pool: vk::CommandPool,
     sync: SyncState,
@@ -158,14 +277,16 @@ impl Renderer {
     }
 
     fn upload_model(&mut self, model: &CpuModel) -> ModelId {
-        self.assets.upload_model(
+        let model = self.assets.upload_model(
             &self.instance,
             &self.logical_device,
             self.physical_device,
             self.command_pool,
             self.graphics_queue,
             model,
-        )
+        );
+        self.pass_schedule.reset_scene_dependent();
+        model
     }
 
     pub fn load_model(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<ModelId> {
@@ -217,11 +338,11 @@ impl Renderer {
 
 fn material_texture_slot_count(material: Material) -> usize {
     [
-        material.base_color_texture,
-        material.metallic_roughness_texture,
-        material.normal_texture,
-        material.occlusion_texture,
-        material.emissive_texture,
+        material.base_color_texture(),
+        material.metallic_roughness_texture(),
+        material.normal_texture(),
+        material.occlusion_texture(),
+        material.emissive_texture(),
     ]
     .into_iter()
     .filter(Option::is_some)

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::renderer::{Material, ModelVertex, TextureId, mat4_mul};
+use crate::renderer::{Material, MaterialAlpha, ModelVertex, TextureId, mat4_mul};
 
 #[derive(Debug, Clone)]
 pub struct CpuMesh {
@@ -427,16 +427,18 @@ fn load_gltf_primitive(
     }))
 }
 
-fn material_from_gltf(material: gltf::Material<'_>, textures: &mut [CpuTexture]) -> Material {
-    if material.index().is_none() {
+fn material_from_gltf(gltf_material: gltf::Material<'_>, textures: &mut [CpuTexture]) -> Material {
+    if gltf_material.index().is_none() {
         return Material::default();
     }
 
-    let pbr = material.pbr_metallic_roughness();
-    let alpha_blend = matches!(material.alpha_mode(), gltf::material::AlphaMode::Blend);
-    let alpha_cutoff = match material.alpha_mode() {
-        gltf::material::AlphaMode::Mask => material.alpha_cutoff().unwrap_or(0.5),
-        _ => 0.0,
+    let pbr = gltf_material.pbr_metallic_roughness();
+    let alpha = match gltf_material.alpha_mode() {
+        gltf::material::AlphaMode::Opaque => MaterialAlpha::Opaque,
+        gltf::material::AlphaMode::Mask => {
+            MaterialAlpha::Mask(gltf_material.alpha_cutoff().unwrap_or(0.5))
+        }
+        gltf::material::AlphaMode::Blend => MaterialAlpha::Blend,
     };
     let base_color_texture = pbr
         .base_color_texture()
@@ -444,18 +446,24 @@ fn material_from_gltf(material: gltf::Material<'_>, textures: &mut [CpuTexture])
     let metallic_roughness_texture = pbr
         .metallic_roughness_texture()
         .map(|info| TextureId(info.texture().index()));
-    let normal_texture = material.normal_texture();
-    let occlusion_texture = material.occlusion_texture();
-    let emissive_texture = material
+    let normal_texture = gltf_material.normal_texture();
+    let occlusion_texture = gltf_material.occlusion_texture();
+    let emissive_texture = gltf_material
         .emissive_texture()
         .map(|info| TextureId(info.texture().index()));
 
     let mut material = Material::new(pbr.base_color_factor())
         .with_metallic(pbr.metallic_factor())
         .with_roughness(pbr.roughness_factor())
-        .with_emissive(material.emissive_factor())
-        .with_alpha_cutoff(alpha_cutoff)
-        .with_alpha_blend(alpha_blend);
+        .with_emissive(gltf_material.emissive_factor())
+        .with_emissive_strength(gltf_material.emissive_strength().unwrap_or(1.0))
+        .with_alpha_mode(alpha)
+        .with_double_sided(gltf_material.double_sided());
+    if let Some(specular) = gltf_material.specular() {
+        material = material
+            .with_specular(specular.specular_factor())
+            .with_specular_color(specular.specular_color_factor());
+    }
 
     if let Some(texture) = base_color_texture {
         material = material.with_base_color_texture(texture);
@@ -493,7 +501,7 @@ fn infer_base_color_alpha(
     texture: TextureId,
     textures: &[CpuTexture],
 ) -> Material {
-    if material.alpha_blend || material.alpha_cutoff > f32::EPSILON {
+    if material.alpha_blend() || material.alpha_cutoff() > f32::EPSILON {
         return material;
     }
 
@@ -979,14 +987,14 @@ fn load_mtl(
                 if let Some(material) = current_material_mut(&current, materials) {
                     let alpha = parse_mtl_scalar(parts, 1.0).clamp(0.0, 1.0);
                     material.base_color[3] = alpha;
-                    material.alpha_blend = alpha < 0.999;
+                    *material = material.with_alpha_blend(alpha < 0.999);
                 }
             }
             "Tr" => {
                 if let Some(material) = current_material_mut(&current, materials) {
                     let alpha = 1.0 - parse_mtl_scalar(parts, 0.0).clamp(0.0, 1.0);
                     material.base_color[3] = alpha;
-                    material.alpha_blend = alpha < 0.999;
+                    *material = material.with_alpha_blend(alpha < 0.999);
                 }
             }
             "Pm" => {
@@ -1017,7 +1025,7 @@ fn load_mtl(
                     Ok(texture) => {
                         let texture_id = TextureId(textures.len());
                         textures.push(texture);
-                        material.base_color_texture = Some(texture_id);
+                        material.textures.base_color = Some(texture_id);
                         *material = infer_base_color_alpha(*material, texture_id, textures);
                     }
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -1495,7 +1503,7 @@ f 1/1 2/2 3/3
         let material = model.primitives[0].material;
 
         assert_eq!(model.textures.len(), 1);
-        assert_eq!(material.base_color_texture, Some(TextureId(0)));
+        assert_eq!(material.base_color_texture(), Some(TextureId(0)));
         assert_close(material.base_color, [0.2, 0.3, 0.4, 1.0]);
 
         let _ = fs::remove_dir_all(dir);
@@ -1537,8 +1545,8 @@ f 1/1 2/2 3/3
         .unwrap();
         let material = model.primitives[0].material;
 
-        assert_eq!(material.alpha_cutoff, 0.5);
-        assert!(!material.alpha_blend);
+        assert_eq!(material.alpha_cutoff(), 0.5);
+        assert!(!material.alpha_blend());
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1554,8 +1562,8 @@ f 1/1 2/2 3/3
         }];
         let material = infer_base_color_alpha(Material::default(), TextureId(0), &textures);
 
-        assert!(material.alpha_blend);
-        assert_eq!(material.alpha_cutoff, 0.0);
+        assert!(material.alpha_blend());
+        assert_eq!(material.alpha_cutoff(), 0.0);
     }
 
     #[test]
@@ -1660,6 +1668,7 @@ f 1 2 3
             format!(
                 r#"{{
     "asset": {{"version": "2.0"}},
+    "extensionsUsed": ["KHR_materials_emissive_strength", "KHR_materials_specular"],
     "scene": 0,
     "scenes": [{{"nodes": [0]}}],
     "nodes": [{{"mesh": 0}}],
@@ -1681,7 +1690,17 @@ f 1 2 3
         "normalTexture": {{"index": 2, "scale": 0.5}},
         "occlusionTexture": {{"index": 3, "strength": 0.25}},
         "emissiveTexture": {{"index": 4}},
-        "emissiveFactor": [0.1, 0.0, 0.2]
+        "emissiveFactor": [0.1, 0.0, 0.2],
+        "alphaMode": "MASK",
+        "alphaCutoff": 0.42,
+        "doubleSided": true,
+        "extensions": {{
+            "KHR_materials_emissive_strength": {{"emissiveStrength": 2.5}},
+            "KHR_materials_specular": {{
+                "specularFactor": 0.8,
+                "specularColorFactor": [0.9, 0.8, 0.7]
+            }}
+        }}
     }}],
     "images": [{{"uri": "tex.png"}}],
     "textures": [
@@ -1724,16 +1743,21 @@ f 1 2 3
         assert_eq!(primitive.mesh.indices, vec![0, 1, 2]);
         assert_close(primitive.material.base_color, [0.2, 0.4, 0.8, 0.75]);
         assert_close(primitive.material.emissive_color, [0.1, 0.0, 0.2]);
+        assert!((primitive.material.emissive_strength - 2.5).abs() < 0.001);
         assert!((primitive.material.metallic - 0.3).abs() < 0.001);
         assert!((primitive.material.roughness - 0.7).abs() < 0.001);
-        assert_eq!(primitive.material.base_color_texture, Some(TextureId(0)));
+        assert!((primitive.material.specular - 0.8).abs() < 0.001);
+        assert_close(primitive.material.specular_color, [0.9, 0.8, 0.7]);
+        assert!((primitive.material.alpha_cutoff() - 0.42).abs() < 0.001);
+        assert!(primitive.material.double_sided);
+        assert_eq!(primitive.material.base_color_texture(), Some(TextureId(0)));
         assert_eq!(
-            primitive.material.metallic_roughness_texture,
+            primitive.material.metallic_roughness_texture(),
             Some(TextureId(1))
         );
-        assert_eq!(primitive.material.normal_texture, Some(TextureId(2)));
-        assert_eq!(primitive.material.occlusion_texture, Some(TextureId(3)));
-        assert_eq!(primitive.material.emissive_texture, Some(TextureId(4)));
+        assert_eq!(primitive.material.normal_texture(), Some(TextureId(2)));
+        assert_eq!(primitive.material.occlusion_texture(), Some(TextureId(3)));
+        assert_eq!(primitive.material.emissive_texture(), Some(TextureId(4)));
         assert!((primitive.material.normal_scale - 0.5).abs() < 0.001);
         assert!((primitive.material.occlusion_strength - 0.25).abs() < 0.001);
 

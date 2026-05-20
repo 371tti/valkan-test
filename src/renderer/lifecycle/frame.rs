@@ -29,14 +29,27 @@ impl Renderer {
 
             self.ensure_reflection_targets(scene);
 
-            let shadow = self.prepare_shadow(scene);
+            let (shadow, shadow_cascades) =
+                self.pass_schedule.shadow_frame(self.prepare_shadow(scene));
             let reflections = self.prepare_reflections(scene);
-            self.shadow_scene_bindings.update(
-                &self.logical_device,
-                frame_index,
-                &SceneUniform::shadow(scene, shadow),
-            );
-            if reflections.probe.enabled {
+            let pass_updates = super::PassUpdates {
+                shadow_cascades,
+                reflection_probe: self
+                    .pass_schedule
+                    .should_update_reflection_probe(reflections.probe.enabled),
+                planar_reflection: self
+                    .pass_schedule
+                    .should_update_planar_reflection(reflections.planar.enabled),
+            };
+
+            if pass_updates.shadow_map() {
+                self.shadow_scene_bindings.update(
+                    &self.logical_device,
+                    frame_index,
+                    &SceneUniform::shadow(scene, shadow),
+                );
+            }
+            if pass_updates.reflection_probe {
                 let face = self.reflection_probe_face_cursor % ReflectionProbe::FACE_COUNT;
                 let binding_index = probe_binding_index(frame_index, face);
                 self.probe_scene_bindings.update(
@@ -45,16 +58,18 @@ impl Renderer {
                     &SceneUniform::reflection_probe_face(scene, reflections, shadow, face),
                 );
             }
-            self.planar_scene_bindings.update(
-                &self.logical_device,
-                frame_index,
-                &SceneUniform::planar_reflection(
-                    scene,
-                    self.planar_reflection.extent,
-                    reflections,
-                    shadow,
-                ),
-            );
+            if pass_updates.planar_reflection {
+                self.planar_scene_bindings.update(
+                    &self.logical_device,
+                    frame_index,
+                    &SceneUniform::planar_reflection(
+                        scene,
+                        self.planar_reflection.extent,
+                        reflections,
+                        shadow,
+                    ),
+                );
+            }
 
             self.scene_bindings.update(
                 &self.logical_device,
@@ -114,6 +129,8 @@ impl Renderer {
                 frame_index,
                 scene,
                 reflections,
+                shadow,
+                pass_updates,
             );
 
             let render_finished = self.swapchain.render_finished_semaphores[image_index as usize];

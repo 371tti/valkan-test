@@ -1,6 +1,8 @@
 #ifndef SCENE_UNIFORMS_GLSL
 #define SCENE_UNIFORMS_GLSL
 
+#define SHADOW_CASCADE_COUNT 4
+
 layout(set = 0, binding = 0) uniform Scene {
     mat4 view_proj;
     vec4 light_dir;
@@ -15,7 +17,11 @@ layout(set = 0, binding = 0) uniform Scene {
     vec4 planar_plane;
     vec4 planar_params;
     vec4 planar_texture_info;
-    mat4 shadow_view_proj;
+    mat4 shadow_view_proj[SHADOW_CASCADE_COUNT];
+    vec4 shadow_cascade_params[SHADOW_CASCADE_COUNT];
+    vec4 shadow_atlas[SHADOW_CASCADE_COUNT];
+    vec4 shadow_camera_pos;
+    vec4 shadow_camera_dir;
     vec4 shadow_params;
     vec4 debug_params;
     vec4 camera_response;
@@ -34,6 +40,7 @@ layout(push_constant) uniform Object {
     vec4 base_color;
     vec4 emissive_color;
     vec4 material;
+    vec4 material_ext;
     vec4 texture_flags;
     vec4 texture_info;
 } object;

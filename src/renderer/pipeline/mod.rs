@@ -249,6 +249,13 @@ impl RasterizationConfig {
             ..Self::default()
         }
     }
+
+    pub fn double_sided() -> Self {
+        Self {
+            cull_mode: vk::CullModeFlags::NONE,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for RasterizationConfig {
@@ -628,11 +635,14 @@ pub struct HotReload {
 
 impl HotReload {
     pub fn new(shaders: &ShaderSet, interval: Duration) -> Self {
+        let enabled = cfg!(debug_assertions);
         Self {
-            enabled: true,
+            enabled,
             interval,
             last_check: Instant::now(),
-            stamp: shaders.watch_stamp().unwrap_or(None),
+            stamp: enabled
+                .then(|| shaders.watch_stamp().unwrap_or(None))
+                .flatten(),
         }
     }
 

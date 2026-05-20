@@ -167,6 +167,7 @@ impl Renderer {
                     desired_probe_size,
                 );
                 self.reflection_probe_face_cursor = 0;
+                self.pass_schedule.reset_reflection_probe();
             }
 
             if rebuild_planar {
@@ -180,6 +181,7 @@ impl Renderer {
                     self.swapchain.format,
                     desired_planar_extent,
                 );
+                self.pass_schedule.reset_planar_reflection();
             }
         }
 
@@ -314,7 +316,7 @@ impl Renderer {
 
         let material = self.assets.material(object.material);
         let reflectivity = material.metallic
-            + if material.metallic_roughness_texture.is_some() {
+            + if material.metallic_roughness_texture().is_some() {
                 0.5
             } else {
                 0.0

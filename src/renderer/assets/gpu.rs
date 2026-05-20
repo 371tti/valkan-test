@@ -4,7 +4,13 @@ use ash::{Instance, vk};
 
 use crate::renderer::{MAX_FRAMES_IN_FLIGHT, Material, MaterialId, MeshId, ModelId, TextureId};
 
-use super::cpu::{CpuMesh, CpuModel, CpuTexture, TextureFilter, TextureSampler, TextureWrap};
+use super::{
+    cpu::{CpuMesh, CpuModel, CpuTexture, TextureFilter, TextureSampler, TextureWrap},
+    image::{
+        GpuImage, create_device_image, create_image_view, destroy_image_memory, destroy_image_view,
+        destroy_sampler, find_memory_type, image_2d_info,
+    },
+};
 
 fn mesh_center(mesh: &CpuMesh) -> [f32; 3] {
     let Some(first) = mesh.vertices.first() else {
@@ -180,24 +186,10 @@ impl GpuTexture {
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        if self.sampler != vk::Sampler::null() {
-            unsafe { device.destroy_sampler(self.sampler, None) };
-            self.sampler = vk::Sampler::null();
-        }
-
-        if self.view != vk::ImageView::null() {
-            unsafe { device.destroy_image_view(self.view, None) };
-            self.view = vk::ImageView::null();
-        }
-
-        if self.image != vk::Image::null() {
-            unsafe { device.destroy_image(self.image, None) };
-            self.image = vk::Image::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
+        unsafe {
+            destroy_sampler(device, &mut self.sampler);
+            destroy_image_view(device, &mut self.view);
+            destroy_image_memory(device, &mut self.image, &mut self.memory);
         }
     }
 }
@@ -346,20 +338,25 @@ impl GpuAssets {
             .iter()
             .map(|primitive| {
                 let mut material = primitive.material;
-                material.base_color_texture = material
-                    .base_color_texture
+                material.textures.base_color = material
+                    .textures
+                    .base_color
                     .and_then(|texture| textures.get(texture.0).copied());
-                material.metallic_roughness_texture = material
-                    .metallic_roughness_texture
+                material.textures.metallic_roughness = material
+                    .textures
+                    .metallic_roughness
                     .and_then(|texture| textures.get(texture.0).copied());
-                material.normal_texture = material
-                    .normal_texture
+                material.textures.normal = material
+                    .textures
+                    .normal
                     .and_then(|texture| textures.get(texture.0).copied());
-                material.occlusion_texture = material
-                    .occlusion_texture
+                material.textures.occlusion = material
+                    .textures
+                    .occlusion
                     .and_then(|texture| textures.get(texture.0).copied());
-                material.emissive_texture = material
-                    .emissive_texture
+                material.textures.emissive = material
+                    .textures
+                    .emissive
                     .and_then(|texture| textures.get(texture.0).copied());
 
                 GpuPrimitive {
@@ -942,70 +939,22 @@ impl DepthTarget {
         format: vk::Format,
         usage: vk::ImageUsageFlags,
     ) -> Self {
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let image = unsafe {
-            device
-                .create_image(&image_info, None)
-                .expect("renderer: failed to create depth image")
-        };
-
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = find_memory_type(
-            instance,
-            physical_device,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc, None)
-                .expect("renderer: failed to allocate depth memory")
-        };
-
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("renderer: failed to bind depth memory")
-        };
+        let image_info = image_2d_info(format, extent, usage);
+        let GpuImage { image, memory } =
+            create_device_image(instance, device, physical_device, &image_info, "depth");
 
         transition_depth_image(device, command_pool, queue, image);
 
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        let view = unsafe {
-            device
-                .create_image_view(&view_info, None)
-                .expect("renderer: failed to create depth view")
-        };
+        let view = create_image_view(
+            device,
+            image,
+            format,
+            vk::ImageViewType::TYPE_2D,
+            vk::ImageAspectFlags::DEPTH,
+            0,
+            1,
+            "depth",
+        );
 
         Self {
             view,
@@ -1019,19 +968,9 @@ impl DepthTarget {
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        if self.view != vk::ImageView::null() {
-            unsafe { device.destroy_image_view(self.view, None) };
-            self.view = vk::ImageView::null();
-        }
-
-        if self.image != vk::Image::null() {
-            unsafe { device.destroy_image(self.image, None) };
-            self.image = vk::Image::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
+        unsafe {
+            destroy_image_view(device, &mut self.view);
+            destroy_image_memory(device, &mut self.image, &mut self.memory);
         }
     }
 }
@@ -1059,66 +998,26 @@ impl ShadowMap {
             height: size.max(1),
         };
         let format = vk::Format::D32_SFLOAT;
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let image = unsafe {
-            device
-                .create_image(&image_info, None)
-                .expect("renderer: failed to create shadow map image")
-        };
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = find_memory_type(
-            instance,
-            physical_device,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        let image_info = image_2d_info(
+            format,
+            extent,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         );
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc, None)
-                .expect("renderer: failed to allocate shadow map memory")
-        };
-
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("renderer: failed to bind shadow map memory")
-        };
+        let GpuImage { image, memory } =
+            create_device_image(instance, device, physical_device, &image_info, "shadow map");
 
         transition_depth_image(device, command_pool, queue, image);
 
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        let view = unsafe {
-            device
-                .create_image_view(&view_info, None)
-                .expect("renderer: failed to create shadow map view")
-        };
+        let view = create_image_view(
+            device,
+            image,
+            format,
+            vk::ImageViewType::TYPE_2D,
+            vk::ImageAspectFlags::DEPTH,
+            0,
+            1,
+            "shadow map",
+        );
         let sampler = create_shadow_sampler(device);
 
         Self {
@@ -1151,24 +1050,10 @@ impl ShadowMap {
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        if self.sampler != vk::Sampler::null() {
-            unsafe { device.destroy_sampler(self.sampler, None) };
-            self.sampler = vk::Sampler::null();
-        }
-
-        if self.view != vk::ImageView::null() {
-            unsafe { device.destroy_image_view(self.view, None) };
-            self.view = vk::ImageView::null();
-        }
-
-        if self.image != vk::Image::null() {
-            unsafe { device.destroy_image(self.image, None) };
-            self.image = vk::Image::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
+        unsafe {
+            destroy_sampler(device, &mut self.sampler);
+            destroy_image_view(device, &mut self.view);
+            destroy_image_memory(device, &mut self.image, &mut self.memory);
         }
     }
 }
@@ -1200,70 +1085,44 @@ impl ReflectionProbe {
             width: size,
             height: size,
         };
-        let image_info = vk::ImageCreateInfo::default()
-            .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE)
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: size,
-                height: size,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(Self::FACE_COUNT as u32)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let image = unsafe {
-            device
-                .create_image(&image_info, None)
-                .expect("renderer: failed to create reflection probe image")
-        };
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = find_memory_type(
+        let image_info = image_2d_info(
+            format,
+            extent,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST,
+        )
+        .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE)
+        .array_layers(Self::FACE_COUNT as u32);
+        let GpuImage { image, memory } = create_device_image(
             instance,
+            device,
             physical_device,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            &image_info,
+            "reflection probe",
         );
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc, None)
-                .expect("renderer: failed to allocate reflection probe memory")
-        };
 
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("renderer: failed to bind reflection probe memory")
-        };
-
-        let view = create_reflection_probe_view(
+        let view = create_image_view(
             device,
             image,
             format,
             vk::ImageViewType::CUBE,
+            vk::ImageAspectFlags::COLOR,
             0,
             Self::FACE_COUNT as u32,
+            "reflection probe",
         );
         let face_views = (0..Self::FACE_COUNT)
             .map(|face| {
-                create_reflection_probe_view(
+                create_image_view(
                     device,
                     image,
                     format,
                     vk::ImageViewType::TYPE_2D,
+                    vk::ImageAspectFlags::COLOR,
                     face as u32,
                     1,
+                    "reflection probe face",
                 )
             })
             .collect();
@@ -1325,24 +1184,10 @@ impl ReflectionProbe {
             unsafe { device.destroy_image_view(view, None) };
         }
 
-        if self.view != vk::ImageView::null() {
-            unsafe { device.destroy_image_view(self.view, None) };
-            self.view = vk::ImageView::null();
-        }
-
-        if self.sampler != vk::Sampler::null() {
-            unsafe { device.destroy_sampler(self.sampler, None) };
-            self.sampler = vk::Sampler::null();
-        }
-
-        if self.image != vk::Image::null() {
-            unsafe { device.destroy_image(self.image, None) };
-            self.image = vk::Image::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
+        unsafe {
+            destroy_image_view(device, &mut self.view);
+            destroy_sampler(device, &mut self.sampler);
+            destroy_image_memory(device, &mut self.image, &mut self.memory);
         }
     }
 }
@@ -1371,53 +1216,31 @@ impl PlanarReflectionTarget {
             width: extent.width.max(1),
             height: extent.height.max(1),
         };
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let image = unsafe {
-            device
-                .create_image(&image_info, None)
-                .expect("renderer: failed to create planar reflection image")
-        };
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = find_memory_type(
-            instance,
-            physical_device,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        let image_info = image_2d_info(
+            format,
+            extent,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_DST,
         );
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc, None)
-                .expect("renderer: failed to allocate planar reflection memory")
-        };
+        let GpuImage { image, memory } = create_device_image(
+            instance,
+            device,
+            physical_device,
+            &image_info,
+            "planar reflection",
+        );
 
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("renderer: failed to bind planar reflection memory")
-        };
-
-        let view = create_planar_reflection_view(device, image, format);
+        let view = create_image_view(
+            device,
+            image,
+            format,
+            vk::ImageViewType::TYPE_2D,
+            vk::ImageAspectFlags::COLOR,
+            0,
+            1,
+            "planar reflection",
+        );
         let sampler = create_texture_sampler(
             device,
             TextureSampler {
@@ -1471,24 +1294,10 @@ impl PlanarReflectionTarget {
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe { self.depth.destroy(device) };
 
-        if self.view != vk::ImageView::null() {
-            unsafe { device.destroy_image_view(self.view, None) };
-            self.view = vk::ImageView::null();
-        }
-
-        if self.sampler != vk::Sampler::null() {
-            unsafe { device.destroy_sampler(self.sampler, None) };
-            self.sampler = vk::Sampler::null();
-        }
-
-        if self.image != vk::Image::null() {
-            unsafe { device.destroy_image(self.image, None) };
-            self.image = vk::Image::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
+        unsafe {
+            destroy_image_view(device, &mut self.view);
+            destroy_sampler(device, &mut self.sampler);
+            destroy_image_memory(device, &mut self.image, &mut self.memory);
         }
     }
 }
@@ -1519,54 +1328,32 @@ impl SceneRenderTarget {
             width: extent.width.max(1),
             height: extent.height.max(1),
         };
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let image = unsafe {
-            device
-                .create_image(&image_info, None)
-                .expect("renderer: failed to create scene color image")
-        };
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        let memory_type = find_memory_type(
-            instance,
-            physical_device,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        let image_info = image_2d_info(
+            format,
+            extent,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
         );
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type);
-        let memory = unsafe {
-            device
-                .allocate_memory(&alloc, None)
-                .expect("renderer: failed to allocate scene color memory")
-        };
+        let GpuImage { image, memory } = create_device_image(
+            instance,
+            device,
+            physical_device,
+            &image_info,
+            "scene color",
+        );
 
-        unsafe {
-            device
-                .bind_image_memory(image, memory, 0)
-                .expect("renderer: failed to bind scene color memory")
-        };
-
-        let view = create_planar_reflection_view(device, image, format);
+        let view = create_image_view(
+            device,
+            image,
+            format,
+            vk::ImageViewType::TYPE_2D,
+            vk::ImageAspectFlags::COLOR,
+            0,
+            1,
+            "scene color",
+        );
         let sampler = create_texture_sampler(
             device,
             TextureSampler {
@@ -1647,29 +1434,11 @@ impl SceneRenderTarget {
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe { self.depth.destroy(device) };
 
-        if self.depth_sampler != vk::Sampler::null() {
-            unsafe { device.destroy_sampler(self.depth_sampler, None) };
-            self.depth_sampler = vk::Sampler::null();
-        }
-
-        if self.view != vk::ImageView::null() {
-            unsafe { device.destroy_image_view(self.view, None) };
-            self.view = vk::ImageView::null();
-        }
-
-        if self.sampler != vk::Sampler::null() {
-            unsafe { device.destroy_sampler(self.sampler, None) };
-            self.sampler = vk::Sampler::null();
-        }
-
-        if self.image != vk::Image::null() {
-            unsafe { device.destroy_image(self.image, None) };
-            self.image = vk::Image::null();
-        }
-
-        if self.memory != vk::DeviceMemory::null() {
-            unsafe { device.free_memory(self.memory, None) };
-            self.memory = vk::DeviceMemory::null();
+        unsafe {
+            destroy_sampler(device, &mut self.depth_sampler);
+            destroy_image_view(device, &mut self.view);
+            destroy_sampler(device, &mut self.sampler);
+            destroy_image_memory(device, &mut self.image, &mut self.memory);
         }
     }
 }
@@ -1822,57 +1591,6 @@ fn image_barrier(
     unsafe { device.cmd_pipeline_barrier2(command_buffer, &dependency) };
 }
 
-fn create_reflection_probe_view(
-    device: &ash::Device,
-    image: vk::Image,
-    format: vk::Format,
-    view_type: vk::ImageViewType,
-    base_array_layer: u32,
-    layer_count: u32,
-) -> vk::ImageView {
-    let info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(view_type)
-        .format(format)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer,
-            layer_count,
-        });
-
-    unsafe {
-        device
-            .create_image_view(&info, None)
-            .expect("renderer: failed to create reflection probe view")
-    }
-}
-
-fn create_planar_reflection_view(
-    device: &ash::Device,
-    image: vk::Image,
-    format: vk::Format,
-) -> vk::ImageView {
-    let info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(format)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-
-    unsafe {
-        device
-            .create_image_view(&info, None)
-            .expect("renderer: failed to create planar reflection view")
-    }
-}
-
 fn create_texture_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
     let bindings = (0..5)
         .map(|binding| {
@@ -1929,13 +1647,13 @@ fn allocate_texture_set(
             .expect("renderer: failed to allocate texture descriptor set")[0]
     };
     let texture_ids = [
-        material.base_color_texture.unwrap_or(TextureId::DEFAULT),
+        material.base_color_texture().unwrap_or(TextureId::DEFAULT),
         material
-            .metallic_roughness_texture
+            .metallic_roughness_texture()
             .unwrap_or(TextureId::DEFAULT),
-        material.normal_texture.unwrap_or(TextureId::NORMAL),
-        material.occlusion_texture.unwrap_or(TextureId::DEFAULT),
-        material.emissive_texture.unwrap_or(TextureId::DEFAULT),
+        material.normal_texture().unwrap_or(TextureId::NORMAL),
+        material.occlusion_texture().unwrap_or(TextureId::DEFAULT),
+        material.emissive_texture().unwrap_or(TextureId::DEFAULT),
     ];
     let image_infos = texture_ids
         .into_iter()
@@ -1981,69 +1699,28 @@ fn create_texture_image(
     height: u32,
     srgb: bool,
 ) -> (vk::Image, vk::DeviceMemory) {
-    let image_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(texture_format(srgb))
-        .extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    let image = unsafe {
-        device
-            .create_image(&image_info, None)
-            .expect("renderer: failed to create texture image")
-    };
-    let requirements = unsafe { device.get_image_memory_requirements(image) };
-    let memory_type = find_memory_type(
-        instance,
-        physical_device,
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    let image_info = image_2d_info(
+        texture_format(srgb),
+        vk::Extent2D { width, height },
+        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
     );
-    let alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type);
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc, None)
-            .expect("renderer: failed to allocate texture memory")
-    };
-
-    unsafe {
-        device
-            .bind_image_memory(image, memory, 0)
-            .expect("renderer: failed to bind texture memory")
-    };
+    let GpuImage { image, memory } =
+        create_device_image(instance, device, physical_device, &image_info, "texture");
 
     (image, memory)
 }
 
 fn create_texture_view(device: &ash::Device, image: vk::Image, srgb: bool) -> vk::ImageView {
-    let info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(texture_format(srgb))
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        });
-
-    unsafe {
-        device
-            .create_image_view(&info, None)
-            .expect("renderer: failed to create texture view")
-    }
+    create_image_view(
+        device,
+        image,
+        texture_format(srgb),
+        vk::ImageViewType::TYPE_2D,
+        vk::ImageAspectFlags::COLOR,
+        0,
+        1,
+        "texture",
+    )
 }
 
 fn texture_format(srgb: bool) -> vk::Format {
@@ -2296,21 +1973,4 @@ fn submit_once<F: FnOnce(vk::CommandBuffer)>(
             .expect("renderer: failed to wait transient command buffer");
         device.free_command_buffers(command_pool, &command_buffers);
     }
-}
-
-pub(in crate::renderer) fn find_memory_type(
-    instance: &Instance,
-    physical_device: vk::PhysicalDevice,
-    type_filter: u32,
-    properties: vk::MemoryPropertyFlags,
-) -> u32 {
-    let memory = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-    (0..memory.memory_type_count)
-        .find(|&index| {
-            let supported = (type_filter & (1_u32 << index)) != 0;
-            let flags = memory.memory_types[index as usize].property_flags;
-            supported && flags.contains(properties)
-        })
-        .expect("renderer: failed to find suitable memory type")
 }

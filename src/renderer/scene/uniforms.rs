@@ -3,7 +3,7 @@ use std::mem;
 use ash::vk;
 
 use super::{
-    Camera, DirectionalLight, Material, RenderObject, RenderScene, TextureId,
+    Camera, DirectionalLight, Material, RenderObject, RenderScene, SHADOW_CASCADE_COUNT, TextureId,
     reflections::PreparedReflections, shadows::PreparedShadow,
 };
 
@@ -23,7 +23,11 @@ pub(super) struct SceneUniform {
     planar_plane: [f32; 4],
     planar_params: [f32; 4],
     planar_texture_info: [f32; 4],
-    shadow_view_proj: [f32; 16],
+    shadow_view_proj: [[f32; 16]; SHADOW_CASCADE_COUNT],
+    shadow_cascade_params: [[f32; 4]; SHADOW_CASCADE_COUNT],
+    shadow_atlas: [[f32; 4]; SHADOW_CASCADE_COUNT],
+    shadow_camera_pos: [f32; 4],
+    shadow_camera_dir: [f32; 4],
     shadow_params: [f32; 4],
     debug_params: [f32; 4],
     camera_response: [f32; 4],
@@ -58,8 +62,8 @@ impl SceneUniform {
                 height: 1,
             },
         );
-        uniform.view_proj = shadow.view_proj;
         uniform.set_shadow_info(shadow);
+        uniform.debug_params[3] = 1.0;
         uniform
     }
 
@@ -114,7 +118,16 @@ impl SceneUniform {
             planar_plane: [0.0, 1.0, 0.0, 0.0],
             planar_params: [0.0, 0.75, 0.35, 3.5],
             planar_texture_info: [0.0, 0.03, 0.0, 0.0],
-            shadow_view_proj: identity_mat4(),
+            shadow_view_proj: [identity_mat4(); SHADOW_CASCADE_COUNT],
+            shadow_cascade_params: [[0.0; 4]; SHADOW_CASCADE_COUNT],
+            shadow_atlas: [[0.0; 4]; SHADOW_CASCADE_COUNT],
+            shadow_camera_pos: [
+                scene.camera.eye[0],
+                scene.camera.eye[1],
+                scene.camera.eye[2],
+                0.0,
+            ],
+            shadow_camera_dir: [basis.forward[0], basis.forward[1], basis.forward[2], 0.0],
             shadow_params: [0.0; 4],
             debug_params: [
                 scene.debug_mode.shader_value(),
@@ -212,12 +225,29 @@ impl SceneUniform {
     }
 
     pub(super) fn set_shadow_info(&mut self, shadow: PreparedShadow) {
-        self.shadow_view_proj = shadow.view_proj;
+        for (index, cascade) in shadow.cascades.iter().enumerate() {
+            self.shadow_view_proj[index] = cascade.view_proj;
+            self.shadow_cascade_params[index] =
+                [cascade.split_depth, cascade.bias, cascade.radius, 0.0];
+            self.shadow_atlas[index] = cascade.atlas;
+        }
         self.shadow_params = [
-            shadow.resolution,
-            shadow.bias,
+            shadow.atlas_size,
             shadow.strength.clamp(0.0, 1.0),
-            1.0,
+            shadow.cascade_count.min(SHADOW_CASCADE_COUNT as u32) as f32,
+            (shadow.cascade_count > 0) as u8 as f32,
+        ];
+        self.shadow_camera_pos = [
+            shadow.camera_pos[0],
+            shadow.camera_pos[1],
+            shadow.camera_pos[2],
+            0.0,
+        ];
+        self.shadow_camera_dir = [
+            shadow.camera_forward[0],
+            shadow.camera_forward[1],
+            shadow.camera_forward[2],
+            0.0,
         ];
     }
 }
@@ -241,38 +271,41 @@ pub(super) struct ObjectPush {
     pub(super) base_color: [f32; 4],
     pub(super) emissive_color: [f32; 4],
     pub(super) material: [f32; 4],
+    pub(super) material_ext: [f32; 4],
     pub(super) texture_flags: [f32; 4],
     pub(super) texture_info: [f32; 4],
 }
 
 impl ObjectPush {
     pub(super) fn new(object: RenderObject, material: Material) -> Self {
+        let emissive = material.emissive_radiance();
         Self {
             model: object.transform.matrix(),
             base_color: material.base_color,
-            emissive_color: [
-                material.emissive_color[0],
-                material.emissive_color[1],
-                material.emissive_color[2],
-                0.0,
-            ],
+            emissive_color: [emissive[0], emissive[1], emissive[2], 0.0],
             material: [
                 material.metallic,
                 material.roughness,
                 material.specular,
                 material.ambient_occlusion,
             ],
+            material_ext: [
+                material.specular_color[0],
+                material.specular_color[1],
+                material.specular_color[2],
+                material.double_sided as u8 as f32,
+            ],
             texture_flags: [
-                has_texture(material.base_color_texture),
-                has_texture(material.metallic_roughness_texture),
-                has_texture(material.normal_texture),
-                has_texture(material.occlusion_texture),
+                has_texture(material.base_color_texture()),
+                has_texture(material.metallic_roughness_texture()),
+                has_texture(material.normal_texture()),
+                has_texture(material.occlusion_texture()),
             ],
             texture_info: [
-                has_texture(material.emissive_texture),
+                has_texture(material.emissive_texture()),
                 material.normal_scale,
                 material.occlusion_strength,
-                material.alpha_cutoff,
+                material.alpha_cutoff(),
             ],
         }
     }

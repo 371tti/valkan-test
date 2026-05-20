@@ -305,6 +305,12 @@ impl super::Renderer {
                 write: false,
                 ..DepthConfig::default()
             });
+        let double_sided_pipeline_desc = pipeline_desc
+            .clone()
+            .with_rasterization(RasterizationConfig::double_sided());
+        let transparent_double_sided_pipeline_desc = transparent_pipeline_desc
+            .clone()
+            .with_rasterization(RasterizationConfig::double_sided());
         let wireframe_pipeline_desc =
             pipeline_desc
                 .clone()
@@ -365,6 +371,20 @@ impl super::Renderer {
                 swapchain.format,
                 wireframe_pipeline_desc,
                 "wireframe mesh pipeline",
+            ),
+            build_pipeline_slot(
+                &logical_device,
+                pipeline_cache,
+                swapchain.format,
+                double_sided_pipeline_desc,
+                "double sided mesh pipeline",
+            ),
+            build_pipeline_slot(
+                &logical_device,
+                pipeline_cache,
+                swapchain.format,
+                transparent_double_sided_pipeline_desc,
+                "transparent double sided mesh pipeline",
             ),
         ];
         let shadow_pipeline = build_pipeline_slot(
@@ -456,6 +476,7 @@ impl super::Renderer {
             shadow_pipeline,
             post_pipeline,
             camera_meter,
+            pass_schedule: super::PassSchedule::new(),
             sync,
             debug_utils_loader,
             debug_messenger,

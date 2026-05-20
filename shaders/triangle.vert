@@ -16,7 +16,13 @@ void main() {
     vec4 world_pos = object.model * vec4(in_position, 1.0);
     mat3 normal_matrix = transpose(inverse(mat3(object.model)));
 
-    gl_Position = scene.view_proj * world_pos;
+    mat4 view_proj = scene.view_proj;
+    if (scene.debug_params.w > 0.5) {
+        int cascade = clamp(int(object.emissive_color.w + 0.5), 0, SHADOW_CASCADE_COUNT - 1);
+        view_proj = scene.shadow_view_proj[cascade];
+    }
+
+    gl_Position = view_proj * world_pos;
     frag_normal = normal_matrix * in_normal;
     frag_uv = in_uv;
     frag_world_pos = world_pos.xyz;

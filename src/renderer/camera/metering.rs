@@ -1,7 +1,7 @@
 use ash::vk;
 
 use super::{
-    assets::{GpuBuffer, find_memory_type},
+    assets::{GpuBuffer, GpuImage, create_device_image, image_2d_info},
     scene::CameraMetering,
 };
 
@@ -358,47 +358,18 @@ fn create_meter_image(
     format: vk::Format,
     extent: vk::Extent2D,
 ) -> (vk::Image, vk::DeviceMemory) {
-    let image_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(vk::Extent3D {
-            width: extent.width,
-            height: extent.height,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-    let image = unsafe {
-        device
-            .create_image(&image_info, None)
-            .expect("renderer: failed to create active camera meter image")
-    };
-    let requirements = unsafe { device.get_image_memory_requirements(image) };
-    let memory_type = find_memory_type(
-        instance,
-        physical_device,
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    let image_info = image_2d_info(
+        format,
+        extent,
+        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
     );
-    let alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type);
-    let memory = unsafe {
-        device
-            .allocate_memory(&alloc, None)
-            .expect("renderer: failed to allocate active camera meter image memory")
-    };
-
-    unsafe {
-        device
-            .bind_image_memory(image, memory, 0)
-            .expect("renderer: failed to bind active camera meter image memory")
-    };
+    let GpuImage { image, memory } = create_device_image(
+        instance,
+        device,
+        physical_device,
+        &image_info,
+        "active camera meter",
+    );
 
     (image, memory)
 }
