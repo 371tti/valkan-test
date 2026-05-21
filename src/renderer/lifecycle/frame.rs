@@ -29,11 +29,14 @@ impl Renderer {
 
             self.ensure_reflection_targets(scene);
 
-            let (shadow, shadow_cascades) =
-                self.pass_schedule.shadow_frame(self.prepare_shadow(scene));
+            let prepared_shadow = self
+                .pass_schedule
+                .needs_shadow_update()
+                .then(|| self.prepare_shadow(scene));
+            let (shadow, update_shadow_map) = self.pass_schedule.shadow_frame(prepared_shadow);
             let reflections = self.prepare_reflections(scene);
             let pass_updates = super::PassUpdates {
-                shadow_cascades,
+                shadow_map: update_shadow_map,
                 reflection_probe: self
                     .pass_schedule
                     .should_update_reflection_probe(reflections.probe.enabled),
@@ -42,7 +45,7 @@ impl Renderer {
                     .should_update_planar_reflection(reflections.planar.enabled),
             };
 
-            if pass_updates.shadow_map() {
+            if pass_updates.shadow_map {
                 self.shadow_scene_bindings.update(
                     &self.logical_device,
                     frame_index,
@@ -129,7 +132,6 @@ impl Renderer {
                 frame_index,
                 scene,
                 reflections,
-                shadow,
                 pass_updates,
             );
 

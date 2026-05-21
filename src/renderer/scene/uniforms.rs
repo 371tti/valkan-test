@@ -3,7 +3,7 @@ use std::mem;
 use ash::vk;
 
 use super::{
-    Camera, DirectionalLight, Material, RenderObject, RenderScene, SHADOW_CASCADE_COUNT, TextureId,
+    Camera, DirectionalLight, Material, RenderObject, RenderScene, TextureId,
     reflections::PreparedReflections, shadows::PreparedShadow,
 };
 
@@ -23,11 +23,7 @@ pub(super) struct SceneUniform {
     planar_plane: [f32; 4],
     planar_params: [f32; 4],
     planar_texture_info: [f32; 4],
-    shadow_view_proj: [[f32; 16]; SHADOW_CASCADE_COUNT],
-    shadow_cascade_params: [[f32; 4]; SHADOW_CASCADE_COUNT],
-    shadow_atlas: [[f32; 4]; SHADOW_CASCADE_COUNT],
-    shadow_camera_pos: [f32; 4],
-    shadow_camera_dir: [f32; 4],
+    shadow_view_proj: [f32; 16],
     shadow_params: [f32; 4],
     debug_params: [f32; 4],
     camera_response: [f32; 4],
@@ -62,8 +58,8 @@ impl SceneUniform {
                 height: 1,
             },
         );
+        uniform.view_proj = shadow.view_proj;
         uniform.set_shadow_info(shadow);
-        uniform.debug_params[3] = 1.0;
         uniform
     }
 
@@ -118,16 +114,7 @@ impl SceneUniform {
             planar_plane: [0.0, 1.0, 0.0, 0.0],
             planar_params: [0.0, 0.75, 0.35, 3.5],
             planar_texture_info: [0.0, 0.03, 0.0, 0.0],
-            shadow_view_proj: [identity_mat4(); SHADOW_CASCADE_COUNT],
-            shadow_cascade_params: [[0.0; 4]; SHADOW_CASCADE_COUNT],
-            shadow_atlas: [[0.0; 4]; SHADOW_CASCADE_COUNT],
-            shadow_camera_pos: [
-                scene.camera.eye[0],
-                scene.camera.eye[1],
-                scene.camera.eye[2],
-                0.0,
-            ],
-            shadow_camera_dir: [basis.forward[0], basis.forward[1], basis.forward[2], 0.0],
+            shadow_view_proj: identity_mat4(),
             shadow_params: [0.0; 4],
             debug_params: [
                 scene.debug_mode.shader_value(),
@@ -225,29 +212,12 @@ impl SceneUniform {
     }
 
     pub(super) fn set_shadow_info(&mut self, shadow: PreparedShadow) {
-        for (index, cascade) in shadow.cascades.iter().enumerate() {
-            self.shadow_view_proj[index] = cascade.view_proj;
-            self.shadow_cascade_params[index] =
-                [cascade.split_depth, cascade.bias, cascade.radius, 0.0];
-            self.shadow_atlas[index] = cascade.atlas;
-        }
+        self.shadow_view_proj = shadow.view_proj;
         self.shadow_params = [
-            shadow.atlas_size,
+            shadow.resolution,
+            shadow.bias,
             shadow.strength.clamp(0.0, 1.0),
-            shadow.cascade_count.min(SHADOW_CASCADE_COUNT as u32) as f32,
-            (shadow.cascade_count > 0) as u8 as f32,
-        ];
-        self.shadow_camera_pos = [
-            shadow.camera_pos[0],
-            shadow.camera_pos[1],
-            shadow.camera_pos[2],
-            0.0,
-        ];
-        self.shadow_camera_dir = [
-            shadow.camera_forward[0],
-            shadow.camera_forward[1],
-            shadow.camera_forward[2],
-            0.0,
+            1.0,
         ];
     }
 }
@@ -282,7 +252,7 @@ impl ObjectPush {
         Self {
             model: object.transform.matrix(),
             base_color: material.base_color,
-            emissive_color: [emissive[0], emissive[1], emissive[2], 0.0],
+            emissive_color: [emissive[0], emissive[1], emissive[2], material.transmission],
             material: [
                 material.metallic,
                 material.roughness,
@@ -302,7 +272,7 @@ impl ObjectPush {
                 has_texture(material.occlusion_texture()),
             ],
             texture_info: [
-                has_texture(material.emissive_texture()),
+                texture_info_flags(material),
                 material.normal_scale,
                 material.occlusion_strength,
                 material.alpha_cutoff(),
@@ -317,6 +287,10 @@ pub(super) fn bytes_of<T>(value: &T) -> &[u8] {
 
 pub(super) fn has_texture(texture: Option<TextureId>) -> f32 {
     texture.is_some() as u8 as f32
+}
+
+fn texture_info_flags(material: Material) -> f32 {
+    has_texture(material.emissive_texture()) + (material.alpha_blend() as u8 as f32) * 2.0
 }
 
 struct CameraBasis {

@@ -64,11 +64,9 @@ pub use scene::{
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const REFLECTION_PROBE_SIZE: u32 = 128;
 const SHADOW_MAP_SIZE: u32 = 4096;
-const SHADOW_CASCADE_COUNT: usize = 4;
-const SHADOW_CASCADE_GRID: u32 = 2;
-const SHADOW_CASCADE_UPDATE_INTERVALS: [u32; SHADOW_CASCADE_COUNT] = [1, 2, 6, 12];
 const PLANAR_REFLECTION_MIN_SIZE: u32 = 128;
 const PLANAR_REFLECTION_MAX_SIZE: u32 = 2048;
+const SHADOW_UPDATE_INTERVAL: u32 = 4;
 const REFLECTION_PROBE_UPDATE_INTERVAL: u32 = 4;
 const PLANAR_REFLECTION_UPDATE_INTERVAL: u32 = 3;
 
@@ -110,64 +108,56 @@ struct PipelineSlot {
 
 struct PassSchedule {
     cached_shadow: Option<shadows::PreparedShadow>,
-    shadow_update_frame: u32,
+    shadow_frames_until_update: u32,
     reflection_probe_frames_until_update: u32,
     planar_reflection_frames_until_update: u32,
 }
 
 #[derive(Clone, Copy)]
 struct PassUpdates {
-    shadow_cascades: [bool; SHADOW_CASCADE_COUNT],
+    shadow_map: bool,
     reflection_probe: bool,
     planar_reflection: bool,
-}
-
-impl PassUpdates {
-    fn shadow_map(&self) -> bool {
-        self.shadow_cascades.iter().any(|&update| update)
-    }
 }
 
 impl PassSchedule {
     fn new() -> Self {
         Self {
             cached_shadow: None,
-            shadow_update_frame: 0,
+            shadow_frames_until_update: 0,
             reflection_probe_frames_until_update: 0,
             planar_reflection_frames_until_update: 0,
         }
     }
 
+    fn needs_shadow_update(&self) -> bool {
+        self.cached_shadow.is_none() || self.shadow_frames_until_update == 0
+    }
+
     fn shadow_frame(
         &mut self,
-        prepared: shadows::PreparedShadow,
-    ) -> (shadows::PreparedShadow, [bool; SHADOW_CASCADE_COUNT]) {
-        let first_frame = self.cached_shadow.is_none();
-        let mut shadow = self.cached_shadow.unwrap_or(prepared);
-        let mut updates = [false; SHADOW_CASCADE_COUNT];
+        prepared: Option<shadows::PreparedShadow>,
+    ) -> (shadows::PreparedShadow, bool) {
+        let should_update = self.needs_shadow_update();
 
-        for cascade in 0..SHADOW_CASCADE_COUNT {
-            let interval = SHADOW_CASCADE_UPDATE_INTERVALS[cascade].max(1);
-            if first_frame || self.shadow_update_frame.is_multiple_of(interval) {
-                shadow.cascades[cascade] = prepared.cascades[cascade];
-                updates[cascade] = true;
-            }
+        if should_update {
+            let prepared = prepared.expect("shadow update requested without prepared shadow data");
+            self.cached_shadow = Some(prepared);
+            self.shadow_frames_until_update = SHADOW_UPDATE_INTERVAL.saturating_sub(1);
+            (prepared, true)
+        } else {
+            self.shadow_frames_until_update -= 1;
+            (
+                self.cached_shadow
+                    .expect("shadow cache missing while update was deferred"),
+                false,
+            )
         }
-
-        shadow.camera_pos = prepared.camera_pos;
-        shadow.camera_forward = prepared.camera_forward;
-        shadow.atlas_size = prepared.atlas_size;
-        shadow.cascade_count = prepared.cascade_count;
-        shadow.strength = prepared.strength;
-        self.cached_shadow = Some(shadow);
-        self.shadow_update_frame = self.shadow_update_frame.wrapping_add(1);
-
-        (shadow, updates)
     }
 
     fn reset_scene_dependent(&mut self) {
         self.cached_shadow = None;
-        self.shadow_update_frame = 0;
+        self.shadow_frames_until_update = 0;
         self.reflection_probe_frames_until_update = 0;
         self.planar_reflection_frames_until_update = 0;
     }

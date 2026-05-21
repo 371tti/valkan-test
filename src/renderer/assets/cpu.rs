@@ -4,7 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::renderer::{Material, MaterialAlpha, ModelVertex, TextureId, mat4_mul};
+use crate::renderer::{Material, ModelVertex, TextureId};
+
+#[path = "cpu/gltf.rs"]
+mod gltf_import;
 
 #[derive(Debug, Clone)]
 pub struct CpuMesh {
@@ -104,6 +107,78 @@ impl CpuTexture {
             (true, true) => TextureAlphaUsage::Blend,
         }
     }
+
+    fn bleed_alpha_rgb(&mut self) {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        if width == 0 || height == 0 || self.pixels.len() != width * height * 4 {
+            return;
+        }
+
+        let mut pixels = self.pixels.clone();
+        for _ in 0..8 {
+            let source = pixels.clone();
+            let mut changed = false;
+
+            for y in 0..height {
+                for x in 0..width {
+                    let index = (y * width + x) * 4;
+                    if source[index + 3] >= 250 {
+                        continue;
+                    }
+
+                    let mut sum = [0_u32; 3];
+                    let mut count = 0_u32;
+                    let y0 = y.saturating_sub(1);
+                    let y1 = (y + 1).min(height - 1);
+                    let x0 = x.saturating_sub(1);
+                    let x1 = (x + 1).min(width - 1);
+                    for ny in y0..=y1 {
+                        for nx in x0..=x1 {
+                            if nx == x && ny == y {
+                                continue;
+                            }
+
+                            let neighbor = (ny * width + nx) * 4;
+                            if source[neighbor + 3] == 0
+                                || source[neighbor + 3] <= source[index + 3]
+                            {
+                                continue;
+                            }
+
+                            sum[0] += source[neighbor] as u32;
+                            sum[1] += source[neighbor + 1] as u32;
+                            sum[2] += source[neighbor + 2] as u32;
+                            count += 1;
+                        }
+                    }
+
+                    if count == 0 {
+                        continue;
+                    }
+
+                    let rgb = [
+                        (sum[0] / count) as u8,
+                        (sum[1] / count) as u8,
+                        (sum[2] / count) as u8,
+                    ];
+                    if pixels[index] != rgb[0]
+                        || pixels[index + 1] != rgb[1]
+                        || pixels[index + 2] != rgb[2]
+                    {
+                        pixels[index..index + 3].copy_from_slice(&rgb);
+                        changed = true;
+                    }
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        self.pixels = pixels;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,55 +252,7 @@ impl CpuModel {
     }
 
     pub fn load_gltf(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
-        let (document, buffers, images) =
-            gltf::import(path).map_err(|source| model_error(path, source))?;
-        let mut primitives = Vec::new();
-        let mut textures = document
-            .textures()
-            .map(|texture| gltf_texture_to_cpu(texture, &images))
-            .collect::<io::Result<Vec<_>>>()?;
-
-        if let Some(scene) = document.default_scene() {
-            for node in scene.nodes() {
-                load_gltf_node(
-                    node,
-                    MAT4_IDENTITY,
-                    &buffers,
-                    &mut textures,
-                    &mut primitives,
-                )?;
-            }
-        } else {
-            for scene in document.scenes() {
-                for node in scene.nodes() {
-                    load_gltf_node(
-                        node,
-                        MAT4_IDENTITY,
-                        &buffers,
-                        &mut textures,
-                        &mut primitives,
-                    )?;
-                }
-            }
-        }
-
-        if primitives.is_empty() {
-            for mesh in document.meshes() {
-                load_gltf_mesh(
-                    mesh,
-                    MAT4_IDENTITY,
-                    &buffers,
-                    &mut textures,
-                    &mut primitives,
-                )?;
-            }
-        }
-
-        Ok(Self {
-            primitives,
-            textures,
-        })
+        gltf_import::load(path.as_ref())
     }
 
     pub fn load_obj(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -325,178 +352,19 @@ impl CpuModel {
     }
 }
 
-const MAT4_IDENTITY: [f32; 16] = [
-    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-];
-
-fn load_gltf_node(
-    node: gltf::Node<'_>,
-    parent_transform: [f32; 16],
-    buffers: &[gltf::buffer::Data],
-    textures: &mut [CpuTexture],
-    primitives: &mut Vec<CpuPrimitive>,
-) -> io::Result<()> {
-    let transform = mat4_mul(parent_transform, gltf_node_transform(node.transform()));
-
-    if let Some(mesh) = node.mesh() {
-        load_gltf_mesh(mesh, transform, buffers, textures, primitives)?;
-    }
-
-    for child in node.children() {
-        load_gltf_node(child, transform, buffers, textures, primitives)?;
-    }
-
-    Ok(())
-}
-
-fn load_gltf_mesh(
-    mesh: gltf::Mesh<'_>,
-    transform: [f32; 16],
-    buffers: &[gltf::buffer::Data],
-    textures: &mut [CpuTexture],
-    primitives: &mut Vec<CpuPrimitive>,
-) -> io::Result<()> {
-    for primitive in mesh.primitives() {
-        if let Some(primitive) = load_gltf_primitive(primitive, transform, buffers, textures)? {
-            primitives.push(primitive);
-        }
-    }
-
-    Ok(())
-}
-
-fn load_gltf_primitive(
-    primitive: gltf::Primitive<'_>,
-    transform: [f32; 16],
-    buffers: &[gltf::buffer::Data],
-    textures: &mut [CpuTexture],
-) -> io::Result<Option<CpuPrimitive>> {
-    if primitive.mode() != gltf::mesh::Mode::Triangles {
-        return Ok(None);
-    }
-
-    let material = material_from_gltf(primitive.material(), textures);
-    let reader =
-        primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| data.0.as_slice()));
-    let positions = reader
-        .read_positions()
-        .ok_or_else(|| invalid_model_error("glTF primitive is missing POSITION"))?
-        .map(|position| transform_position(transform, position))
-        .collect::<Vec<_>>();
-    let normals = reader
-        .read_normals()
-        .map(|normals| {
-            normals
-                .map(|normal| transform_normal(transform, normal))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let uvs = reader
-        .read_tex_coords(0)
-        .map(|coords| coords.into_f32().collect::<Vec<_>>())
-        .unwrap_or_default();
-    let indices = match reader.read_indices() {
-        Some(indices) => indices.into_u32().collect::<Vec<_>>(),
-        None => sequential_indices(positions.len())?,
-    };
-
-    if indices.len() % 3 != 0 {
-        return invalid_model("glTF triangle index count is not divisible by 3");
-    }
-
-    let has_normals = normals.len() == positions.len();
-    let mut vertices = positions
-        .into_iter()
-        .enumerate()
-        .map(|(index, position)| ModelVertex {
-            position,
-            normal: normals.get(index).copied().unwrap_or([0.0; 3]),
-            uv: uvs.get(index).copied().unwrap_or([0.0; 2]),
-        })
-        .collect::<Vec<_>>();
-
-    validate_indices(&indices, vertices.len())?;
-
-    if !has_normals {
-        accumulate_normals(&mut vertices, &indices);
-    }
-
-    Ok(Some(CpuPrimitive {
-        mesh: CpuMesh { vertices, indices },
-        material,
-    }))
-}
-
-fn material_from_gltf(gltf_material: gltf::Material<'_>, textures: &mut [CpuTexture]) -> Material {
-    if gltf_material.index().is_none() {
-        return Material::default();
-    }
-
-    let pbr = gltf_material.pbr_metallic_roughness();
-    let alpha = match gltf_material.alpha_mode() {
-        gltf::material::AlphaMode::Opaque => MaterialAlpha::Opaque,
-        gltf::material::AlphaMode::Mask => {
-            MaterialAlpha::Mask(gltf_material.alpha_cutoff().unwrap_or(0.5))
-        }
-        gltf::material::AlphaMode::Blend => MaterialAlpha::Blend,
-    };
-    let base_color_texture = pbr
-        .base_color_texture()
-        .map(|info| TextureId(info.texture().index()));
-    let metallic_roughness_texture = pbr
-        .metallic_roughness_texture()
-        .map(|info| TextureId(info.texture().index()));
-    let normal_texture = gltf_material.normal_texture();
-    let occlusion_texture = gltf_material.occlusion_texture();
-    let emissive_texture = gltf_material
-        .emissive_texture()
-        .map(|info| TextureId(info.texture().index()));
-
-    let mut material = Material::new(pbr.base_color_factor())
-        .with_metallic(pbr.metallic_factor())
-        .with_roughness(pbr.roughness_factor())
-        .with_emissive(gltf_material.emissive_factor())
-        .with_emissive_strength(gltf_material.emissive_strength().unwrap_or(1.0))
-        .with_alpha_mode(alpha)
-        .with_double_sided(gltf_material.double_sided());
-    if let Some(specular) = gltf_material.specular() {
-        material = material
-            .with_specular(specular.specular_factor())
-            .with_specular_color(specular.specular_color_factor());
-    }
-
-    if let Some(texture) = base_color_texture {
-        material = material.with_base_color_texture(texture);
-        material = infer_base_color_alpha(material, texture, textures);
-    }
-    if let Some(texture) = metallic_roughness_texture {
-        mark_texture_linear(textures, texture);
-        material = material.with_metallic_roughness_texture(texture);
-    }
-    if let Some(texture) = normal_texture {
-        mark_texture_linear(textures, TextureId(texture.texture().index()));
-        material =
-            material.with_normal_texture(TextureId(texture.texture().index()), texture.scale());
-    }
-    if let Some(texture) = occlusion_texture {
-        mark_texture_linear(textures, TextureId(texture.texture().index()));
-        material = material
-            .with_occlusion_texture(TextureId(texture.texture().index()), texture.strength());
-    }
-    if let Some(texture) = emissive_texture {
-        material = material.with_emissive_texture(texture);
-    }
-
-    material
-}
-
-fn mark_texture_linear(textures: &mut [CpuTexture], texture: TextureId) {
+pub(super) fn mark_texture_linear(textures: &mut [CpuTexture], texture: TextureId) {
     if let Some(texture) = textures.get_mut(texture.0) {
         texture.srgb = false;
     }
 }
 
-fn infer_base_color_alpha(
+pub(super) fn prepare_base_color_texture(textures: &mut [CpuTexture], texture: TextureId) {
+    if let Some(texture) = textures.get_mut(texture.0) {
+        texture.bleed_alpha_rgb();
+    }
+}
+
+pub(super) fn infer_base_color_alpha(
     material: Material,
     texture: TextureId,
     textures: &[CpuTexture],
@@ -510,224 +378,6 @@ fn infer_base_color_alpha(
         Some(TextureAlphaUsage::Blend) => material.with_alpha_blend(true),
         Some(TextureAlphaUsage::Opaque) | None => material,
     }
-}
-
-fn gltf_texture_to_cpu(
-    texture: gltf::Texture<'_>,
-    images: &[gltf::image::Data],
-) -> io::Result<CpuTexture> {
-    let image = images
-        .get(texture.source().index())
-        .ok_or_else(|| invalid_model_error("glTF texture references a missing image"))?;
-
-    Ok(CpuTexture {
-        pixels: image_to_rgba8(image)?,
-        width: image.width.max(1),
-        height: image.height.max(1),
-        sampler: sampler_from_gltf(texture.sampler()),
-        srgb: true,
-    })
-}
-
-fn sampler_from_gltf(sampler: gltf::texture::Sampler<'_>) -> TextureSampler {
-    TextureSampler {
-        mag_filter: sampler
-            .mag_filter()
-            .map(|filter| match filter {
-                gltf::texture::MagFilter::Nearest => TextureFilter::Nearest,
-                gltf::texture::MagFilter::Linear => TextureFilter::Linear,
-            })
-            .unwrap_or(TextureFilter::Linear),
-        min_filter: sampler
-            .min_filter()
-            .map(|filter| match filter {
-                gltf::texture::MinFilter::Nearest
-                | gltf::texture::MinFilter::NearestMipmapNearest
-                | gltf::texture::MinFilter::NearestMipmapLinear => TextureFilter::Nearest,
-                gltf::texture::MinFilter::Linear
-                | gltf::texture::MinFilter::LinearMipmapNearest
-                | gltf::texture::MinFilter::LinearMipmapLinear => TextureFilter::Linear,
-            })
-            .unwrap_or(TextureFilter::Linear),
-        wrap_s: wrap_from_gltf(sampler.wrap_s()),
-        wrap_t: wrap_from_gltf(sampler.wrap_t()),
-    }
-}
-
-fn wrap_from_gltf(wrap: gltf::texture::WrappingMode) -> TextureWrap {
-    match wrap {
-        gltf::texture::WrappingMode::ClampToEdge => TextureWrap::ClampToEdge,
-        gltf::texture::WrappingMode::MirroredRepeat => TextureWrap::MirroredRepeat,
-        gltf::texture::WrappingMode::Repeat => TextureWrap::Repeat,
-    }
-}
-
-fn image_to_rgba8(image: &gltf::image::Data) -> io::Result<Vec<u8>> {
-    use gltf::image::Format;
-
-    let pixels = match image.format {
-        Format::R8 => image.pixels.iter().flat_map(|&r| [r, r, r, 255]).collect(),
-        Format::R8G8 => image
-            .pixels
-            .chunks_exact(2)
-            .flat_map(|pixel| [pixel[0], pixel[1], 0, 255])
-            .collect(),
-        Format::R8G8B8 => image
-            .pixels
-            .chunks_exact(3)
-            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
-            .collect(),
-        Format::R8G8B8A8 => image.pixels.clone(),
-        Format::R16 => image
-            .pixels
-            .chunks_exact(2)
-            .flat_map(|pixel| [pixel[1], pixel[1], pixel[1], 255])
-            .collect(),
-        Format::R16G16 => image
-            .pixels
-            .chunks_exact(4)
-            .flat_map(|pixel| [pixel[1], pixel[3], 0, 255])
-            .collect(),
-        Format::R16G16B16 => image
-            .pixels
-            .chunks_exact(6)
-            .flat_map(|pixel| [pixel[1], pixel[3], pixel[5], 255])
-            .collect(),
-        Format::R16G16B16A16 => image
-            .pixels
-            .chunks_exact(8)
-            .flat_map(|pixel| [pixel[1], pixel[3], pixel[5], pixel[7]])
-            .collect(),
-        Format::R32G32B32FLOAT => image
-            .pixels
-            .chunks_exact(12)
-            .flat_map(|pixel| {
-                [
-                    f32_bytes_to_u8(&pixel[0..4]),
-                    f32_bytes_to_u8(&pixel[4..8]),
-                    f32_bytes_to_u8(&pixel[8..12]),
-                    255,
-                ]
-            })
-            .collect(),
-        Format::R32G32B32A32FLOAT => image
-            .pixels
-            .chunks_exact(16)
-            .flat_map(|pixel| {
-                [
-                    f32_bytes_to_u8(&pixel[0..4]),
-                    f32_bytes_to_u8(&pixel[4..8]),
-                    f32_bytes_to_u8(&pixel[8..12]),
-                    f32_bytes_to_u8(&pixel[12..16]),
-                ]
-            })
-            .collect(),
-    };
-
-    let expected_len = image.width as usize * image.height as usize * 4;
-    if pixels.len() != expected_len {
-        return invalid_model("glTF image data size does not match its dimensions");
-    }
-
-    Ok(pixels)
-}
-
-fn f32_bytes_to_u8(bytes: &[u8]) -> u8 {
-    let value = f32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]));
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-fn sequential_indices(len: usize) -> io::Result<Vec<u32>> {
-    let len = u32::try_from(len)
-        .map_err(|_| invalid_model_error("glTF primitive has too many vertices"))?;
-
-    Ok((0..len).collect())
-}
-
-fn validate_indices(indices: &[u32], vertex_count: usize) -> io::Result<()> {
-    if indices.iter().any(|&index| index as usize >= vertex_count) {
-        return invalid_model("glTF index is out of bounds");
-    }
-
-    Ok(())
-}
-
-fn accumulate_normals(vertices: &mut [ModelVertex], indices: &[u32]) {
-    for triangle in indices.chunks_exact(3) {
-        let a = triangle[0] as usize;
-        let b = triangle[1] as usize;
-        let c = triangle[2] as usize;
-        let normal = triangle_normal(
-            vertices[a].position,
-            vertices[b].position,
-            vertices[c].position,
-        );
-
-        for index in [a, b, c] {
-            vertices[index].normal[0] += normal[0];
-            vertices[index].normal[1] += normal[1];
-            vertices[index].normal[2] += normal[2];
-        }
-    }
-
-    for vertex in vertices {
-        vertex.normal = normalize_or(vertex.normal, [0.0, 1.0, 0.0]);
-    }
-}
-
-fn gltf_node_transform(transform: gltf::scene::Transform) -> [f32; 16] {
-    let (translation, rotation, scale) = transform.decomposed();
-    let [x, y, z, w] = rotation;
-    let x2 = x + x;
-    let y2 = y + y;
-    let z2 = z + z;
-    let xx = x * x2;
-    let xy = x * y2;
-    let xz = x * z2;
-    let yy = y * y2;
-    let yz = y * z2;
-    let zz = z * z2;
-    let wx = w * x2;
-    let wy = w * y2;
-    let wz = w * z2;
-
-    [
-        (1.0 - yy - zz) * scale[0],
-        (xy + wz) * scale[0],
-        (xz - wy) * scale[0],
-        0.0,
-        (xy - wz) * scale[1],
-        (1.0 - xx - zz) * scale[1],
-        (yz + wx) * scale[1],
-        0.0,
-        (xz + wy) * scale[2],
-        (yz - wx) * scale[2],
-        (1.0 - xx - yy) * scale[2],
-        0.0,
-        translation[0],
-        translation[1],
-        translation[2],
-        1.0,
-    ]
-}
-
-fn transform_position(matrix: [f32; 16], position: [f32; 3]) -> [f32; 3] {
-    [
-        matrix[0] * position[0] + matrix[4] * position[1] + matrix[8] * position[2] + matrix[12],
-        matrix[1] * position[0] + matrix[5] * position[1] + matrix[9] * position[2] + matrix[13],
-        matrix[2] * position[0] + matrix[6] * position[1] + matrix[10] * position[2] + matrix[14],
-    ]
-}
-
-fn transform_normal(matrix: [f32; 16], normal: [f32; 3]) -> [f32; 3] {
-    normalize_or(
-        [
-            matrix[0] * normal[0] + matrix[4] * normal[1] + matrix[8] * normal[2],
-            matrix[1] * normal[0] + matrix[5] * normal[1] + matrix[9] * normal[2],
-            matrix[2] * normal[0] + matrix[6] * normal[1] + matrix[10] * normal[2],
-        ],
-        [0.0, 1.0, 0.0],
-    )
 }
 
 struct PrimitiveBuilder {
@@ -1025,6 +675,7 @@ fn load_mtl(
                     Ok(texture) => {
                         let texture_id = TextureId(textures.len());
                         textures.push(texture);
+                        prepare_base_color_texture(textures, texture_id);
                         material.textures.base_color = Some(texture_id);
                         *material = infer_base_color_alpha(*material, texture_id, textures);
                     }
@@ -1198,15 +849,15 @@ fn invalid_obj<T>(path: &Path, line: usize, message: &'static str) -> io::Result
     Err(obj_error(path, line, message))
 }
 
-fn invalid_model<T>(message: &'static str) -> io::Result<T> {
+pub(super) fn invalid_model<T>(message: &'static str) -> io::Result<T> {
     Err(invalid_model_error(message))
 }
 
-fn invalid_model_error(message: &'static str) -> io::Error {
+pub(super) fn invalid_model_error(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn model_error(path: &Path, source: gltf::Error) -> io::Error {
+pub(super) fn model_error(path: &Path, source: gltf::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!("{}: {source}", path.display()),
@@ -1220,7 +871,7 @@ fn obj_error(path: &Path, line: usize, message: &'static str) -> io::Error {
     )
 }
 
-fn triangle_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+pub(super) fn triangle_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     normalize_or(
         [
             (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
@@ -1231,7 +882,7 @@ fn triangle_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     )
 }
 
-fn normalize_or(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+pub(super) fn normalize_or(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
 
     if len <= f32::EPSILON {
@@ -1567,6 +1218,26 @@ f 1/1 2/2 3/3
     }
 
     #[test]
+    fn transparent_base_color_pixels_keep_neighbor_rgb() {
+        let mut texture = CpuTexture {
+            pixels: vec![
+                220, 40, 10, 255, //
+                0, 0, 0, 96, //
+                0, 0, 0, 0,
+            ],
+            width: 3,
+            height: 1,
+            sampler: TextureSampler::default(),
+            srgb: true,
+        };
+
+        texture.bleed_alpha_rgb();
+
+        assert_eq!(&texture.pixels[4..8], &[220, 40, 10, 96]);
+        assert_eq!(&texture.pixels[8..12], &[220, 40, 10, 0]);
+    }
+
+    #[test]
     fn obj_material_names_do_not_force_metallic() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1816,6 +1487,100 @@ f 1 2 3
         assert_eq!(material.metallic, 0.0);
         assert_eq!(material.roughness, Material::default().roughness);
         assert_eq!(material.specular, Material::default().specular);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gltf_skin_bakes_first_animation_pose() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("valkan-test-gltf-skin-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut bin = Vec::new();
+        for value in [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+        for joints in [[0_u16, 0, 0, 0]; 3] {
+            for joint in joints {
+                bin.extend_from_slice(&joint.to_le_bytes());
+            }
+        }
+        for weights in [[1.0_f32, 0.0, 0.0, 0.0]; 3] {
+            for weight in weights {
+                bin.extend_from_slice(&weight.to_le_bytes());
+            }
+        }
+        for value in [
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 1.0,
+        ] {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+        bin.extend_from_slice(&0.0_f32.to_le_bytes());
+        for value in [4.0_f32, 0.0, 0.0] {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+        for index in [0_u16, 1, 2] {
+            bin.extend_from_slice(&index.to_le_bytes());
+        }
+
+        fs::write(dir.join("mesh.bin"), &bin).unwrap();
+        fs::write(
+            dir.join("model.gltf"),
+            format!(
+                r#"{{
+    "asset": {{"version": "2.0"}},
+    "scene": 0,
+    "scenes": [{{"nodes": [0, 1]}}],
+    "animations": [{{
+        "samplers": [{{"input": 4, "output": 5, "interpolation": "STEP"}}],
+        "channels": [{{"sampler": 0, "target": {{"node": 1, "path": "translation"}}}}]
+    }}],
+    "nodes": [
+        {{"mesh": 0, "skin": 0, "translation": [5, 0, 0]}},
+        {{"translation": [2, 0, 0]}}
+    ],
+    "skins": [{{"joints": [1], "inverseBindMatrices": 3}}],
+    "meshes": [{{
+        "primitives": [{{
+            "attributes": {{"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2}},
+            "indices": 6
+        }}]
+    }}],
+    "buffers": [{{"uri": "mesh.bin", "byteLength": {}}}],
+    "bufferViews": [
+        {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+        {{"buffer": 0, "byteOffset": 36, "byteLength": 24}},
+        {{"buffer": 0, "byteOffset": 60, "byteLength": 48}},
+        {{"buffer": 0, "byteOffset": 108, "byteLength": 64}},
+        {{"buffer": 0, "byteOffset": 172, "byteLength": 4}},
+        {{"buffer": 0, "byteOffset": 176, "byteLength": 12}},
+        {{"buffer": 0, "byteOffset": 188, "byteLength": 6}}
+    ],
+    "accessors": [
+        {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}},
+        {{"bufferView": 1, "componentType": 5123, "count": 3, "type": "VEC4"}},
+        {{"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC4"}},
+        {{"bufferView": 3, "componentType": 5126, "count": 1, "type": "MAT4"}},
+        {{"bufferView": 4, "componentType": 5126, "count": 1, "type": "SCALAR", "min": [0], "max": [0]}},
+        {{"bufferView": 5, "componentType": 5126, "count": 1, "type": "VEC3"}},
+        {{"bufferView": 6, "componentType": 5123, "count": 3, "type": "SCALAR"}}
+    ]
+}}"#,
+                bin.len()
+            ),
+        )
+        .unwrap();
+
+        let model = CpuModel::load_gltf(dir.join("model.gltf")).unwrap();
+        let vertices = &model.primitives[0].mesh.vertices;
+
+        assert_close(vertices[0].position, [3.0, 0.0, 0.0]);
+        assert_close(vertices[1].position, [4.0, 0.0, 0.0]);
+        assert_close(vertices[2].position, [3.0, 1.0, 0.0]);
 
         let _ = fs::remove_dir_all(dir);
     }

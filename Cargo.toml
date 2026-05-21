@@ -8,7 +8,7 @@ ash = "0.38.0"
 ash-window = "0.13.0"
 winit = "0.30.11"
 raw-window-handle = "0.6"
-gltf = { version = "1.4", features = ["import", "KHR_materials_emissive_strength", "KHR_materials_specular"] }
+gltf = { version = "1.4", features = ["import", "KHR_materials_emissive_strength", "KHR_materials_specular", "KHR_materials_transmission"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 log = "0.4"

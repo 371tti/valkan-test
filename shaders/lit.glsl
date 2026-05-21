@@ -10,6 +10,7 @@ struct MaterialSample {
     float roughness;
     float specular;
     vec3 specular_color;
+    float transmission;
     float ao;
 };
 
@@ -39,6 +40,10 @@ vec3 apply_camera_response(vec3 color) {
     color = mix(vec3(0.5), color, scene.camera_response.y);
 
     return clamp(color, 0.0, 1.0);
+}
+
+float visible_alpha(MaterialSample material) {
+    return material.base.a * mix(1.0, 0.18, material.transmission);
 }
 
 vec3 normal_from_map(vec3 vertex_normal, vec3 world_pos, vec2 uv) {
@@ -76,6 +81,7 @@ MaterialSample read_material(bool use_textures) {
     material.roughness = clamp(object.material.y, 0.04, 1.0);
     material.specular = clamp(object.material.z, 0.0, 1.0);
     material.specular_color = clamp(object.material_ext.rgb, 0.0, 1.0);
+    material.transmission = clamp(object.emissive_color.w, 0.0, 1.0);
     material.ao = clamp(object.material.w, 0.0, 1.0);
     material.emissive = object.emissive_color.rgb;
     material.base = frag_base_color;
@@ -89,7 +95,7 @@ MaterialSample read_material(bool use_textures) {
         float occlusion = texture(occlusion_texture, frag_uv).r;
         material.ao *= mix(1.0, occlusion, object.texture_info.z);
     }
-    if (use_textures && object.texture_info.x > 0.5) {
+    if (use_textures && object_has_emissive_texture()) {
         material.emissive *= texture(emissive_texture, frag_uv).rgb;
     }
     if (use_textures && object.texture_flags.x > 0.5) {
@@ -159,10 +165,11 @@ vec3 material_direct_light(MaterialSample material, vec3 light, vec3 radiance) {
     vec3 specular = distribution * geometry * fresnel / max(4.0 * ndotv * ndotl, 0.0001);
     vec3 diffuse = (vec3(1.0) - fresnel)
         * (1.0 - material.metallic)
+        * (1.0 - material.transmission)
         * material.base.rgb
         / PI;
 
-    return (diffuse + specular) * radiance * ndotl;
+    return (diffuse + specular * mix(1.0, 1.2, material.transmission)) * radiance * ndotl;
 }
 
 vec3 parallax_correct_reflection(vec3 world_pos, vec3 reflection) {
@@ -358,7 +365,12 @@ GiSample sample_gi(
     float energy = mix(0.35, 1.0, material.specular) * mix(1.0, 0.42, material.roughness);
 
     GiSample gi;
-    gi.diffuse = diffuse_ibl * material.base.rgb * (1.0 - material.metallic) * material.ao / PI;
+    gi.diffuse = diffuse_ibl
+        * material.base.rgb
+        * (1.0 - material.metallic)
+        * (1.0 - material.transmission)
+        * material.ao
+        / PI;
     gi.specular = environment_reflection(reflection, material.roughness, world_pos)
         * (fresnel * brdf.x + brdf.y)
         * material.ao
@@ -372,79 +384,46 @@ float sample_shadow_compare(vec2 uv, float compare_depth) {
     return compare_depth <= texture(shadow_map, uv).r ? 1.0 : 0.0;
 }
 
-int select_shadow_cascade(vec3 world_pos) {
-    int count = int(clamp(scene.shadow_params.z, 0.0, float(SHADOW_CASCADE_COUNT)));
-    float depth = max(dot(world_pos - scene.shadow_camera_pos.xyz, scene.shadow_camera_dir.xyz), 0.0);
-
-    for (int i = 0; i < SHADOW_CASCADE_COUNT; i++) {
-        if (i >= count) {
-            break;
-        }
-        if (depth <= scene.shadow_cascade_params[i].x) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
 float shadow_visibility(vec3 world_pos, vec3 light, vec3 normal) {
-    if (scene.shadow_params.w < 0.5 || scene.shadow_params.y <= 0.0) {
+    if (scene.shadow_params.w < 0.5 || scene.shadow_params.z <= 0.0) {
         return 1.0;
     }
 
-    int cascade = select_shadow_cascade(world_pos);
-    if (cascade < 0) {
-        return 1.0;
-    }
-
-    vec4 projected = scene.shadow_view_proj[cascade] * vec4(world_pos, 1.0);
+    vec4 projected = scene.shadow_view_proj * vec4(world_pos, 1.0);
     if (projected.w <= 0.0) {
         return 1.0;
     }
 
     vec3 shadow_pos = projected.xyz / projected.w;
-    vec2 local_uv = shadow_pos.xy * 0.5 + 0.5;
+    vec2 uv = shadow_pos.xy * 0.5 + 0.5;
     if (
-        local_uv.x <= 0.0 || local_uv.x >= 1.0 ||
-        local_uv.y <= 0.0 || local_uv.y >= 1.0 ||
+        uv.x <= 0.0 || uv.x >= 1.0 ||
+        uv.y <= 0.0 || uv.y >= 1.0 ||
         shadow_pos.z <= 0.0 || shadow_pos.z >= 1.0
     ) {
         return 1.0;
     }
 
-    vec4 atlas = scene.shadow_atlas[cascade];
-    vec2 uv = atlas.xy + local_uv * atlas.zw;
     vec2 texel = 1.0 / vec2(textureSize(shadow_map, 0));
-    vec2 atlas_min = atlas.xy + texel * 1.5;
-    vec2 atlas_max = atlas.xy + atlas.zw - texel * 1.5;
     float light_alignment = saturate(dot(normalize(normal), light));
     float receiver_depth = shadow_pos.z
-        - scene.shadow_cascade_params[cascade].y * mix(2.6, 0.9, light_alignment)
-        - fwidth(shadow_pos.z) * 1.55;
+        - scene.shadow_params.y * mix(2.4, 0.85, light_alignment)
+        - fwidth(shadow_pos.z) * 1.35;
     const vec2 poisson_disk[8] = vec2[](
         vec2(-0.326, -0.406), vec2(-0.840, -0.074), vec2(-0.696, 0.457), vec2(-0.203, 0.621),
         vec2(0.962, -0.195), vec2(0.473, -0.480), vec2(0.519, 0.767), vec2(0.185, -0.893)
     );
 
-    int count = int(clamp(scene.shadow_params.z, 1.0, float(SHADOW_CASCADE_COUNT)));
-    int sample_count = cascade <= 1 ? 8 : 5;
-    float cascade_weight = float(cascade) / max(float(count - 1), 1.0);
-    float kernel_radius = mix(1.05, 1.85, cascade_weight) * mix(1.18, 0.82, light_alignment);
-    float lit = sample_shadow_compare(clamp(uv, atlas_min, atlas_max), receiver_depth) * 2.0;
+    float kernel_radius = mix(1.95, 1.05, light_alignment);
+    float lit = sample_shadow_compare(uv, receiver_depth) * 2.0;
     float weight_sum = 2.0;
-
     for (int i = 0; i < 8; i++) {
-        if (i >= sample_count) {
-            break;
-        }
         float weight = (i < 4) ? 1.2 : 1.0;
-        vec2 sample_uv = clamp(uv + poisson_disk[i] * texel * kernel_radius, atlas_min, atlas_max);
-        lit += sample_shadow_compare(sample_uv, receiver_depth) * weight;
+        lit += sample_shadow_compare(uv + poisson_disk[i] * texel * kernel_radius, receiver_depth) * weight;
         weight_sum += weight;
     }
 
-    return mix(1.0 - scene.shadow_params.y, 1.0, lit / weight_sum);
+    return mix(1.0 - scene.shadow_params.z, 1.0, lit / weight_sum);
 }
 
 #endif

@@ -39,7 +39,8 @@ void main() {
         }
     }
 
-    if (material.base.a < object.texture_info.w) {
+    float alpha_floor = object_is_alpha_blend() ? 0.003 : object.texture_info.w;
+    if (material.base.a <= max(object.texture_info.w, alpha_floor)) {
         discard;
     }
 
@@ -48,17 +49,17 @@ void main() {
         float near_plane = scene.debug_params.y;
         float far_plane = max(scene.debug_params.z, near_plane + 0.001);
         float visible_depth = 1.0 - saturate(log2(depth / near_plane + 1.0) / log2(far_plane / near_plane + 1.0));
-        out_color = vec4(vec3(visible_depth), material.base.a);
+        out_color = vec4(vec3(visible_depth), visible_alpha(material));
         return;
     }
     if (debug_mode == DEBUG_NORMALS) {
-        out_color = vec4(material.normal * 0.5 + 0.5, material.base.a);
+        out_color = vec4(material.normal * 0.5 + 0.5, visible_alpha(material));
         return;
     }
     if (debug_mode == DEBUG_SHADOW_MASK) {
         vec3 sun_light = normalize(-scene.light_dir.xyz);
         float visibility = shadow_visibility(frag_world_pos, sun_light, material.normal);
-        out_color = vec4(vec3(visibility), material.base.a);
+        out_color = vec4(vec3(visibility), visible_alpha(material));
         return;
     }
 
@@ -72,7 +73,15 @@ void main() {
     vec3 reflection = reflect(-material.view, material.normal);
     vec3 env_fresnel = fresnel_schlick(view_dot, f0);
     vec3 sun_light = normalize(-scene.light_dir.xyz);
-    float sun_visibility = shadow_visibility(frag_world_pos, sun_light, material.normal);
+    float shadow_weight = (1.0 - material.transmission * 0.85);
+    if (object_is_alpha_blend()) {
+        shadow_weight *= smoothstep(0.08, 0.85, material.base.a);
+    }
+    float sun_visibility = mix(
+        1.0,
+        shadow_visibility(frag_world_pos, sun_light, material.normal),
+        shadow_weight
+    );
     vec3 direct = material_direct_light(
         material,
         sun_light,
@@ -89,5 +98,5 @@ void main() {
     vec3 color = gi.diffuse + direct + specular_indirect + material.emissive;
     color = apply_camera_response(color);
 
-    out_color = vec4(color, material.base.a);
+    out_color = vec4(color, visible_alpha(material));
 }

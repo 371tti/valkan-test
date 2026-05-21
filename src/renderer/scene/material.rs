@@ -63,6 +63,7 @@ pub struct Material {
     pub roughness: f32,
     pub specular: f32,
     pub specular_color: [f32; 3],
+    pub transmission: f32,
     pub ambient_occlusion: f32,
     pub normal_scale: f32,
     pub occlusion_strength: f32,
@@ -81,6 +82,7 @@ impl Material {
             roughness: 0.55,
             specular: 0.5,
             specular_color: [1.0; 3],
+            transmission: 0.0,
             ambient_occlusion: 1.0,
             normal_scale: 1.0,
             occlusion_strength: 1.0,
@@ -174,6 +176,11 @@ impl Material {
         self
     }
 
+    pub fn with_transmission(mut self, transmission: f32) -> Self {
+        self.transmission = transmission.clamp(0.0, 1.0);
+        self
+    }
+
     pub fn with_emissive(mut self, emissive_color: [f32; 3]) -> Self {
         self.emissive_color = emissive_color;
         self
@@ -235,7 +242,15 @@ impl Material {
     }
 
     pub fn is_translucent(&self) -> bool {
-        self.alpha.is_blend() || self.base_color[3] < 0.999
+        self.alpha.is_blend() || self.base_color[3] < 0.999 || self.transmission > 0.001
+    }
+
+    pub fn shadow_opacity_hint(&self) -> f32 {
+        self.base_color[3].clamp(0.0, 1.0) * (1.0 - self.transmission.clamp(0.0, 1.0) * 0.82)
+    }
+
+    pub fn casts_shadow(&self) -> bool {
+        self.base_color_texture().is_some() || self.shadow_opacity_hint() > 0.02
     }
 }
 

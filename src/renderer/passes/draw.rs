@@ -495,7 +495,6 @@ impl Renderer {
         frame_index: usize,
         scene: &RenderScene,
         reflections: PreparedReflections,
-        shadow: super::shadows::PreparedShadow,
         pass_updates: super::PassUpdates,
     ) {
         unsafe {
@@ -506,14 +505,8 @@ impl Renderer {
                 .begin_command_buffer(command_buffer, &begin_info)
                 .expect("failed to begin command buffer");
 
-            if pass_updates.shadow_map() {
-                self.record_shadow_map(
-                    command_buffer,
-                    frame_index,
-                    scene,
-                    shadow,
-                    pass_updates.shadow_cascades,
-                );
+            if pass_updates.shadow_map {
+                self.record_shadow_map(command_buffer, frame_index, scene);
             }
             if pass_updates.reflection_probe {
                 self.record_reflection_probe(command_buffer, frame_index, scene, reflections);
