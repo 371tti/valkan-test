@@ -1,0 +1,38 @@
+[package]
+name = "rebuild1"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["logging"]
+
+logging = [
+    "dep:tracing-subscriber",
+    "tracing-subscriber/env-filter",
+]
+
+
+[dependencies]
+ash = "0.38.0"
+async-trait = "0.1"
+gltf = { version = "1.4", features = ["import"] }
+raw-window-handle = "0.6"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time", "rt-multi-thread"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["fmt", "std"] }
+winit = { version = "0.30.11", default-features = false, features = ["rwh_06"] }
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+
+[profile.min-size]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false
