@@ -8,6 +8,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use gr_render::{
+    protocol::{
+        FrameId, FrameSnapshot, FrameSnapshotBuilder, FramebufferReadbackOptions, LightPacket,
+        LoadedAsset, MessageEnvelope, NativeSurfaceHandle, NonZeroExtent, RenderItemPacket,
+        RendererCommand, RendererEndpoint, RendererEvent, SceneHandle, SnapshotError,
+        SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, ViewId, ViewPacket,
+        Win32SurfaceHandle, WindowId,
+    },
+    renderer::{RendererError, RendererThread, VulkanRendererBackend, spawn_renderer_thread},
+};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use thiserror::Error;
 use winit::{
@@ -17,17 +27,6 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowAttributes, WindowId as WinitWindowId},
-};
-
-use crate::{
-    protocol::{
-        DrawPacket, FrameId, FrameSnapshot, FrameSnapshotBuilder, FramebufferReadbackOptions,
-        LightPacket, LoadedAsset, MessageEnvelope, NativeSurfaceHandle, NonZeroExtent,
-        RenderItemPacket, RendererCommand, RendererEndpoint, RendererEvent, SceneHandle,
-        SnapshotError, SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, ViewId,
-        ViewPacket, Win32SurfaceHandle, WindowId,
-    },
-    renderer::{RendererError, RendererThread, VulkanRendererBackend, spawn_renderer_thread},
 };
 
 use super::camera::{CameraKey, FreeCamera};
@@ -51,6 +50,10 @@ const WINDOW_TRANSPORT_CAPACITY: usize = 32;
 const WINDOW_SMOKE_PRESENTED_FRAME_LIMIT: u64 = 6;
 const SHUTDOWN_RETRY_SLEEP: Duration = Duration::from_millis(1);
 const EVENT_PUMP_INTERVAL: Duration = Duration::from_millis(16);
+const WINDOW_MAX_FPS_ENV: &str = "REBUILD1_MAX_FPS";
+const DEFAULT_WINDOW_MAX_FPS: u32 = 120;
+const MIN_WINDOW_MAX_FPS: u32 = 15;
+const MAX_WINDOW_MAX_FPS: u32 = 240;
 
 #[derive(Debug, Error)]
 pub enum WindowedRunError {
@@ -193,7 +196,7 @@ pub fn run_windowed_with_config(config: WindowConfig) -> Result<(), WindowedRunE
         "starting windowed renderer run"
     );
 
-    let (endpoint, inbox) = crate::protocol::renderer_transport(WINDOW_TRANSPORT_CAPACITY);
+    let (endpoint, inbox) = gr_render::protocol::renderer_transport(WINDOW_TRANSPORT_CAPACITY);
     let renderer = spawn_renderer_thread("rebuild1-renderer", VulkanRendererBackend, inbox)?;
     let event_loop = EventLoop::<WindowUserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -261,6 +264,8 @@ struct WindowedApp {
     light_brighter: bool,
     light_darker: bool,
     last_frame_at: Instant,
+    frame_interval: Duration,
+    next_frame_at: Instant,
     mouse_captured: bool,
     presented_frames: u64,
     presented_loaded_asset_frames: u64,
@@ -306,6 +311,11 @@ impl WindowedApp {
             .unwrap_or(DEFAULT_SURFACE_GENERATION);
 
         let now = Instant::now();
+        let frame_interval = configured_frame_interval();
+        tracing::info!(
+            max_fps = (1.0 / frame_interval.as_secs_f64()).round() as u32,
+            "configured window frame pacing"
+        );
 
         Self {
             endpoint,
@@ -327,6 +337,8 @@ impl WindowedApp {
             light_brighter: false,
             light_darker: false,
             last_frame_at: now,
+            frame_interval,
+            next_frame_at: now,
             mouse_captured: false,
             presented_frames: 0,
             presented_loaded_asset_frames: 0,
@@ -513,9 +525,29 @@ impl WindowedApp {
             return;
         }
 
+        let now = Instant::now();
+        if now < self.next_frame_at {
+            return;
+        }
+
         if let Some(window) = &self.window {
             tracing::trace!("requesting redraw for next protocol frame");
             window.request_redraw();
+        }
+    }
+
+    /// Keeps winit asleep until either renderer events arrive or the next frame budget opens.
+    fn apply_frame_pacing_control_flow(&self, event_loop: &ActiveEventLoop) {
+        if self.is_shutting_down() || self.frame_in_flight || self.drawable_surface.is_none() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+
+        let now = Instant::now();
+        if self.next_frame_at > now {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_at));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -546,6 +578,7 @@ impl WindowedApp {
         match self.endpoint.try_send(command) {
             Ok(()) => {
                 self.frame_in_flight = true;
+                self.next_frame_at = Instant::now() + self.frame_interval;
                 tracing::trace!(
                     frame_id = frame_id.raw(),
                     surface_id = self.config.surface_id.raw(),
@@ -585,12 +618,10 @@ impl WindowedApp {
             .add_view(ViewPacket::new(view, drawable.extent).with_camera(self.camera.snapshot()));
         let light = LightPacket::new(self.light_intensity);
         let screen_metering = self.screen_metering_for_frame();
-        let camera_effects = self.camera_effects.update(screen_metering, delta_time);
+        let camera_effects: gr_render::prelude::CameraEffects =
+            self.camera_effects.update(screen_metering, delta_time);
         builder.add_light(light).set_camera_effects(camera_effects);
-        let model_draw_count = self.add_loaded_model_items(&mut builder);
-        if model_draw_count == 0 {
-            builder.add_draw(DrawPacket::debug_triangle());
-        }
+        self.add_loaded_model_items(&mut builder);
         Ok(builder.build()?)
     }
 
@@ -964,6 +995,7 @@ impl WindowedApp {
         }
 
         self.request_redraw_if_ready();
+        self.apply_frame_pacing_control_flow(event_loop);
     }
 
     /// Captures or releases the mouse cursor for old-style free camera look controls.
@@ -1076,6 +1108,17 @@ fn default_model_asset_path() -> Option<PathBuf> {
 
     let path = PathBuf::from(DEFAULT_MODEL_ASSET_PATH);
     path.is_file().then_some(path)
+}
+
+/// Returns the app-side frame pacing interval used to avoid rendering faster than needed.
+fn configured_frame_interval() -> Duration {
+    let fps = std::env::var(WINDOW_MAX_FPS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_WINDOW_MAX_FPS)
+        .clamp(MIN_WINDOW_MAX_FPS, MAX_WINDOW_MAX_FPS);
+
+    Duration::from_secs_f64(1.0 / fps as f64)
 }
 
 /// Copies winit raw handles into a sendable protocol surface handle.
@@ -1251,7 +1294,7 @@ fn camera_key(physical_key: PhysicalKey) -> CameraKey {
 mod tests {
     use super::*;
 
-    use crate::protocol::renderer_transport;
+    use gr_render::protocol::renderer_transport;
 
     // Verifies that window shutdown does not use tokio's blocking send inside a runtime.
     #[tokio::test(flavor = "current_thread")]

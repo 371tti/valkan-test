@@ -8,13 +8,13 @@
 
 ## 現在の短期目標
 
-Stage 7.5 の graph compiler foundation と real target slice は完了済みです。現在は `.r1scene` / GLB geometry を renderer-owned mesh record に変換し、asset load 時に Vulkan vertex/index buffer と texture/material descriptor を backend-local resource へ upload し、compiled graph が shadow -> reflection -> scene -> post -> present を実行します。
+Stage 7.5 の graph compiler foundation と real target slice は完了済みです。現在は `.r1scene` / GLB geometry を renderer-owned mesh record に変換し、asset load 時に Vulkan vertex/index buffer と texture/material descriptor を backend-local resource へ upload し、compiled graph が shadow cascades -> translucent shadow -> scene -> post -> optional readback -> present を実行します。
 
 順序:
 
 1. mesh shader を base-color texture sampling へ進め、暗黙 white texture は作らない。
 2. shader interface validation の前に binding の散在を増やさない。
-3. texture / alpha cutout / shadow / reflection / camera effects の fixed visual scenes を用意する。
+3. texture / alpha cutout / cascade shadow / translucent shadow / camera effects の fixed visual scenes を用意する。
 4. render graph は pass/resource/barrier の単一 owner として維持し、pass 内に layout transition を戻さない。
 5. graph optimizer は metadata から実 allocation / merge へ進めるときだけ拡張する。
 
@@ -49,6 +49,7 @@ Stage 7.5 の graph compiler foundation と real target slice は完了済みで
 
 - surface support query、swapchain、image view、swapchain dependent render pass、framebuffer、swapchain dependent pipeline だけを置く。
 - command buffer や per-frame sync を置かない。
+- fixed shadow resources は swapchain extent に依存させない。resize で作り直す target と device lifetime target を混ぜない。
 
 `renderer/vulkan/frame.rs`:
 
@@ -71,13 +72,6 @@ Stage 7.5 の graph compiler foundation と real target slice は完了済みで
 - backend-local texture image、sampler、material parameter buffer、descriptor set を置く。
 - importer や renderer asset store の ownership policy を持たない。
 - 暗黙 fallback texture を作らない。descriptor にない texture slot は shader/pipeline variant 側で扱う。
-
-`renderer/vulkan/triangle.rs`:
-
-- real draw packet ができるまでの temporary debug triangle resource だけを置く。
-- vertex buffer、frame uniform、descriptor set layout、pipeline layout、shader module/pipeline 作成 helper を置く。
-- asset handle、material system、scene extraction を混ぜない。
-- debug triangle は `DrawPacket::DebugTriangle` から呼ばれる temporary path として維持する。
 
 `renderer/assets/store.rs`:
 

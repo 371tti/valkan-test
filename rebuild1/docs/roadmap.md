@@ -135,7 +135,7 @@ Stage 4 から外したもの:
 - [x] `FrameSnapshot` が target surface generation を持っている
 - [x] stale frame を `FrameDropped` / `DropReason::StaleSurfaceGeneration` として扱える
 - [x] GPU resource の deferred destroy 方針が入っている
-- [x] debug triangle を direct Vulkan path から `DrawPacket` 経由へ移す道筋がある
+- [x] temporary debug triangle path を削除し、正式な `render_items` 経路へ集約した
 
 作るもの:
 
@@ -157,7 +157,7 @@ Stage 4 から外したもの:
 - ファイル読み取りは worker task で行い、renderer thread では imported scene の handle 登録だけを行う。
 - `LoadAsset` 失敗は `AssetLoadFailed` として返し、cube や placeholder は作らない。
 - `GpuAssetStore` は protocol handle を発行し、`UnloadAsset` で stale 化して deferred destroy queue に積む。
-- debug triangle は `FrameSnapshot.draws` の `DrawPacket::DebugTriangle` 経由で submit される。
+- asset 未ロード時は debug triangle ではなく scene clear frame を submit する。
 
 ## Stage 6: materials and texture
 
@@ -215,11 +215,11 @@ Stage 7 から外したもの:
 
 - `renderer/assets/mesh.rs` を追加し、`.r1scene` の `mesh plane` は 4 vertices / 6 indices の renderer-owned geometry に変換する。
 - `GpuAssetStore` は mesh handle を単なる active set ではなく geometry record として保持する。
-- `vulkan/buffer.rs` を追加し、host-visible buffer 作成と typed upload を debug triangle と mesh upload で共有する。
+- `vulkan/buffer.rs` を追加し、host-visible buffer 作成と typed upload を mesh/material/post 系で共有する。
 - `vulkan/mesh.rs` を追加し、`LoadAsset` で device がある場合は mesh handle ごとに vertex/index buffer を作る。
 - `old/assets/model.glb` を `rebuild1/assets/model.glb` にコピーし、window app が存在するときだけ app policy として `LoadAsset` を送る。
 - GLB は worker importer で triangle primitive を `ImportedMesh::Indexed` に変換する。renderer core は `assets/model.glb` の探索を知らない。
-- mesh pipeline は `vulkan/mesh.rs` に閉じ込め、swapchain pass 内の `DrawPacket::Mesh` は indexed draw を記録する。
+- mesh pipeline は `vulkan/mesh.rs` に閉じ込め、scene pass 内の `render_items` は indexed draw を記録する。
 - `ImportedScene` は bounds を持ち、`AssetLoaded` で app 側 camera が model を frame する。
 - GLB の importer 側 clip-space 正規化は削除し、world-space position を `CameraSnapshot` の view-projection で描画する。
 - window app は left click で cursor capture、Escape で release、WASD/arrow、Space/E、Shift/Q、Ctrl、mouse wheel を old-style free camera として処理する。
@@ -242,15 +242,15 @@ Stage 7 から外したもの:
 - [x] `--window-smoke` で GLB load 後の graph-driven mesh frame を検証
 - [x] Vulkan imported texture image upload
 - [x] material descriptor set upload
-- [x] shadow map target と shadow pass
-- [x] reflection target と reflection pass
+- [x] fixed cascade shadow targets と opaque shadow passes
+- [x] translucent shadow transmittance targets と transparent shadow passes
 
 完了条件:
 
 - [x] pass order を手書き固定しない
 - [x] graph が read/write から必要な barrier を生成する
 - [x] scene/post/swapchain の target lifetime が graph から読める
-- [x] shadow/reflection の target lifetime が graph から読める
+- [x] shadow cascade / translucent shadow の target lifetime が graph から読める
 - [x] cadence は `pass_schedule.rs` に残し、dependency は graph が管理する
 - [x] Vulkan object は renderer backend から外へ出ない
 
@@ -258,9 +258,10 @@ Stage 7 から外したもの:
 
 - 最初から巨大な AAA graph compiler にはしないが、toy 実装にはしない。今の compiler は deterministic な plan、barrier、lifetime、optimization hint を返す。
 - Vulkan executor は fixed swapchain pass ではなく、compiled graph の pass/barrier を実際に記録する。
-- fake shadow/reflection graph は置かない。shadow map、reflection color/depth、scene color/depth、swapchain image はすべて graph resource と Vulkan resource が対応している。
-- shadow pass は `DrawPacket::Mesh` の shadow caster を depth-only pipeline で記録する。
-- reflection pass は mesh packets を reflection color/depth target へ記録し、scene pass は shadow/reflection を graph read として宣言する。
+- fake shadow graph は置かない。shadow cascade、translucent shadow、scene color/depth、swapchain image はすべて graph resource と Vulkan resource が対応している。
+- shadow pass は `render_items` の opaque/cutout caster を depth-only pipeline で記録する。
+- translucent shadow pass は opaque depth を shader sample し、transparent caster を transmittance target へ multiplicative blend で記録する。
+- scene pass は shadow cascade と translucent transmittance を graph read として宣言する。
 - imported texture は renderer asset store の owned `TextureDescriptor` clone から Vulkan sampled image へ upload する。
 - material は named slot と alpha policy を descriptor set へ upload する。暗黙 white texture は作らない。
 - mesh shader での sampled material 表示は Stage 8 の visual verification と shader interface validation の入口として扱う。
@@ -274,23 +275,28 @@ Stage 7 から外したもの:
 - [x] validation layer checklist
 - [x] sampled material texture shader path
 - [x] shader interface validation
+- [x] renderer-side mesh visibility optimization
 
 完了条件:
 
 - [x] 少なくとも triangle、texture、alpha cutout、shadow、post camera effects を確認できる
 - [x] unit test と rendering test の役割が混ざっていない
+- [x] mesh draw は bounds から画面外 culling と screen-size LOD を選べる
 
 実装メモ:
 
-- GLB importer は base-color texture と vertex normal を CPU intermediate data として持ち、renderer thread では file format を読まない。
+- GLB importer は vertex color、inverse-transpose normal、負スケール時の winding 補正、base-color / normal / metallic-roughness / occlusion / emissive slot、PBR scalar、emissive strength、double-sided policy を CPU intermediate data として持ち、renderer thread では file format を読まない。
 - `.r1scene` は `texture checker ...` を明示 directive として持ち、`assets/stage8_textured_cutout.r1scene` で texture / alpha cutout / shadow cutout を smoke できる。
-- mesh pipeline は `scene` / `reflection` / `shadow` ごとに untextured/textured variant を持つ。暗黙 white texture は使わず、base-color texture を持つ material だけ texture sampling shader に入る。
-- scene mesh shader は material descriptor set と graph pass descriptor set を読み、shadow map と reflection color を scene lighting に反映する。
-- reflection pass は graph target を読む shader を使わない。scene pass だけが `set = 2` の graph-produced target を読む。
+- mesh pipeline は `scene` / `opaque shadow` / `translucent shadow` ごとに untextured/textured variant と cull/double-sided variant を持つ。asset fallback は使わず、glTF の省略 slot は明示的な material default map で descriptor を満たす。
+- scene mesh shader は material descriptor set と graph pass descriptor set を読み、opaque shadow cascade と translucent transmittance を scene lighting に反映する。
+- shadow resources は swapchain extent に依存しない fixed resources として device にぶら下げる。near/mid/far cascade は camera frustum に合わせ、scene 全体の bounds で解像度を薄めない。
 - post pass は scene color を tone map し、`FrameSnapshot::camera_effects` の露出/white balance を適用する。
 - auto exposure / white balance は app/user extraction 側で計算し、renderer には owned な camera effect scalar だけを渡す。ほぼ黒の metering では露出を強く上げず、光のない場所を暗く残す。
 - camera metering は renderer event 経由の final framebuffer readback を使う。app 側は owned な luminance/color summary だけを受け取り、Vulkan object は renderer 境界の外へ出さない。
+- `FrameSnapshot::optimization` は frustum culling と screen-size LOD のポリシーだけを持つ。renderer は mesh upload 時に bounds と coarse index LOD を backend-local に作り、scene pass の draw recording 直前で不要な mesh を捨てる。
+- mesh pipeline は back-face culling を有効化する。double-sided material が必要になったら pipeline variant と material policy として明示的に追加する。
 - `REBUILD1_WINDOW_ASSET=assets/stage8_textured_cutout.r1scene cargo run -- --window-smoke` で fixed verification scene を選べる。
+- `REBUILD1_WINDOW_ASSET=assets/stage9_translucent_shadow.r1scene cargo run -- --window-smoke` で transparent shadow verification scene を選べる。
 - `assets/model.glb` smoke は old model 相当の geometry/material/texture import と camera 操作確認の入口として残す。
 
 ## Open questions
@@ -302,6 +308,5 @@ Stage 7 から外したもの:
 - allocator は自前 wrapper にするか、既存 crate を使うか
 - asset unload を最初から入れるか、append-only で始めるか
 - screenshot comparison を最初から CI に入れるか
-- reflection は planar 固定で始めるか、probe まで考えるか
 - message log をどの粒度で保存するか
 - async runtime は tokio で確定するか、runtime 抽象を残すか

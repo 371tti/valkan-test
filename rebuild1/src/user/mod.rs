@@ -1,9 +1,8 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
-use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::protocol::{CommandSink, RendererEventEnvelope, TransportError};
+use gr_render::protocol::{CommandSink, RendererEventEnvelope, TransportError};
 
 #[derive(Clone, Debug)]
 pub enum AppEvent {
@@ -35,54 +34,67 @@ pub enum UserError {
     Transport(#[from] TransportError),
 }
 
-#[async_trait]
 pub trait UserApp: Send {
     /// Sends initial renderer commands required by this user app.
-    async fn init(&mut self, out: &CommandSink) -> Result<(), UserError>;
+    fn init<'a>(
+        &'a mut self,
+        out: &'a CommandSink,
+    ) -> impl Future<Output = Result<(), UserError>> + Send + 'a;
 
     /// Handles one app event and may emit renderer commands.
-    async fn handle_event(&mut self, event: AppEvent, out: &CommandSink) -> Result<(), UserError>;
+    fn handle_event<'a>(
+        &'a mut self,
+        event: AppEvent,
+        out: &'a CommandSink,
+    ) -> impl Future<Output = Result<(), UserError>> + Send + 'a;
 
     /// Advances user state by one frame and may emit renderer commands.
-    async fn update(&mut self, time: FrameTime, out: &CommandSink) -> Result<(), UserError>;
+    fn update<'a>(
+        &'a mut self,
+        time: FrameTime,
+        out: &'a CommandSink,
+    ) -> impl Future<Output = Result<(), UserError>> + Send + 'a;
 
     /// Handles one renderer event and may emit follow-up renderer commands.
-    async fn handle_renderer_event(
-        &mut self,
+    fn handle_renderer_event<'a>(
+        &'a mut self,
         event: RendererEventEnvelope,
-        out: &CommandSink,
-    ) -> Result<(), UserError>;
+        out: &'a CommandSink,
+    ) -> impl Future<Output = Result<(), UserError>> + Send + 'a;
 }
 
 #[derive(Default)]
 pub struct NoopUserApp;
 
-#[async_trait]
 impl UserApp for NoopUserApp {
     /// Performs no initialization and emits no renderer commands.
-    async fn init(&mut self, _out: &CommandSink) -> Result<(), UserError> {
+    async fn init<'a>(&'a mut self, _out: &'a CommandSink) -> Result<(), UserError> {
         Ok(())
     }
 
     /// Ignores one app event and emits no renderer commands.
-    async fn handle_event(
-        &mut self,
+    async fn handle_event<'a>(
+        &'a mut self,
         _event: AppEvent,
-        _out: &CommandSink,
+        _out: &'a CommandSink,
     ) -> Result<(), UserError> {
         Ok(())
     }
 
     /// Ignores one frame update and emits no renderer commands.
-    async fn update(&mut self, _time: FrameTime, _out: &CommandSink) -> Result<(), UserError> {
+    async fn update<'a>(
+        &'a mut self,
+        _time: FrameTime,
+        _out: &'a CommandSink,
+    ) -> Result<(), UserError> {
         Ok(())
     }
 
     /// Ignores one renderer event and emits no follow-up commands.
-    async fn handle_renderer_event(
-        &mut self,
+    async fn handle_renderer_event<'a>(
+        &'a mut self,
         _event: RendererEventEnvelope,
-        _out: &CommandSink,
+        _out: &'a CommandSink,
     ) -> Result<(), UserError> {
         Ok(())
     }

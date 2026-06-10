@@ -1,5 +1,7 @@
 /target
 /rebuild1/target
-/rebuild1/assets
+/rebuild1/assets/*
+!/rebuild1/assets/
+!/rebuild1/assets/*.r1scene
 /old/target
 /old/assets

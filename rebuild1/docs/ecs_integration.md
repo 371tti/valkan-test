@@ -99,7 +99,7 @@ renderer は ECS component を更新しません。renderer は event を返す�
 - renderer 側 GPU culling
 - hybrid culling
 
-どれを選んでも、renderer が ECS world を直接読む必要はありません。境界は `FrameSnapshot` または将来の `VisibilityInput` / `DrawPacket` に保ちます。
+どれを選んでも、renderer が ECS world を直接読む必要はありません。境界は `FrameSnapshot` または将来の `VisibilityInput` / `RenderItemPacket` に保ちます。
 
 ## Trait
 

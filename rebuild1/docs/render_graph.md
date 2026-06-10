@@ -2,7 +2,7 @@
 
 ## なぜ必要か
 
-前作は shadow、reflection、scene、post の順序と image layout 遷移を手で管理していました。pass が増えるほど、resource がいつ writable で、いつ shader read なのかが見えにくくなります。
+前作は shadow、scene、post の順序と image layout 遷移を手で管理していました。pass が増えるほど、resource がいつ writable で、いつ shader read なのかが見えにくくなります。
 
 `rebuild1` では最初から小さな frame graph を置きます。大げさな汎用 engine ではなく、少なくとも pass の inputs/outputs/layout を一箇所に集めるための仕組みにします。
 
@@ -37,9 +37,12 @@ Resource は graph 上の名前付き handle として扱います。
 SwapchainImage
 SceneColor
 SceneDepth
-ShadowMapDirectional
-ReflectionColor
-ReflectionDepth
+ShadowCascade0
+ShadowCascade1
+ShadowCascade2
+TranslucentShadow0
+TranslucentShadow1
+TranslucentShadow2
 FrameUniformBuffer
 MaterialBuffer
 TextureArray
@@ -79,13 +82,14 @@ RenderPass
 
 | Order | Pass | Reads | Writes | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | shadow | mesh packets | shadow map | shadow caster の mesh を depth-only pipeline で描く。 |
-| 2 | reflection | mesh packets, shadow map | reflection color/depth | mesh packets を offscreen reflection target へ描く。cadence は schedule 側。 |
-| 3 | scene | mesh/debug packets, shadow map, reflection color | scene color/depth | main camera。mesh/debug triangle をここで描く。 |
-| 4 | post | scene color | swapchain image | tone mapping、camera effects、gamma。 |
-| 5 | present | swapchain image | external presentation | side effect pass として culling から守る。 |
+| 1 | `shadow_cascade_0..2` | mesh packets | shadow cascade depth | cascade ごとに opaque/cutout caster を depth-only pipeline で描く。 |
+| 2 | `translucent_shadow_0..2` | shadow cascade depth, mesh packets | transmittance color | opaque depth を shader sample し、transparent caster を multiplicative blend で描く。 |
+| 3 | `scene` | render items, shadow cascades, transmittance maps | scene color, scene normal/roughness, scene depth | main camera。mesh indexed draw をここで描く。 |
+| 4 | `post` | scene color, scene depth, scene normal/roughness | swapchain image | SSR、tone mapping、camera effects、gamma。 |
+| 5 | `framebuffer_readback` | swapchain image | CPU readback buffer | request がある frame だけ final framebuffer summary を返す。 |
+| 6 | `present` | swapchain image | external presentation | side effect pass として culling から守る。 |
 
-transparent shadow を本当にやる場合も、`shadow_transparent` pass として明示的に足します。shader ファイル名だけ増やして pass の意味が曖昧になる状態を避けます。
+transparent shadow は shader variant だけではなく、graph pass と resource として明示します。opaque depth と translucent transmittance を別 resource にすることで、layout transition と descriptor indexing を追える状態にします。
 
 ## Resize
 
@@ -95,7 +99,6 @@ resize では swapchain dependent resource だけを破棄して作り直しま�
 
 - swapchain images/views
 - scene color/depth
-- reflection target が window size dependent ならそれ
 - graph resource description
 - swapchain format に依存する pipeline
 
@@ -107,6 +110,7 @@ resize では swapchain dependent resource だけを破棄して作り直しま�
 - imported scene
 - CPU scene state
 - shader source watcher
+- fixed cascade shadow depth/transmittance targets
 
 ## Pass schedule
 
@@ -115,11 +119,11 @@ resize では swapchain dependent resource だけを破棄して作り直しま�
 - graph: pass の依存関係と command 記録順
 - schedule: その frame で pass を実行するか
 
-reflection を毎 frame 更新しない、shadow を light 変化時だけ更新する、という判断は schedule の責務です。
+shadow を light 変化時だけ更新する、readback を request frame だけ実行する、という判断は schedule の責務です。
 
 ## Stage 7.5 compiler gate
 
-Stage 7.5 では fixed swapchain graph をやめ、pass/resource 宣言から plan を生成します。現在の executor はこの plan を実際に使い、shadow、reflection、scene、post、present の image layout transition を graph barrier から記録します。
+Stage 7.5 では fixed swapchain graph をやめ、pass/resource 宣言から plan を生成します。現在の executor はこの plan を実際に使い、cascade shadow、translucent shadow、scene、post、readback、present の image layout transition を graph barrier から記録します。
 
 compiler が行うこと:
 
@@ -134,15 +138,19 @@ compiler が行うこと:
 現在の標準実行 graph:
 
 ```text
-shadow
-  writes: shadow_map
+shadow_cascade_0
+shadow_cascade_1
+shadow_cascade_2
+  writes: shadow_cascade_N
 
-reflection
-  reads: shadow_map
-  writes: reflection_color, reflection_depth
+translucent_shadow_0
+translucent_shadow_1
+translucent_shadow_2
+  reads: shadow_cascade_N as shader_read
+  writes: translucent_shadow_N
 
 scene
-  reads: shadow_map, reflection_color
+  reads: shadow_cascade_0..2, translucent_shadow_0..2
   writes: scene_color, scene_depth
 
 post

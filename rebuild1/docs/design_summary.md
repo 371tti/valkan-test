@@ -99,9 +99,8 @@ renderer/
     debug.rs     # validation layer, debug utils messenger, callback logging
     swapchain.rs # surface support query, swapchain, views, render pass, framebuffers
     frame.rs     # frames-in-flight, command pools, sync
-    triangle.rs  # temporary debug triangle resources
   graph/         # pass declarations, resources, barriers
-  targets/       # depth, scene, shadow, reflection targets
+  targets/       # depth, scene, fixed shadow targets
   assets/        # handle store, material records, texture payloads, deferred destroy
   import.rs      # file import to intermediate data
   pipeline/      # shader interface, shader modules, layouts, pipelines
@@ -115,7 +114,7 @@ renderer/
 - `RendererTransport`: channel/log/remote bridge that only moves messages.
 - `FrameSnapshot`: extracted per-frame render request from user/ECS.
 - `SceneCache`: renderer-local copy/cache built from snapshots.
-- `DrawPacket`: renderer-local resolved data used by graph passes.
+- `RenderItemPacket`: renderer-local resolved mesh/material item used by graph passes.
 - `ExternalObjectId`: stable debug/picking id; not an ECS entity.
 
 ## Reading order
@@ -146,6 +145,6 @@ Reference docs:
 - validation/debug utils は `vulkan/debug.rs` に隔離する。
 - resize で再作成される swapchain resources は `vulkan/swapchain.rs` に隔離する。
 - 次に command pool / command buffer / semaphore / fence を追加するときは `vulkan/frame.rs` か `renderer/frame/` を先に作り、`vulkan.rs` に足し続けない。
-- debug triangle は `vulkan/triangle.rs` に閉じ込め、`DrawPacket::DebugTriangle` 経由の temporary path として扱う。
+- temporary debug triangle は削除済み。asset 未ロード時は scene clear frame を present し、描画は `FrameSnapshot.render_items` に集約する。
 - material/texture の data path は `protocol/material.rs` と `renderer/assets/{store,material,texture}.rs` に分ける。
 - 次の実装 slice は `code_generation_policy.md` の module policy と stop signs を先に確認する。

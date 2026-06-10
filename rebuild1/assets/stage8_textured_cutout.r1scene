@@ -1,0 +1,4 @@
+rebuild1-scene
+texture checker 255 255 255 255 34 108 255 0
+material cutout base_color=0 alpha_cutoff=0.5
+mesh plane

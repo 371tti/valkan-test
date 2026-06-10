@@ -71,7 +71,7 @@ FrameId
 SurfaceId
 SurfaceGeneration
 CameraSnapshot
-Vec<DrawPacket>
+Vec<RenderItemPacket>
 Vec<LightPacket>
 RenderDebugSettings
 MeshHandle
@@ -161,7 +161,7 @@ undefined/present -> color_attachment
 color_attachment -> present
 ```
 
-現在は compiled graph が scene color、scene depth、swapchain image の resource state と barrier を管理し、Vulkan executor は scene pass -> post pass -> present side effect の順で記録します。shadow/reflection は fake graph で先に置かず、実 target と executor を作るタイミングで追加します。
+現在は compiled graph が fixed shadow cascades、translucent shadow transmittance、scene color、scene depth、swapchain image の resource state と barrier を管理し、Vulkan executor は shadow cascade -> translucent shadow -> scene -> post -> optional readback -> present side effect の順で記録します。fake shadow graph は置かず、実 target と executor を graph resource に対応させます。
 
 pass 順序と image layout transition を手作業で各 pass に分散させません。layout transition / barrier は render graph 側に集めます。
 
@@ -300,7 +300,7 @@ rendering correctness は screenshot / golden image / manual visual test 側に�
 1. imported texture の Vulkan image / sampler upload
 2. material descriptor set と mesh shader の sampled texture path
 3. shader interface validation
-4. actual shadow/reflection targets and passes
+4. actual cascade/translucent shadow targets and passes
 5. graph executor optimization: async compute scheduling、resource aliasing、render pass merge
 
 graph は fake pass を置かず、resource lifetime と Vulkan executor が同時に説明できる範囲で広げます。

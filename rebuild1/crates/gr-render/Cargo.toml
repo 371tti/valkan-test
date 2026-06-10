@@ -1,0 +1,16 @@
+[package]
+name = "gr-render"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "gr_render"
+
+[dependencies]
+ash = "0.38.0"
+gltf = { version = "1.4", features = ["import", "KHR_materials_emissive_strength"] }
+meshopt = "0.6.2"
+raw-window-handle = "0.6"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }

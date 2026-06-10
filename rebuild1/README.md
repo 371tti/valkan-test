@@ -47,30 +47,38 @@
 
 - app は headless path と winit window path を持つ。
 - protocol は command/event/envelope/id/snapshot/surface/transport に分かれている。
+- renderer 品質は `SetQualitySettings(RenderQualitySettings)` で送る。window app は通常操作用に `performance()` を送る。SSR / SSAO / AA / lighting / post look は renderer の実行ポリシーであり、ECS owned な `FrameSnapshot` には混ぜない。
 - renderer は dedicated thread 上で `RendererBackend` を動かす。
-- Vulkan backend は instance / validation debug callback / device / surface / swapchain / image view / shadow/reflection/scene/post render pass / framebuffer / frame resources / debug triangle / mesh / material / post pipeline まで持つ。
-- `SubmitFrame` は target surface に対して acquire、graph compile、barrier record、shadow pass、reflection pass、scene pass、post pass、submit、present を行う。
+- Vulkan backend は instance / validation debug callback / device / surface / swapchain / image view / fixed cascade shadow resources / scene/post render pass / framebuffer / frame resources / mesh / material / post pipeline まで持つ。
+- `SubmitFrame` は target surface に対して acquire、graph compile、barrier record、opaque cascade shadow pass、translucent shadow pass、scene pass、post pass、readback pass、submit、present を行う。
 - present 待ちの semaphore は swapchain image ごとに持ち、frame slot ごとに再利用しない。
 - window path は surface configure 後に redraw-driven の最小 `SubmitFrame` loop を走らせる。
-- renderer graph は `shadow_map -> reflection_color/depth -> scene_color/depth -> post -> swapchain present` を実行計画として持ち、resource state から explicit barrier plan を生成する。
-- shader source は `build.rs` で SPIR-V にし、debug triangle は frame set uniform、hardcoded vertex buffer、basic graphics pipeline で描画する。
+- renderer graph は `shadow_cascade[0..2] -> translucent_shadow[0..2] -> scene_color/depth -> post -> optional readback -> swapchain present` を実行計画として持ち、resource state から explicit barrier plan を生成する。
+- shader source は `build.rs` で SPIR-V にする。temporary debug triangle pipeline は削除済みで、asset 未ロード時は scene clear frame を present する。
 - Stage 4 first draw は window capture で triangle 表示確認済み。
 - winit resize は command channel を詰まらせないよう、in-flight 1 件と pending 最新 1 件に coalesce する。
 - `FrameSnapshot` は `SurfaceId` / `SurfaceGeneration` を持ち、古い generation の frame は `FrameDropped` で落とす。
 - Stage 5 asset path は `.r1scene` importer skeleton、worker import、`LoadAsset` / `AssetLoaded` / `AssetLoadFailed`、`GpuAssetStore`、deferred destroy queue まで実装済み。
-- `FrameSnapshot` は `DrawPacket` を持ち、debug triangle は `DrawPacket::DebugTriangle` 経由で送られる。
+- `FrameSnapshot` は正式な mesh draw 入力として `render_items` を持つ。temporary `DrawPacket` / debug triangle 経路は削除済み。
 - Stage 6 material/texture path は named slot、alpha mode、validated `TextureDescriptor`、`MaterialDescriptor`、shader binding constants まで実装済み。
 - renderer assets は `store.rs` / `mesh.rs` / `material.rs` / `texture.rs` / `garbage.rs` に分割済み。
 - Stage 7 の mesh rendering slice は完了済みで、`.r1scene` / GLB geometry は renderer-owned vertex/index geometry として store に残り、Vulkan backend で vertex/index buffer へ upload される。
-- `old/assets/model.glb` は app-level sample として `rebuild1/assets/model.glb` にコピー済み。window path はこのファイルが存在するときだけ `LoadAsset` を送り、全 mesh/material pair を `DrawPacket::Mesh` として submit する。
-- `DrawPacket::Mesh` は `vulkan/mesh.rs` の mesh pipeline で indexed draw を記録する。`FrameSnapshot` は owned `CameraSnapshot` を持ち、mesh shader は app-side camera の view-projection で world-space GLB を描画する。
+- `old/assets/model.glb` は app-level sample として `rebuild1/assets/model.glb` にコピー済み。window path はこのファイルが存在するときだけ `LoadAsset` を送り、全 mesh/material pair を `render_items` として submit する。
+- `render_items` は `vulkan/mesh.rs` の mesh pipeline で indexed draw を記録する。`FrameSnapshot` は owned `CameraSnapshot` を持ち、mesh shader は app-side camera の view-projection で world-space GLB を描画する。
 - window path は old-style free camera controls を持つ。left click で cursor capture、Escape で release、WASD/arrow、Space/E、Shift/Q、Ctrl、mouse wheel で移動する。
-- swapchain dependent resource は shadow map、reflection color/depth、scene color/depth、post framebuffer を持ち、mesh pipeline は shadow/reflection/scene pass で depth test/write を使う。post pipeline は scene color を sampler2D として読み、swapchain image へ fullscreen triangle で書く。
+- shadow resource は device-owned fixed cascade で、swapchain resize では作り直さない。near cascade は高解像度、mid/far cascade は段階的に軽くし、scene size ではなく camera frustum から shadow projection を作る。interactive default は 2048 shadow map で、重い visual inspection 時だけ `REBUILD1_SHADOW_MAP_SIZE` で上げる。
+- shadow sampling は通常 1 cascade だけを評価し、cascade 境界の blend 範囲だけ 2 cascade を読む。PCF tap は near/mid/far で 16/10/6 に分け、far shadow pass は low LOD geometry を使う。
+- mesh LOD は三角形を単純に間引かない。meshoptimizer の border-locked simplification と vertex-cache reorder で index LOD を作り、同一 LOD stream は upload しない。
+- translucent shadow は cascade ごとの独立 pass で opaque depth を shader sample し、transparent caster だけを transmittance color target へ multiplicative blend で記録する。複数透明 caster は色付き透過として合成し、scene shader が opaque shadow と transmittance をまとめて読む。
+- swapchain dependent resource は scene color/depth、normal/material target、post framebuffer を持つ。post pipeline は scene color/depth と normal/material を読み、実投影係数で復元する material reflectance aware SSR、SSAO、高品質 FXAA、camera effects、tone mapping を fullscreen triangle で書く。
 - `vulkan/material.rs` は imported texture payload を sampled image へ upload し、material parameter buffer と descriptor set を作る。暗黙 fallback texture は作らない。
-- Stage 8 で GLB base-color texture、vertex normal、material texture sampling、alpha cutout shadow、scene shadow/reflection sampling、post camera effects を通した。
-- camera effects は `FrameSnapshot::camera_effects` として app/user 側で抽出し、renderer は露出/ホワイトバランスの owned 値だけを post pass に適用する。暗所は露出上限を抑え、光がない場所を灰色に持ち上げない。
-- mesh pipeline は scene/reflection/shadow ごとに untextured/textured variant を持ち、texture descriptor がある material だけ texture sampling shader を使う。
+- Stage 8 で GLB base-color texture、vertex normal、material texture sampling、alpha cutout shadow、scene shadow sampling、post camera effects を通した。
+- Stage 9 shadow slice で fixed cascade shadow、translucent shadow pass、cascade descriptor indexing、sampled opaque-depth rejection、transparent shadow smoke scene を通した。
+- camera effects は `FrameSnapshot::camera_effects` として app/user 側で抽出し、renderer は露出/ホワイトバランスの owned 値だけを post pass に適用する。contrast/saturation の renderer-wide 補正は quality command 側で扱う。
+- lighting quality は low ambient、directional wrap、indirect strength を分ける。完全に光がない場所は暗く残しつつ、画面外や背面側の key light で normal terminator が急に黒く落ちる問題を抑える。
+- mesh pipeline は scene / opaque shadow / translucent shadow ごとに untextured/textured variant を持ち、texture descriptor がある material だけ texture sampling shader を使う。
 - `REBUILD1_WINDOW_ASSET=assets/stage8_textured_cutout.r1scene` で fixed texture/cutout verification scene を window smoke に流せる。
+- `REBUILD1_WINDOW_ASSET=assets/stage9_translucent_shadow.r1scene` で transparent shadow verification scene を window smoke に流せる。
 - `--window-smoke` は `assets/model.glb` がある場合に asset load 後の mesh frame まで待って自動終了する。
 - asset load 失敗時に renderer が cube や placeholder を作る経路はない。
 - まだ独立した user task、本格的な shader reflection/codegen、screenshot golden image は未実装。
@@ -114,14 +122,13 @@ renderer/
   vulkan/
     buffer.rs    # host-visible typed buffer upload helper
     debug.rs     # validation layer and debug messenger
-    swapchain.rs # swapchain image views, shadow/reflection/scene/post render passes, framebuffers
+    swapchain.rs # swapchain image views, fixed shadows, scene/post render passes, framebuffers
     frame.rs     # frames in flight, command pools, sync, frame execution
     material.rs  # sampled images, sampler, material parameter buffers, descriptor sets
     mesh.rs      # backend-local mesh vertex/index buffers and mesh pipeline
     post.rs      # scene_color sampling and swapchain post pipeline
-    triangle.rs  # temporary debug triangle resources driven by DrawPacket
   graph/         # pass declarations, resources, barriers
-  targets/       # depth, shadow, reflection, scene color
+  targets/       # depth, shadow, scene color
   pipeline/      # shader interface, shader modules, layouts, pipeline cache
   scene/         # renderable scene data
 

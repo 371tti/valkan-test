@@ -1,16 +1,15 @@
 use std::num::NonZeroIsize;
 
-use thiserror::Error;
-
-use crate::{
+use gr_render::{
     protocol::{
-        DrawPacket, FrameId, FrameSnapshot, FrameSnapshotBuilder, MessageEnvelope,
-        NativeSurfaceHandle, NonZeroExtent, RendererCommand, RendererEndpoint, RendererEvent,
-        SceneHandle, SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, ViewId,
-        ViewPacket, Win32SurfaceHandle, WindowId, renderer_transport,
+        FrameId, FrameSnapshot, FrameSnapshotBuilder, MessageEnvelope, NativeSurfaceHandle,
+        NonZeroExtent, RendererCommand, RendererEndpoint, RendererEvent, SceneHandle,
+        SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, ViewId, ViewPacket,
+        Win32SurfaceHandle, WindowId, renderer_transport,
     },
     renderer::{NullRendererBackend, RendererError, spawn_renderer_thread},
 };
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum HeadlessRunError {
@@ -23,7 +22,7 @@ pub enum HeadlessRunError {
     #[error("headless frame was not presented")]
     FrameNotPresented,
     #[error("failed to build frame snapshot: {0}")]
-    Snapshot(#[from] crate::protocol::SnapshotError),
+    Snapshot(#[from] gr_render::protocol::SnapshotError),
 }
 
 /// Runs one protocol-driven frame through the null renderer backend.
@@ -132,7 +131,6 @@ fn build_minimal_snapshot() -> Result<FrameSnapshot, HeadlessRunError> {
 
     let mut builder = FrameSnapshotBuilder::new(frame, scene, surface, generation);
     builder.add_view(ViewPacket::new(view, extent));
-    builder.add_draw(DrawPacket::debug_triangle());
 
     Ok(builder.build()?)
 }

@@ -16,7 +16,7 @@ shader と pipeline の操作も protocol 境界を意識します。user code �
 | --- | --- | --- | --- |
 | 0 | frame | frame/renderer | `FrameSnapshot` から作る camera, light, camera effects, time |
 | 1 | material | assets | material parameters, textures |
-| 2 | pass | graph/pass | shadow map, reflection, post input など pass 固有 |
+| 2 | pass | graph/pass | shadow cascades, translucent shadow maps, post input など pass 固有 |
 
 binding 番号は `shader_interface` に集約します。pipeline 作成側、descriptor 作成側、shader 側が別々の数字を直接持たないようにします。
 
@@ -42,7 +42,7 @@ push constants は小さく保ちます。
 
 ```text
 shadow_opaque
-shadow_cutout
+shadow_translucent
 scene_opaque
 scene_cutout
 scene_transparent
@@ -79,19 +79,13 @@ shader reload の結果は `ShaderReloaded` / `ShaderReloadFailed` event で返�
 
 Stage 8 では `renderer::pipeline::shader_interface` に mesh shader binding contract を置き、`VulkanMeshStore::create` の前に set order と binding 衝突を検証します。これは reflection/codegen ではありませんが、Rust layout と GLSL layout の数字が散らばる状態には戻さないための gate です。
 
-## Temporary debug triangle
+## Mesh and post pipeline
 
-first draw 用の debug triangle は real material / scene pipeline ではありません。
+temporary debug triangle pipeline は削除済みです。first draw 後は `FrameSnapshot.render_items` が唯一の scene draw 入力になり、asset 未ロード時は scene clear frame を present します。
 
-- set order は `frame/material/pass` を使う
-- set 0 binding 0 に小さな `FrameData` uniform を置く
-- set 1 と set 2 は空 layout で先に順序だけ固定する
-- shader source は `shaders/` に置き、`build.rs` で SPIR-V にする
-- app/headless からは `DrawPacket::DebugTriangle` として submit する
+Stage 7 の mesh pipeline は set 0 binding 0 に `CameraSnapshot` 由来の view/projection uniform を持ちます。scene pass は scene color と normal/roughness の MRT を出力し、post pass は scene color / depth / normal-roughness を sampler として読みます。post pass の antialiasing は追加 target を作らず、3x3 luma から edge 方向を推定して edge 方向に沿った resolve sample を読む高品質 FXAA として実行します。edge 判定は tone-map 前 HDR の生 luma ではなく perceptual luma、depth、normal を併用します。SSR / SSAO / AA / lighting wrap / renderer-wide contrast は `SetQualitySettings` で更新される renderer 状態から push constant と frame uniform へ pack します。
 
-Stage 7 の mesh pipeline は set 0 binding 0 に `CameraSnapshot` 由来の view-projection uniform を持ちます。debug triangle は診断用として小さな tint uniform のまま分離します。
-
-Stage 4 では first draw を優先し、temporary uniform のまま完了扱いにしました。Stage 6 で debug triangle は direct app call ではなく `DrawPacket` 経由になりました。full descriptor contents と hot reload error handling は shader interface validation / reload 実装時に扱います。
+full descriptor contents と hot reload error handling は shader interface validation / reload 実装時に扱います。
 
 ## Material variants
 
@@ -107,4 +101,6 @@ transparent -> depth write off, blend on, sorted draw
 
 Stage 6 では `MaterialAlphaMode` と named texture slot を protocol に持たせ、binding 番号は `renderer::pipeline::shader_interface` に集約しました。
 
-Stage 8 では material descriptor set を mesh pipeline に接続し、base-color texture を持つ material だけ sampled texture shader variant に入ります。暗黙 white texture は作りません。alpha cutout は scene と shadow の両方で discard されます。
+Stage 8 では material descriptor set を mesh pipeline に接続し、base-color texture を持つ material だけ sampled texture shader variant に入ります。暗黙 white texture は作りません。alpha cutout は scene と opaque shadow の両方で discard されます。
+
+Stage 9 shadow slice では pass descriptor set が `shadow_cascade_0..2` と `translucent_shadow_0..2` を名前付き binding として持ちます。opaque/cutout material は depth cascade に入り、transparent material は transmittance cascade に入ります。

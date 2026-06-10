@@ -34,7 +34,7 @@
 
 - importer が作った material field を細かく眺めるだけの test
 - shader と descriptor を通さない texture slot test
-- 実際の draw をしない shadow/reflection の見た目 test
+- 実際の draw をしない shadow の見た目 test
 - fixture の期待値を大量に固定するだけの test
 - renderer 内部状態に依存しすぎる protocol test
 
@@ -89,8 +89,8 @@ message protocol は unit test します。renderer を実際に動かさなく�
 | textured plane | texture upload, sampler, UV |
 | alpha cutout card | alpha mode, shadow cutout |
 | normal mapped sphere | tangent/normal/material |
-| shadow receivers | shadow map and bias |
-| reflection plane | reflection target and sampling |
+| shadow receivers | cascade shadow map and bias |
+| translucent blockers | transparent shadow transmittance |
 | post camera effects | tone mapping, exposure, white balance, dark preservation |
 
 ## Current manual checks
@@ -101,12 +101,14 @@ Stage 8 の手元確認は次を使います。
 cargo run -- --headless
 $env:RUST_LOG='rebuild1=info,winit=info'; cargo run -- --window-smoke
 $env:REBUILD1_WINDOW_ASSET='assets/stage8_textured_cutout.r1scene'; $env:RUST_LOG='rebuild1=info,winit=info'; cargo run -- --window-smoke
+$env:REBUILD1_WINDOW_ASSET='assets/stage9_translucent_shadow.r1scene'; $env:RUST_LOG='rebuild1=info,winit=info'; cargo run -- --window-smoke
 ```
 
 確認対象:
 
 - default `assets/model.glb`: GLB geometry, base-color texture import, normals, material draw path
 - `stage8_textured_cutout.r1scene`: explicit checker texture, alpha cutout, shadow cutout, post camera effects
+- `stage9_translucent_shadow.r1scene`: transparent materials, translucent shadow pass, transmittance sampling
 - validation callback: Vulkan error / warning が出ていないこと
 
 ## Acceptance rule

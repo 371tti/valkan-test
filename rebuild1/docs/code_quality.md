@@ -64,7 +64,7 @@ fn record_frame(snapshot: &FrameSnapshot, frame: &mut ActiveFrame) -> RendererRe
 ```rust
 // Converts a validated ECS/user snapshot into renderer-local draw packets.
 // Requires: all asset handles were validated by AssetStore before this call.
-fn build_draw_packets(snapshot: FrameSnapshot, assets: &AssetStore) -> Vec<DrawPacket> {
+fn build_render_items(snapshot: FrameSnapshot, assets: &AssetStore) -> Vec<RenderItemPacket> {
     // ...
 }
 ```

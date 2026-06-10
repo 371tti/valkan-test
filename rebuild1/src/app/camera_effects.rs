@@ -1,4 +1,4 @@
-use crate::protocol::{CameraEffects, Exposure, FramebufferMetering};
+use gr_render::protocol::{CameraEffects, Exposure, FramebufferMetering};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CameraMetering {
@@ -16,15 +16,15 @@ pub(super) struct CameraEffectController {
     white_balance: [f32; 3],
 }
 
-const MIN_OLD_CAMERA_EXPOSURE: f32 = 0.35;
-const MAX_CAMERA_EXPOSURE: f32 = 3.0;
-const TARGET_CAMERA_LUMA: f32 = 0.20;
-const EXPOSURE_RISE_STOPS_PER_SECOND: f32 = 1.1;
-const EXPOSURE_FALL_STOPS_PER_SECOND: f32 = 3.0;
+const MIN_OLD_CAMERA_EXPOSURE: f32 = 0.25;
+const MAX_CAMERA_EXPOSURE: f32 = 3.6;
+const TARGET_CAMERA_LUMA: f32 = 0.25;
+const EXPOSURE_RISE_STOPS_PER_SECOND: f32 = 1.8;
+const EXPOSURE_FALL_STOPS_PER_SECOND: f32 = 5.5;
 const MIN_WHITE_BALANCE: f32 = 0.55;
 const MAX_WHITE_BALANCE: f32 = 1.85;
-const OLD_CAMERA_CONTRAST: f32 = 1.06;
-const OLD_CAMERA_SATURATION: f32 = 1.04;
+const OLD_CAMERA_CONTRAST: f32 = 1.0;
+const OLD_CAMERA_SATURATION: f32 = 1.0;
 
 impl Default for CameraMetering {
     /// Creates an invalid metering sample that leaves the current camera response unchanged.
@@ -134,21 +134,19 @@ impl CameraEffectController {
 
     /// Moves exposure with the same screen-space response curve as the old AutoCamera.
     fn update_exposure(&mut self, metering: CameraMetering, delta_time: f32) {
-        let metered_luma =
-            (metering.center_luminance * 0.65 + metering.average_luminance * 0.35).max(0.002);
+        let metered_luma = metered_luminance(metering);
         let low_light = 1.0 - smoothstep(0.035, 0.22, metered_luma);
-        let target_display_luma = smooth_mix(TARGET_CAMERA_LUMA, 0.26, low_light);
-        let max_exposure = smooth_mix(2.2, MAX_CAMERA_EXPOSURE, low_light);
-        let highlight_guard = (1.0_f32
-            - (metering.highlight_fraction - 0.04_f32).max(0.0_f32) * 1.6_f32)
-            .clamp(0.60_f32, 1.0_f32);
+        let usable_low_light = low_light * smoothstep(0.004, 0.026, metered_luma);
+        let target_display_luma = smooth_mix(TARGET_CAMERA_LUMA, 0.30, usable_low_light);
+        let max_exposure = smooth_mix(2.0, MAX_CAMERA_EXPOSURE, usable_low_light);
+        let highlight_guard = highlight_guard(metering);
         let target_exposure =
             (self.exposure * (target_display_luma / metered_luma) * highlight_guard)
                 .clamp(MIN_OLD_CAMERA_EXPOSURE, max_exposure);
         let exposure_seconds = if target_exposure < self.exposure {
             smooth_mix(0.15, 0.35, low_light)
         } else {
-            smooth_mix(0.55, 1.4, low_light)
+            smooth_mix(0.45, 0.95, usable_low_light)
         };
         let smoothed =
             smooth_exposure(self.exposure, target_exposure, delta_time, exposure_seconds)
@@ -171,6 +169,39 @@ impl CameraEffectController {
                 .clamp(MIN_WHITE_BALANCE, MAX_WHITE_BALANCE);
         }
     }
+}
+
+/// Returns the luminance that should drive exposure for the current screen sample.
+///
+/// Normal frames keep the old center/average blend. If the center is much darker than the
+/// weighted average, the central subject is treated as the metering priority.
+fn metered_luminance(metering: CameraMetering) -> f32 {
+    let average = metering.average_luminance.max(0.002);
+    let center = metering.center_luminance.max(0.002);
+    let center_dark = center_dark_priority(metering);
+    let center_weight = smooth_mix(0.65, 0.90, center_dark);
+
+    (center * center_weight + average * (1.0 - center_weight)).max(0.002)
+}
+
+/// Returns a highlight protection factor that does not punish dark central subjects too hard.
+fn highlight_guard(metering: CameraMetering) -> f32 {
+    let center_dark = center_dark_priority(metering);
+    let allowed_highlights = smooth_mix(0.04, 0.14, center_dark);
+    let pressure = smooth_mix(1.6, 0.85, center_dark);
+    let minimum_guard = smooth_mix(0.60, 0.76, center_dark);
+
+    (1.0_f32 - (metering.highlight_fraction - allowed_highlights).max(0.0_f32) * pressure)
+        .clamp(minimum_guard, 1.0_f32)
+}
+
+/// Returns how strongly the center should win over the rest of the frame.
+fn center_dark_priority(metering: CameraMetering) -> f32 {
+    let average = metering.average_luminance.max(0.002);
+    let center = metering.center_luminance.max(0.002);
+    let ratio = ((average - center) / average).clamp(0.0, 1.0);
+
+    smoothstep(0.12, 0.65, ratio)
 }
 
 /// Computes a bounded white-balance correction from the metered average screen color.
@@ -253,6 +284,31 @@ mod tests {
     }
 
     #[test]
+    fn near_black_metering_does_not_force_max_exposure() {
+        let mut controller = CameraEffectController::default();
+
+        for _ in 0..240 {
+            controller.update(metering(0.001, 0.0), 1.0 / 60.0);
+        }
+
+        assert!(controller.exposure < 2.5);
+    }
+
+    #[test]
+    fn dim_metering_recovers_exposure_upward() {
+        let mut controller = CameraEffectController {
+            exposure: 0.7,
+            white_balance: [1.0; 3],
+        };
+
+        for _ in 0..120 {
+            controller.update(metering(0.018, 0.0), 1.0 / 60.0);
+        }
+
+        assert!(controller.exposure > 2.4);
+    }
+
+    #[test]
     fn bright_metering_recovers_exposure_downward() {
         let mut controller = CameraEffectController {
             exposure: MAX_CAMERA_EXPOSURE,
@@ -264,6 +320,25 @@ mod tests {
         }
 
         assert!(controller.exposure < 1.8);
+    }
+
+    #[test]
+    fn dark_center_subject_receives_more_exposure_than_bright_average() {
+        let mut centered = CameraEffectController::default();
+        let mut averaged = CameraEffectController::default();
+
+        for _ in 0..90 {
+            centered.update(
+                CameraMetering::estimated(0.58, 0.045, 0.60, [0.58; 3], 0.0),
+                1.0 / 60.0,
+            );
+            averaged.update(
+                CameraMetering::estimated(0.58, 0.58, 0.60, [0.58; 3], 0.0),
+                1.0 / 60.0,
+            );
+        }
+
+        assert!(centered.exposure > averaged.exposure * 1.35);
     }
 
     #[test]

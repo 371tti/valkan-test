@@ -83,7 +83,7 @@ renderer/
   graph/
     pass 宣言、resource 宣言、barrier、実行順。
   targets/
-    depth, scene color, shadow, reflection などの render target。
+    depth, scene color, fixed cascade shadow などの render target。
   assets/
     GPU mesh, GPU texture, material buffer, descriptor。
   import/
@@ -105,7 +105,7 @@ renderer/
 | `DeviceContext` | instance, device, queues, debug utils | no | 最長 lifetime。ほかのほぼ全ての親。 |
 | `SwapchainContext` | surface, swapchain, images, image views, render pass, framebuffers | yes | window size と surface format に依存。破棄順は framebuffer -> render pass -> image view -> swapchain。 |
 | `FrameResources` | command buffers, fences, semaphores, upload scratch | maybe | frames-in-flight 単位。 |
-| `RenderTargets` | depth, scene color, shadow, reflection | partly | swapchain size dependent なものだけ作り直す。 |
+| `RenderTargets` | depth, scene color, fixed cascade shadow | partly | scene/post は resize で作り直す。shadow cascade は device lifetime 側に置き、swapchain extent に依存させない。 |
 | `RenderGraph` | pass list, resource state plan | yes | resource が変わったら再構築。 |
 | `AssetStore` | GPU mesh, texture, material buffers | no | resize では壊さない。 |
 | `PipelineLibrary` | shader modules, pipeline layouts, pipelines | maybe | swapchain format や render target format に依存。 |

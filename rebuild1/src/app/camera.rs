@@ -1,4 +1,4 @@
-use crate::protocol::{CameraSnapshot, SceneBounds};
+use gr_render::protocol::{CameraSnapshot, SceneBounds};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CameraKey {

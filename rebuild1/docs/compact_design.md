@@ -25,14 +25,14 @@
 - dedicated renderer thread
 - Vulkan instance / validation callback / device / surface / swapchain
 - swapchain image view / scene-post render passes / framebuffers
+- fixed cascade shadow depth/transmittance targets
 - frames-in-flight / acquire / submit / present
 - per-swapchain-image present semaphore
 - render graph compiler: pass/resource declaration, dependency sort, lifetime, barrier plan
 - explicit barrier plan generated from resource usage
-- executable graph path: scene color + scene depth -> post -> swapchain present
-- executable graph path: shadow map -> reflection target -> scene target -> post -> present
+- executable graph path: shadow cascades -> translucent shadow transmittance -> scene target -> post -> optional readback -> present
 - build-time GLSL -> SPIR-V
-- debug triangle vertex buffer / frame uniform / basic graphics pipeline
+- temporary debug triangle pipeline was removed; startup without assets presents a clear scene frame
 - window capture で triangle 表示確認
 - `SurfaceId` / `SurfaceGeneration`
 - stale frame drop: `FrameDropped` + `DropReason::StaleSurfaceGeneration`
@@ -41,7 +41,7 @@
 - `LoadAsset` / `AssetLoaded` / `AssetLoadFailed`
 - GPU asset handle / store skeleton
 - asset file import runs on worker task, not renderer thread
-- `DrawPacket::DebugTriangle` drives the temporary debug triangle
+- `FrameSnapshot.render_items` is the scene draw input
 - named material texture slots
 - `TextureDescriptor` validated payloads
 - `MaterialDescriptor` with alpha mode/cutoff
@@ -52,7 +52,7 @@
 - Vulkan buffer helper extracted from temporary triangle path
 - GLB triangle primitive import for explicit app model loading
 - window app loads `assets/model.glb` when the app-level sample asset exists
-- `DrawPacket::Mesh` records indexed Vulkan mesh draws in the swapchain pass
+- each render item records an indexed Vulkan mesh draw in the scene pass
 - `FrameSnapshot` carries owned `CameraSnapshot` data per view
 - window app has old-style free camera controls
 - GLB scene bounds frame the app-side camera after `AssetLoaded`
@@ -60,8 +60,8 @@
 - scene framebuffer has a depth target and mesh pipeline uses depth test/write
 - pass cadence is visible through `pass_schedule.rs`
 - post pipeline samples scene color and writes the acquired swapchain image
-- shadow pass owns a real depth target and depth-only mesh pipeline
-- reflection pass owns real color/depth targets and mesh pipeline
+- shadow passes own fixed-size cascade depth targets and depth-only mesh pipeline
+- translucent shadow passes own fixed-size transmittance targets and multiplicative blend mesh pipeline
 - Vulkan material module uploads imported texture payloads into sampled images
 - Vulkan material module uploads material parameter buffers and descriptor sets
 - `--window-smoke` verifies Vulkan startup, `assets/model.glb` load, mesh draw, post, present, and shutdown
@@ -70,7 +70,7 @@
 
 - shader interface validation
 - sampled material texture use in the mesh shader
-- visual verification scenes for texture, alpha cutout, shadow, reflection, and camera effects
+- visual verification scenes for texture, alpha cutout, cascade shadow, translucent shadow, and camera effects
 
 ## Thread And Ownership
 
@@ -136,7 +136,7 @@ Allowed:
 - `MeshHandle`
 - `MaterialHandle`
 - `TextureHandle`
-- `Vec<DrawPacket>`
+- `Vec<RenderItemPacket>`
 
 Forbidden:
 
@@ -155,22 +155,23 @@ Stage 6 fixed the material/texture data path. Stage 7 is turning that data into 
 3. renderer still receives owned `FrameSnapshot` only.
 4. real mesh/texture upload must stay behind renderer asset modules and Vulkan backend-local owners.
 5. sampled image / sampler / descriptor set objects must stay inside the Vulkan backend.
-6. debug triangle stays a `DrawPacket` for no-asset startup and diagnostics.
+6. no-asset startup presents a clear frame; diagnostics should use explicit mesh assets, not a dedicated temporary pipeline.
 7. camera/view state belongs to app/user code and crosses the boundary only as `CameraSnapshot`.
 
 This keeps asset lifetime, resize ordering, and frame submission from tangling together.
 
-## Stage 7.5 Gate
+## Shadow Gate
 
-Stage 7.5 moved the renderer from a scene/post-only graph to the standard frame graph:
+The current graph treats shadows as real resources, not a fake pre-pass:
 
-1. `shadow` writes a real shadow depth target.
-2. `reflection` reads shadow and writes real reflection color/depth targets.
-3. `scene` reads shadow/reflection graph resources and writes scene color/depth.
+1. `shadow_cascade_0..2` write fixed-size opaque depth targets.
+2. `translucent_shadow_0..2` sample cascade depth and write color-only transmittance maps.
+3. `scene` samples all opaque/translucent cascade resources and writes scene color/depth.
 4. `post` samples scene color and writes the acquired swapchain image.
-5. `present` is the external side-effect pass.
+5. `framebuffer_readback` runs only for requested final-frame summaries.
+6. `present` is the external side-effect pass.
 
-Texture and material upload are backend-local Vulkan owners now. The next visual slice is not another graph rewrite; it is binding sampled material data into the mesh shader and verifying the result with fixed scenes.
+Shadow resources are device-owned and do not follow swapchain extent. The near cascade uses the highest resolution, mid/far cascades are smaller, and projection comes from the camera frustum instead of whole scene bounds.
 
 ## Module Shape
 
@@ -212,7 +213,6 @@ renderer/
     mesh.rs      # backend-local mesh buffers and mesh pipeline
     post.rs      # scene_color sampler and post pipeline
     swapchain.rs # swapchain-owned resources
-    triangle.rs  # temporary debug triangle resources
 ```
 
 ## Implementation Rules

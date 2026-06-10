@@ -1,0 +1,7 @@
+rebuild1-scene
+texture checker 180 230 255 128 255 120 90 128
+texture checker 160 255 180 128 120 140 255 128
+material transparent base_color=0
+material transparent base_color=1
+mesh plane
+mesh plane

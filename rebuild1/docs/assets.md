@@ -10,7 +10,7 @@
 
 `import/` はファイル形式を読むだけです。renderer の descriptor や pipeline を知りません。
 
-現在は、最小の `.r1scene` manifest と GLB import を扱います。`.r1scene` は `LoadAsset` の成功/失敗、intermediate scene、handle 発行、fallback 禁止、material/texture slot の流れを固定するための小さい形式です。GLB は実モデルのロード確認用に triangle primitive、vertex normal、base-color texture を CPU intermediate data へ変換します。ファイル読み取りは worker task で行い、renderer thread では Vulkan object と asset store 登録だけを扱います。
+現在は、最小の `.r1scene` manifest と GLB import を扱います。`.r1scene` は `LoadAsset` の成功/失敗、intermediate scene、handle 発行、fallback 禁止、material/texture slot の流れを固定するための小さい形式です。GLB は triangle primitive、vertex normal、vertex color、base-color / normal / metallic-roughness / occlusion / emissive texture slot、PBR scalar、double-sided policy を CPU intermediate data へ変換します。ファイル読み取りは worker task で行い、renderer thread では Vulkan object と asset store 登録だけを扱います。
 
 ```text
 rebuild1-scene
@@ -74,7 +74,7 @@ ImportedScene
 
 Stage 7 では mesh handle も active set ではなく geometry record になりました。`.r1scene` の `mesh plane` は 4 vertices / 6 indices の renderer-owned geometry に変換されます。GLB triangle primitive は indexed geometry として登録されます。`ImportedScene` は bounds を持ち、app/user 側 camera framing に使えます。Vulkan `VkBuffer` / memory、mesh frame camera uniform、mesh pipeline は `vulkan/mesh.rs` が backend-local に所有します。
 
-Stage 8 では imported texture payload が Vulkan sampled image へ upload され、material descriptor set が mesh pipeline に bind されます。base-color texture を持つ material だけ texture sampling shader variant を使い、texture がない material は untextured shader variant を使います。暗黙の white texture は作りません。
+Stage 8 では imported texture payload が Vulkan sampled image へ upload され、material descriptor set が mesh pipeline に bind されます。texture slot を持つ material は texture sampling shader variant を使い、texture がない material は untextured shader variant を使います。renderer は読み込み失敗を隠す fallback asset は作りません。ただし glTF の「slot が省略された場合の既定値」は material default map として明示的に descriptor へ入れ、未初期化 descriptor や shader 分岐の増殖を避けます。
 
 持つもの:
 
@@ -85,8 +85,8 @@ Stage 8 では imported texture payload が Vulkan sampled image へ upload さ�
 
 持たないもの:
 
-- shadow map
-- reflection target
+- fixed shadow cascade targets
+- scene/post render targets
 - scene color/depth
 - swapchain image
 - window size dependent target
@@ -125,9 +125,10 @@ texture は `TextureDescriptor` として protocol-safe な owned data にしま
 
 ```text
 rgba8_srgb
+rgba8_linear
 ```
 
-`TextureDescriptor::rgba8_srgb` は width/height と byte count を検証します。読み込み失敗や texture 不足で renderer が暗黙 white texture を作ることはありません。必要な debug texture は `.r1scene` か user code 側で明示します。
+`TextureDescriptor::rgba8_srgb` / `rgba8_linear` は width/height と byte count を検証します。glTF import は base-color / emissive を sRGB、normal / metallic-roughness / occlusion を linear として分類します。読み込み失敗や texture 不足で renderer が別 asset を捏造することはありません。必要な debug texture は `.r1scene` か user code 側で明示します。
 
 Vulkan の sampled `VkImage` / `VkImageView` / `VkSampler` / material descriptor set への upload は `vulkan/material.rs` が backend-local に所有します。
 

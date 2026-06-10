@@ -38,10 +38,9 @@ RendererCommand
   UnloadAsset
   CreateScene
   DestroyScene
-  SetCamera
-  SetLight
-  SetRenderItems
   SetDebugOptions
+  SetFramebufferReadback
+  SetQualitySettings
   SubmitFrame
   CaptureScreenshot
   Shutdown
@@ -83,6 +82,8 @@ FrameSnapshot
 `FrameSnapshot` は renderer 側で即座に GPU command に変換できるように、user code の参照や借用を含みません。ECS `Entity`、component reference、ECS world pointer も含めません。
 
 `camera_effects` は app/user/ECS 側で決めた露出、white balance、contrast、saturation の owned snapshot です。renderer は framebuffer 外側の world や camera controller を読みに行かず、post pass でこの値だけを使います。暗所保護の方針として、メータリングがほぼ黒のときは exposure を強く上げず、光がない領域を黒いまま残します。
+
+`RenderQualitySettings` は `FrameSnapshot` ではなく `SetQualitySettings` で送ります。SSR、SSAO、AA、lighting wrap、renderer-wide contrast のような「renderer が frame をどう解釈して実行するか」は ECS world の snapshot ではなく renderer 状態として扱います。
 
 `render_items` は renderer protocol 用の packet です。
 
