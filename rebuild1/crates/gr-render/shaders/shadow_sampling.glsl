@@ -30,9 +30,6 @@ float shadow_visibility_at(sampler2D shadow_map, vec2 uv, float compare, vec2 of
 
 float shadow_filter_radius(float ndotl) {
     float grazing = 1.0 - clamp(ndotl, 0.0, 1.0);
-
-    // 元: mix(2.0, 4.0, grazing)
-    // 少し軽量寄り。ぼかし幅は狭くなるが、少ないtapでも破綻しにくい。
     return mix(1.5, 3.0, grazing);
 }
 
@@ -103,6 +100,16 @@ float opaque_shadow_factor(
     return clamp(sum / float(count), 0.0, 1.0);
 }
 
+float translucent_shadow_depth_bias(vec3 projected) {
+    float slope = max(abs(dFdx(projected.z)), abs(dFdy(projected.z)));
+
+    return clamp(
+        0.0030 + slope * 5.0,
+        0.0030,
+        0.025
+    );
+}
+
 vec3 translucent_shadow_factor(sampler2D transmittance_map, vec4 shadow_pos) {
     if (shadow_pos.w <= 0.0) {
         return vec3(1.0);
@@ -121,8 +128,10 @@ vec3 translucent_shadow_factor(sampler2D transmittance_map, vec4 shadow_pos) {
         vec4(1.0)
     );
 
+    float bias = translucent_shadow_depth_bias(projected);
+
     float receiver_is_behind_translucent_caster =
-        step(transmittance.a + 0.0015, projected.z);
+        step(transmittance.a + bias, projected.z);
 
     return mix(
         vec3(1.0),
