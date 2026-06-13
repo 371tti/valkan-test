@@ -1508,7 +1508,7 @@ fn create_graphics_pipeline(
 fn vertex_attributes_for_target(
     target: MeshPipelineTarget,
 ) -> Vec<vk::VertexInputAttributeDescription> {
-    let mut attributes = Vec::with_capacity(4);
+    let mut attributes = Vec::with_capacity(5);
     attributes.push(
         vk::VertexInputAttributeDescription::default()
             .binding(0)
@@ -1532,13 +1532,34 @@ fn vertex_attributes_for_target(
             .format(vk::Format::R32G32_SFLOAT)
             .offset(offset_of!(MeshVertex, uv) as u32),
     );
-    attributes.push(
-        vk::VertexInputAttributeDescription::default()
-            .binding(0)
-            .location(3)
-            .format(vk::Format::R32G32B32A32_SFLOAT)
-            .offset(offset_of!(MeshVertex, color) as u32),
-    );
+
+    if target.uses_surface_normal() {
+        // Scene shaders use location 3 as tangent and location 4 as color.
+        attributes.push(
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(3)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(offset_of!(MeshVertex, tangent) as u32),
+        );
+        attributes.push(
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(4)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(offset_of!(MeshVertex, color) as u32),
+        );
+    } else {
+        // Shadow shaders keep their old contract: location 3 is vertex color.
+        attributes.push(
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(3)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(offset_of!(MeshVertex, color) as u32),
+        );
+    }
+
     attributes
 }
 

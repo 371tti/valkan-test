@@ -4,8 +4,9 @@
 layout(location = 1) in vec3 frag_normal;
 layout(location = 2) in vec2 frag_uv;
 layout(location = 3) in vec4 frag_color;
-layout(location = 4) in vec4 frag_shadow_pos[3];
-layout(location = 7) in vec3 frag_world_pos;
+layout(location = 4) in vec4 frag_tangent;
+layout(location = 5) in vec4 frag_shadow_pos[3];
+layout(location = 8) in vec3 frag_world_pos;
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_normal_roughness;
 layout(location = 2) out vec4 out_transparent_normal_roughness;
@@ -62,25 +63,54 @@ vec4 apply_alpha(vec4 base_color) {
     return base_color;
 }
 
-vec3 normal_from_map(vec3 vertex_normal) {
-    vec3 map = texture(normal_texture, frag_uv).xyz * 2.0 - 1.0;
-    map.xy *= material.pbr_alpha.w;
+vec3 normal_from_derivatives(vec3 vertex_normal, vec3 tangent_space_normal) {
     vec3 dp1 = dFdx(frag_world_pos);
     vec3 dp2 = dFdy(frag_world_pos);
     vec2 duv1 = dFdx(frag_uv);
     vec2 duv2 = dFdy(frag_uv);
-    vec3 tangent_raw = dp1 * duv2.y - dp2 * duv1.y;
-    vec3 bitangent_raw = -dp1 * duv2.x + dp2 * duv1.x;
-    float tangent_len_sq = dot(tangent_raw, tangent_raw);
-    float bitangent_len_sq = dot(bitangent_raw, bitangent_raw);
 
-    if (tangent_len_sq < 0.0001 || bitangent_len_sq < 0.0001) {
+    float det = duv1.x * duv2.y - duv1.y * duv2.x;
+    if (abs(det) < 0.000001) {
         return vertex_normal;
     }
 
-    vec3 tangent = tangent_raw * inversesqrt(tangent_len_sq);
-    vec3 bitangent = bitangent_raw * inversesqrt(bitangent_len_sq);
+    vec3 tangent_raw = (dp1 * duv2.y - dp2 * duv1.y) / det;
+    if (dot(tangent_raw, tangent_raw) < 0.000001) {
+        return vertex_normal;
+    }
+
+    vec3 tangent = tangent_raw - vertex_normal * dot(vertex_normal, tangent_raw);
+    tangent = pbr_normalize_fast(tangent);
+
+    vec3 bitangent = cross(vertex_normal, tangent);
+    vec3 bitangent_raw = (-dp1 * duv2.x + dp2 * duv1.x) / det;
+    if (dot(bitangent, bitangent_raw) < 0.0) {
+        bitangent = -bitangent;
+    }
+
+    return pbr_normalize_fast(mat3(tangent, bitangent, vertex_normal) * tangent_space_normal);
+}
+
+vec3 normal_from_map(vec3 vertex_normal, vec4 vertex_tangent) {
+    vec3 map = texture(normal_texture, frag_uv).xyz * 2.0 - 1.0;
+    map.xy *= material.pbr_alpha.w;
     vec3 tangent_space_normal = pbr_normalize_fast(map);
+
+    vec3 tangent = vertex_tangent.xyz;
+    float tangent_len_sq = dot(tangent, tangent);
+    if (tangent_len_sq < 0.000001) {
+        return normal_from_derivatives(vertex_normal, tangent_space_normal);
+    }
+
+    tangent *= inversesqrt(tangent_len_sq);
+    tangent = tangent - vertex_normal * dot(vertex_normal, tangent);
+    if (dot(tangent, tangent) < 0.000001) {
+        return normal_from_derivatives(vertex_normal, tangent_space_normal);
+    }
+    tangent = pbr_normalize_fast(tangent);
+
+    float tangent_sign = vertex_tangent.w < 0.0 ? -1.0 : 1.0;
+    vec3 bitangent = cross(vertex_normal, tangent) * tangent_sign;
     return pbr_normalize_fast(mat3(tangent, bitangent, vertex_normal) * tangent_space_normal);
 }
 
@@ -90,7 +120,7 @@ vec3 surface_normal() {
         normal = -normal;
     }
     if (has_texture(TEX_NORMAL)) {
-        normal = normal_from_map(normal);
+        normal = normal_from_map(normal, frag_tangent);
     }
     return normal;
 }

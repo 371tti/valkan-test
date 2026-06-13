@@ -152,6 +152,7 @@ struct PostPushConstants {
     camera: [f32; 4],
     depth: [f32; 4],
     ssao: [f32; 4],
+    ssr: [f32; 4],
     aa: [f32; 4],
     exposure: f32,
     contrast: f32,
@@ -167,6 +168,7 @@ impl PostPipeline {
         scene_color_view: vk::ImageView,
         scene_depth_view: vk::ImageView,
         scene_normal_roughness_view: vk::ImageView,
+        scene_transparent_normal_roughness_view: vk::ImageView,
     ) -> Result<Self, VulkanError> {
         let mut build = PostBuild::new(device);
         build.empty_set_layout = Some(create_empty_set_layout(device)?);
@@ -190,6 +192,7 @@ impl PostPipeline {
             scene_color_view,
             scene_depth_view,
             scene_normal_roughness_view,
+            scene_transparent_normal_roughness_view,
             build.color_sampler(),
             build.data_sampler(),
         );
@@ -226,6 +229,7 @@ impl PostPipeline {
         let descriptor_sets = [self.descriptor_set];
         let white_balance = camera_effects.white_balance();
         let ssao = quality.ssao();
+        let ssr = quality.ssr();
         let anti_aliasing = quality.anti_aliasing();
         let post = quality.post();
         let push = PostPushConstants {
@@ -237,6 +241,12 @@ impl PostPipeline {
                 ssao.radius(),
                 ssao.bias(),
                 ssao.sample_count() as f32,
+            ],
+            ssr: [
+                ssr.intensity(),
+                ssr.max_steps() as f32,
+                ssr.max_distance(),
+                ssr.thickness(),
             ],
             aa: post_aa_params(extent, anti_aliasing),
             exposure: camera_effects.exposure().value(),
@@ -255,6 +265,8 @@ impl PostPipeline {
             saturation = push.saturation,
             enabled = camera_effects.enabled(),
             ssao_intensity = push.ssao[0],
+            ssr_intensity = push.ssr[0],
+            ssr_steps = push.ssr[1],
             aa_threshold = push.aa[2],
             aa_blend = push.aa[3],
             "recording Vulkan post pass"
@@ -307,6 +319,7 @@ fn create_pass_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, Vu
         post_sampler_binding(0),
         post_sampler_binding(1),
         post_sampler_binding(2),
+        post_sampler_binding(3),
     ];
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
@@ -406,12 +419,17 @@ fn update_descriptor_set(
     scene_color_view: vk::ImageView,
     scene_depth_view: vk::ImageView,
     scene_normal_roughness_view: vk::ImageView,
+    scene_transparent_normal_roughness_view: vk::ImageView,
     color_sampler: vk::Sampler,
     data_sampler: vk::Sampler,
 ) {
     let color_info = [post_image_info(color_sampler, scene_color_view)];
     let depth_info = [post_image_info(data_sampler, scene_depth_view)];
     let normal_roughness_info = [post_image_info(data_sampler, scene_normal_roughness_view)];
+    let transparent_normal_roughness_info = [post_image_info(
+        data_sampler,
+        scene_transparent_normal_roughness_view,
+    )];
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
@@ -428,6 +446,11 @@ fn update_descriptor_set(
             .dst_binding(2)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&normal_roughness_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(3)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&transparent_normal_roughness_info),
     ];
 
     // Safety: descriptor set, sampler, and image view belong to this device and remain alive.

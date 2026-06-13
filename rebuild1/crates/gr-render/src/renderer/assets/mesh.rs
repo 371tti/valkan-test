@@ -46,10 +46,11 @@ impl MeshGeometry {
                     .vertices()
                     .iter()
                     .map(|vertex| {
-                        MeshVertex::new(
+                        MeshVertex::new_with_tangent(
                             vertex.position(),
                             vertex.normal(),
                             vertex.uv(),
+                            vertex.tangent(),
                             vertex.color(),
                         )
                     })
@@ -162,16 +163,29 @@ pub(crate) struct MeshVertex {
     pub(crate) position: [f32; 3],
     pub(crate) normal: [f32; 3],
     pub(crate) uv: [f32; 2],
+    pub(crate) tangent: [f32; 4],
     pub(crate) color: [f32; 4],
 }
 
 impl MeshVertex {
-    /// Creates one renderer-owned vertex in the exact memory layout used by mesh shaders.
+    /// Creates one vertex with a generated tangent for explicit untextured geometry.
     pub(crate) fn new(position: [f32; 3], normal: [f32; 3], uv: [f32; 2], color: [f32; 4]) -> Self {
+        Self::new_with_tangent(position, normal, uv, [1.0, 0.0, 0.0, 1.0], color)
+    }
+
+    /// Creates one vertex in the exact memory layout used by scene and shadow mesh shaders.
+    pub(crate) fn new_with_tangent(
+        position: [f32; 3],
+        normal: [f32; 3],
+        uv: [f32; 2],
+        tangent: [f32; 4],
+        color: [f32; 4],
+    ) -> Self {
         Self {
             position,
             normal,
             uv,
+            tangent,
             color,
         }
     }

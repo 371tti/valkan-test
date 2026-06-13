@@ -3,8 +3,8 @@
 
 layout(location = 1) in vec3 frag_normal;
 layout(location = 3) in vec4 frag_color;
-layout(location = 4) in vec4 frag_shadow_pos[3];
-layout(location = 7) in vec3 frag_world_pos;
+layout(location = 5) in vec4 frag_shadow_pos[3];
+layout(location = 8) in vec3 frag_world_pos;
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_normal_roughness;
 layout(location = 2) out vec4 out_transparent_normal_roughness;

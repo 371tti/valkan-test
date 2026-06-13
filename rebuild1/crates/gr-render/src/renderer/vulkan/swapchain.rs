@@ -16,7 +16,19 @@ use crate::renderer::graph::{
 use crate::renderer::shadow_map_size;
 
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+
+// Scene color is sampled by the post shader before tonemapping.
+// Do not use the swapchain format here: B8G8R8A8_SRGB/RGBA8_UNORM clamps HDR PBR
+// lighting to [0, 1], which makes close-camera specular highlights and reflections collapse.
+const SCENE_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+// Opaque metadata fits in UNORM8: oct-encoded normal.xy, roughness, reflectance.
 const SCENE_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+// Transparent metadata stores alpha as 1.0 + gl_FragCoord.z to mark valid pixels.
+// UNORM8 would clamp that to 1.0, so post.frag's `transparent.w > 1.0` test can never work.
+const SCENE_TRANSPARENT_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
 const TRANSLUCENT_SHADOW_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const FALLBACK_SHADOW_TRANSMITTANCE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const MIN_FAR_SHADOW_MAP_SIZE: u32 = 512;
@@ -595,7 +607,7 @@ impl VulkanDevice {
             &self.device,
             &self.memory_properties,
             config.extent,
-            config.format,
+            SCENE_COLOR_FORMAT,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         )?);
         build.scene_normal_roughness = Some(create_color_target(
@@ -609,7 +621,7 @@ impl VulkanDevice {
             &self.device,
             &self.memory_properties,
             config.extent,
-            SCENE_NORMAL_ROUGHNESS_FORMAT,
+            SCENE_TRANSPARENT_NORMAL_ROUGHNESS_FORMAT,
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         )?);
         build.scene_depth = Some(create_depth_target(
@@ -667,6 +679,7 @@ impl VulkanDevice {
             scene_color.view,
             scene_depth.view,
             scene_normal_roughness.view,
+            scene_transparent_normal_roughness.view,
         )?);
 
         build.scene_framebuffer = Some(create_scene_framebuffer(

@@ -6,7 +6,7 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    math::{add3, cross3, normalize_or, sub3},
+    math::{add3, cross3, dot3, normalize_or, sub3},
     protocol::{MaterialAlphaMode, MaterialTextureSlot, SceneBounds, TextureDescriptor},
 };
 
@@ -135,16 +135,24 @@ pub struct ImportedVertex {
     position: [f32; 3],
     normal: [f32; 3],
     uv: [f32; 2],
+    tangent: [f32; 4],
     color: [f32; 4],
 }
 
 impl ImportedVertex {
     /// Creates one imported vertex in renderer-independent CPU memory.
-    pub fn new(position: [f32; 3], normal: [f32; 3], uv: [f32; 2], color: [f32; 4]) -> Self {
+    pub fn new(
+        position: [f32; 3],
+        normal: [f32; 3],
+        uv: [f32; 2],
+        tangent: [f32; 4],
+        color: [f32; 4],
+    ) -> Self {
         Self {
             position,
             normal: normalize_or(normal, [0.0, 1.0, 0.0]),
             uv,
+            tangent: normalize_tangent(tangent, normal),
             color: color.map(clamp_unit),
         }
     }
@@ -162,6 +170,11 @@ impl ImportedVertex {
     /// Returns the imported texture coordinate.
     pub fn uv(self) -> [f32; 2] {
         self.uv
+    }
+
+    /// Returns the imported tangent xyz and bitangent handedness sign in w.
+    pub fn tangent(self) -> [f32; 4] {
+        self.tangent
     }
 
     /// Returns the imported debug/base color.
@@ -533,7 +546,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
         gltf::import(path).map_err(|source| gltf_error(path, source))?;
     let mut meshes = Vec::new();
     let mut materials = Vec::new();
-    let textures = import_gltf_textures(path, &document, &images)?;
+    let texture_import = import_gltf_textures(path, &document, &images)?;
     let transforms = gltf_scene_transforms(&document, &buffers)?;
 
     if let Some(scene) = document.default_scene() {
@@ -544,7 +557,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
                 MAT4_IDENTITY,
                 &transforms,
                 &buffers,
-                &textures,
+                &texture_import,
                 &mut meshes,
                 &mut materials,
             )?;
@@ -558,7 +571,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
                     MAT4_IDENTITY,
                     &transforms,
                     &buffers,
-                    &textures,
+                    &texture_import,
                     &mut meshes,
                     &mut materials,
                 )?;
@@ -574,7 +587,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
                     None,
                     &transforms,
                     &buffers,
-                    &textures,
+                    &texture_import,
                     &mut meshes,
                     &mut materials,
                 )?;
@@ -601,7 +614,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
         path.to_path_buf(),
         meshes,
         materials,
-        textures,
+        texture_import.into_textures(),
     ))
 }
 
@@ -744,7 +757,7 @@ fn import_gltf_node(
     parent_transform: [f32; 16],
     transforms: &GltfSceneTransforms,
     buffers: &[gltf::buffer::Data],
-    textures: &[ImportedTexture],
+    textures: &GltfImportedTextures,
     meshes: &mut Vec<ImportedMesh>,
     materials: &mut Vec<ImportedMaterial>,
 ) -> Result<(), ImportError> {
@@ -789,7 +802,7 @@ fn import_gltf_mesh(
     skin: Option<gltf::Skin<'_>>,
     transforms: &GltfSceneTransforms,
     buffers: &[gltf::buffer::Data],
-    textures: &[ImportedTexture],
+    textures: &GltfImportedTextures,
     meshes: &mut Vec<ImportedMesh>,
     materials: &mut Vec<ImportedMaterial>,
 ) -> Result<(), ImportError> {
@@ -819,7 +832,7 @@ fn import_gltf_primitive(
     skin: Option<gltf::Skin<'_>>,
     transforms: &GltfSceneTransforms,
     buffers: &[gltf::buffer::Data],
-    textures: &[ImportedTexture],
+    textures: &GltfImportedTextures,
     meshes: &mut Vec<ImportedMesh>,
     materials: &mut Vec<ImportedMaterial>,
 ) -> Result<(), ImportError> {
@@ -831,7 +844,7 @@ fn import_gltf_primitive(
         return Ok(());
     }
 
-    let material = import_gltf_material(path, primitive.material(), textures.len())?;
+    let material = import_gltf_material(path, primitive.material(), textures)?;
     let reader =
         primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| data.0.as_slice()));
     let source_positions = reader
@@ -889,6 +902,7 @@ fn import_gltf_primitive(
         &positions,
         &indices,
     );
+    let tangents = compute_vertex_tangents(&positions, &normals, &uvs, &indices);
 
     let vertices = positions
         .into_iter()
@@ -898,6 +912,7 @@ fn import_gltf_primitive(
                 position,
                 normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0]),
                 uvs.get(index).copied().unwrap_or([0.0, 0.0]),
+                tangents.get(index).copied().unwrap_or([1.0, 0.0, 0.0, 1.0]),
                 colors.get(index).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]),
             )
         })
@@ -1107,7 +1122,7 @@ fn skin_normal(
 fn import_gltf_material(
     path: &Path,
     material: gltf::Material<'_>,
-    texture_count: usize,
+    textures: &GltfImportedTextures,
 ) -> Result<ImportedMaterial, ImportError> {
     let alpha_mode = match material.alpha_mode() {
         gltf::material::AlphaMode::Opaque => MaterialAlphaMode::Opaque,
@@ -1120,41 +1135,46 @@ fn import_gltf_material(
     let mut texture_slots = Vec::new();
     push_gltf_texture_slot(
         path,
-        texture_count,
+        textures,
         &mut texture_slots,
         MaterialTextureSlot::BaseColor,
         pbr.base_color_texture(),
+        GltfImageColorSpace::Srgb,
     )?;
     push_gltf_texture_slot(
         path,
-        texture_count,
+        textures,
         &mut texture_slots,
         MaterialTextureSlot::MetallicRoughness,
         pbr.metallic_roughness_texture(),
+        GltfImageColorSpace::Linear,
     )?;
     push_gltf_texture_slot(
         path,
-        texture_count,
+        textures,
         &mut texture_slots,
         MaterialTextureSlot::Normal,
         material.normal_texture(),
+        GltfImageColorSpace::Linear,
     )?;
     push_gltf_texture_slot(
         path,
-        texture_count,
+        textures,
         &mut texture_slots,
         MaterialTextureSlot::Occlusion,
         material.occlusion_texture(),
+        GltfImageColorSpace::Linear,
     )?;
     push_gltf_texture_slot(
         path,
-        texture_count,
+        textures,
         &mut texture_slots,
         MaterialTextureSlot::Emissive,
         material.emissive_texture(),
+        GltfImageColorSpace::Srgb,
     )?;
 
-    Ok(ImportedMaterial::with_pbr(
+    let imported = ImportedMaterial::with_pbr(
         alpha_mode,
         alpha_cutoff_milli,
         pbr.base_color_factor(),
@@ -1171,7 +1191,16 @@ fn import_gltf_material(
             .unwrap_or(1000),
         material.double_sided(),
         texture_slots,
-    ))
+    );
+    tracing::trace!(
+        alpha_mode = imported.alpha_mode().name(),
+        metallic = imported.metallic_factor_milli(),
+        roughness = imported.roughness_factor_milli(),
+        textures = imported.texture_slots().len(),
+        "imported glTF material"
+    );
+
+    Ok(imported)
 }
 
 /// Returns emissive color after applying the KHR emissive strength extension when present.
@@ -1183,10 +1212,11 @@ fn gltf_emissive_factor(material: &gltf::Material<'_>) -> [f32; 3] {
 /// Adds a glTF texture info to the imported slot list after validating the source image index.
 fn push_gltf_texture_slot<T>(
     path: &Path,
-    texture_count: usize,
+    textures: &GltfImportedTextures,
     texture_slots: &mut Vec<ImportedMaterialTextureSlot>,
     slot: MaterialTextureSlot,
     info: Option<T>,
+    color_space: GltfImageColorSpace,
 ) -> Result<(), ImportError>
 where
     T: GltfTextureSource,
@@ -1194,13 +1224,12 @@ where
     let Some(info) = info else {
         return Ok(());
     };
-    let index = info.source_index();
-    if index >= texture_count {
+    let Some(index) = textures.texture_index(info.source_index(), color_space) else {
         return Err(gltf_message(
             path,
             "glTF material references a texture image that was not imported",
         ));
-    }
+    };
     texture_slots.push(ImportedMaterialTextureSlot::new(slot, index));
     Ok(())
 }
@@ -1227,31 +1256,87 @@ impl GltfTextureSource for gltf::material::OcclusionTexture<'_> {
     }
 }
 
-/// Converts glTF image payloads into renderer-owned RGBA8 sRGB texture descriptors.
+struct GltfImportedTextures {
+    textures: Vec<ImportedTexture>,
+    srgb_indices: Vec<Option<usize>>,
+    linear_indices: Vec<Option<usize>>,
+}
+
+impl GltfImportedTextures {
+    /// Creates the lookup used by material import to select the correct image color space.
+    fn new(
+        textures: Vec<ImportedTexture>,
+        srgb_indices: Vec<Option<usize>>,
+        linear_indices: Vec<Option<usize>>,
+    ) -> Self {
+        Self {
+            textures,
+            srgb_indices,
+            linear_indices,
+        }
+    }
+
+    /// Returns the imported texture index for a glTF source image and shader sampling role.
+    fn texture_index(
+        &self,
+        source_index: usize,
+        color_space: GltfImageColorSpace,
+    ) -> Option<usize> {
+        match color_space {
+            GltfImageColorSpace::Srgb => self.srgb_indices.get(source_index).copied().flatten(),
+            GltfImageColorSpace::Linear => self.linear_indices.get(source_index).copied().flatten(),
+        }
+    }
+
+    /// Moves the imported texture payloads into the final scene intermediate.
+    fn into_textures(self) -> Vec<ImportedTexture> {
+        self.textures
+    }
+}
+
+/// Converts glTF image payloads into renderer-owned texture descriptors by sampling role.
 fn import_gltf_textures(
     path: &Path,
     document: &gltf::Document,
     images: &[gltf::image::Data],
-) -> Result<Vec<ImportedTexture>, ImportError> {
-    let color_spaces = gltf_image_color_spaces(document, images.len());
-    images
-        .iter()
-        .enumerate()
-        .map(|(index, image)| {
-            let pixels = image_to_rgba8(path, image)?;
-            let descriptor = match color_spaces[index] {
-                GltfImageColorSpace::Srgb => {
-                    TextureDescriptor::rgba8_srgb(image.width, image.height, pixels)
-                }
-                GltfImageColorSpace::Linear => {
-                    TextureDescriptor::rgba8_linear(image.width, image.height, pixels)
-                }
-            };
-            descriptor.map(ImportedTexture::new).ok_or_else(|| {
-                gltf_message(path, "glTF image payload has an invalid RGBA8 byte count")
-            })
-        })
-        .collect()
+) -> Result<GltfImportedTextures, ImportError> {
+    let usages = gltf_image_usages(document, images.len());
+    let mut textures = Vec::new();
+    let mut srgb_indices = vec![None; images.len()];
+    let mut linear_indices = vec![None; images.len()];
+
+    for (index, image) in images.iter().enumerate() {
+        let usage = usages[index];
+        if !usage.srgb && !usage.linear {
+            continue;
+        }
+
+        let pixels = image_to_rgba8(path, image)?;
+        if usage.srgb {
+            srgb_indices[index] = Some(push_gltf_texture_descriptor(
+                path,
+                &mut textures,
+                image,
+                pixels.clone(),
+                GltfImageColorSpace::Srgb,
+            )?);
+        }
+        if usage.linear {
+            linear_indices[index] = Some(push_gltf_texture_descriptor(
+                path,
+                &mut textures,
+                image,
+                pixels,
+                GltfImageColorSpace::Linear,
+            )?);
+        }
+    }
+
+    Ok(GltfImportedTextures::new(
+        textures,
+        srgb_indices,
+        linear_indices,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1260,31 +1345,88 @@ enum GltfImageColorSpace {
     Linear,
 }
 
-/// Classifies glTF source images so data maps are sampled without sRGB conversion.
-fn gltf_image_color_spaces(
-    document: &gltf::Document,
-    image_count: usize,
-) -> Vec<GltfImageColorSpace> {
-    let mut color_spaces = vec![GltfImageColorSpace::Linear; image_count];
-    for material in document.materials() {
-        let pbr = material.pbr_metallic_roughness();
-        mark_gltf_texture_srgb(&mut color_spaces, pbr.base_color_texture());
-        mark_gltf_texture_srgb(&mut color_spaces, material.emissive_texture());
-    }
-
-    color_spaces
+#[derive(Clone, Copy, Default)]
+struct GltfImageUsage {
+    srgb: bool,
+    linear: bool,
 }
 
-/// Marks a texture source image as color data when a glTF material uses it as such.
-fn mark_gltf_texture_srgb<T>(color_spaces: &mut [GltfImageColorSpace], info: Option<T>)
-where
+/// Adds one texture descriptor and returns its imported texture index.
+fn push_gltf_texture_descriptor(
+    path: &Path,
+    textures: &mut Vec<ImportedTexture>,
+    image: &gltf::image::Data,
+    pixels: Vec<u8>,
+    color_space: GltfImageColorSpace,
+) -> Result<usize, ImportError> {
+    let descriptor = match color_space {
+        GltfImageColorSpace::Srgb => {
+            TextureDescriptor::rgba8_srgb(image.width, image.height, pixels)
+        }
+        GltfImageColorSpace::Linear => {
+            TextureDescriptor::rgba8_linear(image.width, image.height, pixels)
+        }
+    };
+    let texture = descriptor
+        .map(ImportedTexture::new)
+        .ok_or_else(|| gltf_message(path, "glTF image payload has an invalid RGBA8 byte count"))?;
+    let index = textures.len();
+    textures.push(texture);
+    Ok(index)
+}
+
+/// Classifies glTF source images so color and data uses can create separate descriptors.
+fn gltf_image_usages(document: &gltf::Document, image_count: usize) -> Vec<GltfImageUsage> {
+    let mut usages = vec![GltfImageUsage::default(); image_count];
+    for material in document.materials() {
+        let pbr = material.pbr_metallic_roughness();
+        mark_gltf_texture_usage(
+            &mut usages,
+            pbr.base_color_texture(),
+            GltfImageColorSpace::Srgb,
+        );
+        mark_gltf_texture_usage(
+            &mut usages,
+            pbr.metallic_roughness_texture(),
+            GltfImageColorSpace::Linear,
+        );
+        mark_gltf_texture_usage(
+            &mut usages,
+            material.normal_texture(),
+            GltfImageColorSpace::Linear,
+        );
+        mark_gltf_texture_usage(
+            &mut usages,
+            material.occlusion_texture(),
+            GltfImageColorSpace::Linear,
+        );
+        mark_gltf_texture_usage(
+            &mut usages,
+            material.emissive_texture(),
+            GltfImageColorSpace::Srgb,
+        );
+    }
+
+    usages
+}
+
+/// Marks how one glTF source image is sampled by a material slot.
+fn mark_gltf_texture_usage<T>(
+    usages: &mut [GltfImageUsage],
+    info: Option<T>,
+    color_space: GltfImageColorSpace,
+) where
     T: GltfTextureSource,
 {
     let Some(info) = info else {
         return;
     };
-    if let Some(color_space) = color_spaces.get_mut(info.source_index()) {
-        *color_space = GltfImageColorSpace::Srgb;
+    let Some(usage) = usages.get_mut(info.source_index()) else {
+        return;
+    };
+    match color_space {
+        GltfImageColorSpace::Srgb => usage.srgb = true,
+        GltfImageColorSpace::Linear => usage.linear = true,
     }
 }
 
@@ -1627,6 +1769,125 @@ fn compute_vertex_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 
         .collect()
 }
 
+/// Computes per-vertex tangents from positions, normals, UVs, and triangles.
+///
+/// glTF normal maps require a stable tangent frame. This importer computes the frame after
+/// node transform / CPU skinning so the shader can use TANGENT.xyz + TANGENT.w instead of a
+/// fragile derivative-only TBN.
+fn compute_vertex_tangents(
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+    indices: &[u32],
+) -> Vec<[f32; 4]> {
+    let mut tangent_sum = vec![[0.0, 0.0, 0.0]; positions.len()];
+    let mut bitangent_sum = vec![[0.0, 0.0, 0.0]; positions.len()];
+
+    if uvs.len() != positions.len() || normals.len() != positions.len() {
+        return (0..positions.len())
+            .map(|index| fallback_tangent(normals.get(index).copied().unwrap_or([0.0, 1.0, 0.0])))
+            .collect();
+    }
+
+    for triangle in indices.chunks_exact(3) {
+        let [i0, i1, i2] = [
+            triangle[0] as usize,
+            triangle[1] as usize,
+            triangle[2] as usize,
+        ];
+        if i0 >= positions.len() || i1 >= positions.len() || i2 >= positions.len() {
+            continue;
+        }
+
+        let p0 = positions[i0];
+        let p1 = positions[i1];
+        let p2 = positions[i2];
+        let uv0 = uvs[i0];
+        let uv1 = uvs[i1];
+        let uv2 = uvs[i2];
+
+        let dp1 = sub3(p1, p0);
+        let dp2 = sub3(p2, p0);
+        let duv1 = [uv1[0] - uv0[0], uv1[1] - uv0[1]];
+        let duv2 = [uv2[0] - uv0[0], uv2[1] - uv0[1]];
+        let det = duv1[0] * duv2[1] - duv1[1] * duv2[0];
+        if !det.is_finite() || det.abs() <= 1e-8 {
+            continue;
+        }
+
+        let inv_det = 1.0 / det;
+        let tangent = [
+            (dp1[0] * duv2[1] - dp2[0] * duv1[1]) * inv_det,
+            (dp1[1] * duv2[1] - dp2[1] * duv1[1]) * inv_det,
+            (dp1[2] * duv2[1] - dp2[2] * duv1[1]) * inv_det,
+        ];
+        let bitangent = [
+            (dp2[0] * duv1[0] - dp1[0] * duv2[0]) * inv_det,
+            (dp2[1] * duv1[0] - dp1[1] * duv2[0]) * inv_det,
+            (dp2[2] * duv1[0] - dp1[2] * duv2[0]) * inv_det,
+        ];
+
+        for index in [i0, i1, i2] {
+            tangent_sum[index] = add3(tangent_sum[index], tangent);
+            bitangent_sum[index] = add3(bitangent_sum[index], bitangent);
+        }
+    }
+
+    normals
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, normal)| {
+            let n = normalize_or(normal, [0.0, 1.0, 0.0]);
+            let t_raw = tangent_sum[index];
+            let t_ortho = sub3(
+                t_raw,
+                [
+                    n[0] * dot3(n, t_raw),
+                    n[1] * dot3(n, t_raw),
+                    n[2] * dot3(n, t_raw),
+                ],
+            );
+            let fallback = fallback_tangent(n);
+            let tangent = normalize_or(t_ortho, [fallback[0], fallback[1], fallback[2]]);
+            let b = bitangent_sum[index];
+            let sign = if dot3(cross3(n, tangent), b) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            [tangent[0], tangent[1], tangent[2], sign]
+        })
+        .collect()
+}
+
+/// Normalizes tangent xyz and keeps tangent.w as a handedness sign.
+fn normalize_tangent(tangent: [f32; 4], normal: [f32; 3]) -> [f32; 4] {
+    let n = normalize_or(normal, [0.0, 1.0, 0.0]);
+    let t = [tangent[0], tangent[1], tangent[2]];
+    let orthogonal = sub3(t, [n[0] * dot3(n, t), n[1] * dot3(n, t), n[2] * dot3(n, t)]);
+    let fallback = fallback_tangent(n);
+    let normalized = normalize_or(orthogonal, [fallback[0], fallback[1], fallback[2]]);
+    [
+        normalized[0],
+        normalized[1],
+        normalized[2],
+        if tangent[3] < 0.0 { -1.0 } else { 1.0 },
+    ]
+}
+
+/// Returns any stable tangent orthogonal to a normal.
+fn fallback_tangent(normal: [f32; 3]) -> [f32; 4] {
+    let n = normalize_or(normal, [0.0, 1.0, 0.0]);
+    let axis = if n[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let tangent = normalize_or(cross3(axis, n), [1.0, 0.0, 0.0]);
+    [tangent[0], tangent[1], tangent[2], 1.0]
+}
+
 /// Clamps imported color channels into the visible range.
 fn clamp_unit(value: f32) -> f32 {
     if value.is_finite() {
@@ -1665,6 +1926,13 @@ fn parse_material(
     let alpha_mode = MaterialAlphaMode::from_name(mode)
         .ok_or_else(|| invalid_directive(path, line, format!("unknown alpha mode: {mode}")))?;
     let mut alpha_cutoff_milli = 500;
+    let mut base_color_factor = [1.0, 1.0, 1.0, 1.0];
+    let mut metallic_factor_milli = 0;
+    let mut roughness_factor_milli = 1000;
+    let mut emissive_factor = [0.0, 0.0, 0.0];
+    let mut occlusion_strength_milli = 1000;
+    let mut normal_scale_milli = 1000;
+    let mut double_sided = false;
     let mut texture_slots = Vec::new();
 
     for token in rest {
@@ -1678,6 +1946,34 @@ fn parse_material(
 
         if name == "alpha_cutoff" {
             alpha_cutoff_milli = parse_alpha_cutoff(path, line, value)?;
+            continue;
+        }
+        if name == "base_color_factor" {
+            base_color_factor = parse_vec4(path, line, value, "base_color_factor")?;
+            continue;
+        }
+        if name == "emissive" {
+            emissive_factor = parse_vec3_non_negative(path, line, value, "emissive")?;
+            continue;
+        }
+        if name == "metallic" {
+            metallic_factor_milli = parse_unit_milli(path, line, value, "metallic")?;
+            continue;
+        }
+        if name == "roughness" {
+            roughness_factor_milli = parse_unit_milli(path, line, value, "roughness")?;
+            continue;
+        }
+        if name == "occlusion" {
+            occlusion_strength_milli = parse_unit_milli(path, line, value, "occlusion")?;
+            continue;
+        }
+        if name == "normal_scale" {
+            normal_scale_milli = parse_positive_milli(path, line, value, "normal_scale", 4000)?;
+            continue;
+        }
+        if name == "double_sided" {
+            double_sided = parse_bool(path, line, value, "double_sided")?;
             continue;
         }
 
@@ -1695,9 +1991,16 @@ fn parse_material(
         texture_slots.push(ImportedMaterialTextureSlot::new(slot, texture_index));
     }
 
-    Ok(ImportedMaterial::new(
+    Ok(ImportedMaterial::with_pbr(
         alpha_mode,
         alpha_cutoff_milli,
+        base_color_factor,
+        metallic_factor_milli,
+        roughness_factor_milli,
+        emissive_factor,
+        occlusion_strength_milli,
+        normal_scale_milli,
+        double_sided,
         texture_slots,
     ))
 }
@@ -1714,6 +2017,130 @@ fn parse_usize(path: &Path, line: usize, value: &str) -> Result<usize, ImportErr
     value
         .parse::<usize>()
         .map_err(|_| invalid_directive(path, line, format!("invalid index value: {value}")))
+}
+
+/// Parses one finite scalar used by material factor directives.
+fn parse_f32_directive(
+    path: &Path,
+    line: usize,
+    value: &str,
+    name: &str,
+) -> Result<f32, ImportError> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| invalid_directive(path, line, format!("invalid {name}: {value}")))?;
+    if parsed.is_finite() {
+        Ok(parsed)
+    } else {
+        Err(invalid_directive(
+            path,
+            line,
+            format!("{name} must be finite: {value}"),
+        ))
+    }
+}
+
+/// Parses a unit material factor and stores it as deterministic milli units.
+fn parse_unit_milli(path: &Path, line: usize, value: &str, name: &str) -> Result<u16, ImportError> {
+    let parsed = parse_f32_directive(path, line, value, name)?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err(invalid_directive(
+            path,
+            line,
+            format!("{name} must be between 0 and 1: {value}"),
+        ));
+    }
+
+    Ok((parsed * 1000.0).round() as u16)
+}
+
+/// Parses a non-negative factor with an explicit milli-unit ceiling.
+fn parse_positive_milli(
+    path: &Path,
+    line: usize,
+    value: &str,
+    name: &str,
+    max_milli: u16,
+) -> Result<u16, ImportError> {
+    let parsed = parse_f32_directive(path, line, value, name)?;
+    if parsed < 0.0 || parsed > f32::from(max_milli) / 1000.0 {
+        return Err(invalid_directive(
+            path,
+            line,
+            format!("{name} is outside the supported range: {value}"),
+        ));
+    }
+
+    Ok((parsed * 1000.0).round() as u16)
+}
+
+/// Parses a boolean directive without accepting ambiguous spellings.
+fn parse_bool(path: &Path, line: usize, value: &str, name: &str) -> Result<bool, ImportError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(invalid_directive(
+            path,
+            line,
+            format!("{name} must be true or false: {value}"),
+        )),
+    }
+}
+
+/// Parses a comma-separated RGB factor for simple verification scene materials.
+fn parse_vec3_non_negative(
+    path: &Path,
+    line: usize,
+    value: &str,
+    name: &str,
+) -> Result<[f32; 3], ImportError> {
+    let values = parse_f32_list(path, line, value, name, 3)?;
+    if values.iter().all(|value| *value >= 0.0) {
+        Ok([values[0], values[1], values[2]])
+    } else {
+        Err(invalid_directive(
+            path,
+            line,
+            format!("{name} channels must be non-negative: {value}"),
+        ))
+    }
+}
+
+/// Parses a comma-separated RGBA factor for simple verification scene materials.
+fn parse_vec4(path: &Path, line: usize, value: &str, name: &str) -> Result<[f32; 4], ImportError> {
+    let values = parse_f32_list(path, line, value, name, 4)?;
+    if values.iter().all(|value| (0.0..=1.0).contains(value)) {
+        Ok([values[0], values[1], values[2], values[3]])
+    } else {
+        Err(invalid_directive(
+            path,
+            line,
+            format!("{name} channels must be between 0 and 1: {value}"),
+        ))
+    }
+}
+
+/// Parses a fixed-length comma-separated list of finite floats.
+fn parse_f32_list(
+    path: &Path,
+    line: usize,
+    value: &str,
+    name: &str,
+    expected_len: usize,
+) -> Result<Vec<f32>, ImportError> {
+    let values = value
+        .split(',')
+        .map(|part| parse_f32_directive(path, line, part, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() == expected_len {
+        Ok(values)
+    } else {
+        Err(invalid_directive(
+            path,
+            line,
+            format!("{name} expects {expected_len} comma-separated values: {value}"),
+        ))
+    }
 }
 
 /// Parses alpha cutoff and stores it as a milli value.
@@ -1759,7 +2186,7 @@ mod tests {
     #[test]
     fn import_reads_textured_cutout_material() {
         let path = PathBuf::from("scene.r1scene");
-        let text = "rebuild1-scene\ntexture solid 255 0 0 255\nmaterial cutout base_color=0 alpha_cutoff=0.4\nmesh plane\n";
+        let text = "rebuild1-scene\ntexture solid 255 0 0 255\nmaterial cutout base_color=0 alpha_cutoff=0.4 roughness=0.25 metallic=0.75 double_sided=true\nmesh plane\n";
 
         let scene = parse_rebuild1_scene(&path, text).expect("manifest should parse");
         let material = &scene.materials()[0];
@@ -1767,6 +2194,9 @@ mod tests {
         assert_eq!(scene.texture_count(), 1);
         assert_eq!(material.alpha_mode(), MaterialAlphaMode::Cutout);
         assert_eq!(material.alpha_cutoff_milli(), 400);
+        assert_eq!(material.roughness_factor_milli(), 250);
+        assert_eq!(material.metallic_factor_milli(), 750);
+        assert!(material.double_sided());
         assert_eq!(
             material.texture_slots()[0].slot(),
             MaterialTextureSlot::BaseColor

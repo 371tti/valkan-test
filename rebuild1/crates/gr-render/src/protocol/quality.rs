@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderQualitySettings {
     ssao: SsaoQualitySettings,
+    ssr: SsrQualitySettings,
     anti_aliasing: AntiAliasingQualitySettings,
     post: PostQualitySettings,
 }
@@ -12,8 +13,19 @@ impl RenderQualitySettings {
         anti_aliasing: AntiAliasingQualitySettings,
         post: PostQualitySettings,
     ) -> Self {
+        Self::new_with_ssr(ssao, SsrQualitySettings::balanced(), anti_aliasing, post)
+    }
+
+    /// Creates a complete renderer quality profile including screen-space reflections.
+    pub fn new_with_ssr(
+        ssao: SsaoQualitySettings,
+        ssr: SsrQualitySettings,
+        anti_aliasing: AntiAliasingQualitySettings,
+        post: PostQualitySettings,
+    ) -> Self {
         Self {
             ssao,
+            ssr,
             anti_aliasing,
             post,
         }
@@ -26,12 +38,14 @@ impl RenderQualitySettings {
             AntiAliasingQualitySettings::disabled(),
             PostQualitySettings::natural(),
         )
+        .with_ssr(SsrQualitySettings::disabled())
     }
 
     /// Returns the interactive profile used when the app does not override renderer quality.
     pub fn interactive() -> Self {
-        Self::new(
+        Self::new_with_ssr(
             SsaoQualitySettings::interactive(),
+            SsrQualitySettings::interactive(),
             AntiAliasingQualitySettings::interactive(),
             PostQualitySettings::natural(),
         )
@@ -39,8 +53,9 @@ impl RenderQualitySettings {
 
     /// Returns the balanced profile for scenes that can spend more post-process budget.
     pub fn balanced() -> Self {
-        Self::new(
+        Self::new_with_ssr(
             SsaoQualitySettings::balanced(),
+            SsrQualitySettings::balanced(),
             AntiAliasingQualitySettings::balanced(),
             PostQualitySettings::natural(),
         )
@@ -48,16 +63,28 @@ impl RenderQualitySettings {
 
     /// Returns the expensive profile used when visual inspection matters more than frame time.
     pub fn high_quality() -> Self {
-        Self::new(
+        Self::new_with_ssr(
             SsaoQualitySettings::balanced(),
+            SsrQualitySettings::high_quality(),
             AntiAliasingQualitySettings::high_quality(),
             PostQualitySettings::natural(),
         )
     }
 
+    /// Returns a copy with a different screen-space reflection profile.
+    pub fn with_ssr(mut self, ssr: SsrQualitySettings) -> Self {
+        self.ssr = ssr;
+        self
+    }
+
     /// Returns the screen-space ambient occlusion quality applied by the post pass.
     pub fn ssao(self) -> SsaoQualitySettings {
         self.ssao
+    }
+
+    /// Returns the screen-space reflection quality applied by the post pass.
+    pub fn ssr(self) -> SsrQualitySettings {
+        self.ssr
     }
 
     /// Returns the post-pass antialiasing quality applied before tone mapping.
@@ -75,6 +102,80 @@ impl Default for RenderQualitySettings {
     /// Uses the renderer's balanced quality profile for the default visual path.
     fn default() -> Self {
         Self::balanced()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SsrQualitySettings {
+    intensity: f32,
+    max_steps: u32,
+    max_distance: f32,
+    thickness: f32,
+}
+
+impl SsrQualitySettings {
+    /// Creates bounded SSR controls for the post pass ray marcher.
+    ///
+    /// `intensity` is the final blend cap, `max_steps` bounds shader work,
+    /// `max_distance` limits view-space ray length, and `thickness` controls
+    /// depth-hit tolerance.
+    pub fn new(intensity: f32, max_steps: u32, max_distance: f32, thickness: f32) -> Self {
+        Self {
+            intensity: finite_clamp(intensity, 0.0, 1.0, 0.0),
+            max_steps: max_steps.clamp(1, 96),
+            max_distance: finite_clamp(max_distance, 0.25, 160.0, 64.0),
+            thickness: finite_clamp(thickness, 0.01, 1.0, 0.14),
+        }
+    }
+
+    /// Disables SSR so the post shader can skip the reflection ray march.
+    pub fn disabled() -> Self {
+        Self::new(0.0, 1, 8.0, 0.12)
+    }
+
+    /// Returns a visible SSR profile that stays responsive during camera movement.
+    pub fn interactive() -> Self {
+        Self::new(0.60, 40, 42.0, 0.22)
+    }
+
+    /// Returns the default cinematic SSR profile used by normal windowed rendering.
+    pub fn balanced() -> Self {
+        Self::new(0.82, 72, 72.0, 0.18)
+    }
+
+    /// Returns the inspection SSR profile with longer rays and cleaner hit refinement.
+    pub fn high_quality() -> Self {
+        Self::new(0.94, 96, 104.0, 0.16)
+    }
+
+    /// Returns the strongest built-in SSR profile for still screenshots and visual checks.
+    pub fn ultra() -> Self {
+        Self::new(1.0, 96, 140.0, 0.15)
+    }
+
+    /// Returns an intentionally exaggerated SSR profile for diagnosing reflective materials.
+    pub fn debug_strong() -> Self {
+        Self::new(1.0, 96, 160.0, 0.30)
+    }
+
+    /// Returns the final reflection blend cap.
+    pub fn intensity(self) -> f32 {
+        self.intensity
+    }
+
+    /// Returns the maximum number of ray steps evaluated per reflective pixel.
+    pub fn max_steps(self) -> u32 {
+        self.max_steps
+    }
+
+    /// Returns the maximum view-space ray length.
+    pub fn max_distance(self) -> f32 {
+        self.max_distance
+    }
+
+    /// Returns the base depth tolerance used when matching ray depth to scene depth.
+    pub fn thickness(self) -> f32 {
+        self.thickness
     }
 }
 
@@ -237,6 +338,7 @@ mod tests {
         );
 
         assert_eq!(settings.ssao().sample_count(), 8);
+        assert!(settings.ssr().max_distance().is_finite());
         assert_eq!(settings.anti_aliasing().blend(), 1.0);
         assert!(settings.post().contrast().is_finite());
     }
@@ -246,6 +348,17 @@ mod tests {
         let settings = RenderQualitySettings::performance();
 
         assert_eq!(settings.ssao().intensity(), 0.0);
+        assert_eq!(settings.ssr().intensity(), 0.0);
         assert_eq!(settings.anti_aliasing().blend(), 0.0);
+    }
+
+    #[test]
+    fn ssr_settings_clamp_shader_work() {
+        let settings = SsrQualitySettings::new(5.0, 128, f32::INFINITY, -1.0);
+
+        assert_eq!(settings.intensity(), 1.0);
+        assert_eq!(settings.max_steps(), 96);
+        assert!(settings.max_distance().is_finite());
+        assert_eq!(settings.thickness(), 0.01);
     }
 }

@@ -95,8 +95,6 @@ float opaque_shadow_factor(
         );
     }
 
-    // 元の softened / inversesqrt は削除。
-    // 影の丸めは PCF 平均だけにする。
     return clamp(sum / float(count), 0.0, 1.0);
 }
 
@@ -141,8 +139,6 @@ vec3 translucent_shadow_factor(sampler2D transmittance_map, vec4 shadow_pos) {
 }
 
 float cascade_transition_width(float split) {
-    // 元: max(split * 0.08, 2.0)
-    // 遷移範囲を狭くして、2カスケード同時サンプリング領域を減らす。
     return max(split * 0.04, 1.0);
 }
 
@@ -201,7 +197,7 @@ vec3 shadow_factor(
             translucent_shadow_0,
             shadow_pos[0],
             ndotl,
-            12, // 元: 16
+            12,
             translucent_enabled
         );
     }
@@ -218,7 +214,7 @@ vec3 shadow_factor(
             translucent_shadow_0,
             shadow_pos[0],
             ndotl,
-            12, // 元: 16
+            12,
             translucent_enabled
         );
 
@@ -227,7 +223,7 @@ vec3 shadow_factor(
             translucent_shadow_1,
             shadow_pos[1],
             ndotl,
-            6, // 元: 10
+            6,
             translucent_enabled
         );
 
@@ -244,7 +240,7 @@ vec3 shadow_factor(
             translucent_shadow_1,
             shadow_pos[1],
             ndotl,
-            6, // 元: 10
+            6,
             translucent_enabled
         );
     }
@@ -261,7 +257,7 @@ vec3 shadow_factor(
             translucent_shadow_1,
             shadow_pos[1],
             ndotl,
-            6, // 元: 10
+            6,
             translucent_enabled
         );
 
@@ -270,7 +266,7 @@ vec3 shadow_factor(
             translucent_shadow_2,
             shadow_pos[2],
             ndotl,
-            4, // 元: 6
+            4,
             translucent_enabled
         );
 
@@ -282,7 +278,7 @@ vec3 shadow_factor(
         translucent_shadow_2,
         shadow_pos[2],
         ndotl,
-        4, // 元: 6
+        4,
         translucent_enabled
     );
 }

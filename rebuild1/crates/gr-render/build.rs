@@ -1,9 +1,17 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    println!("cargo:rerun-if-changed=shaders/shadow_sampling.glsl");
-    println!("cargo:rerun-if-changed=shaders/shadow_alpha.glsl");
-    println!("cargo:rerun-if-changed=shaders/pbr_lighting.glsl");
+    for include in [
+        "shaders/shadow_sampling.glsl",
+        "shaders/shadow_alpha.glsl",
+        "shaders/pbr_lighting.glsl",
+        "shaders/post_common.glsl",
+        "shaders/post_fxaa.glsl",
+        "shaders/post_ssao.glsl",
+        "shaders/post_ssr.glsl",
+    ] {
+        println!("cargo:rerun-if-changed={include}");
+    }
 
     for (source, output) in [
         ("shaders/mesh.vert", "mesh.vert.spv"),
