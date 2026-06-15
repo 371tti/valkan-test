@@ -6,15 +6,20 @@ const SCENE_PASS: &str = "scene";
 const POST_PASS: &str = "post";
 const FRAMEBUFFER_READBACK_PASS: &str = "framebuffer_readback";
 const PRESENT_PASS: &str = "present";
-const SHADOW_PASSES: [&str; SHADOW_CASCADE_COUNT] =
-    ["shadow_cascade_0", "shadow_cascade_1", "shadow_cascade_2"];
+const SHADOW_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
+    "shadow_cascade_0",
+    "shadow_cascade_1",
+    "shadow_cascade_2",
+    "shadow_cascade_3",
+];
 const TRANSLUCENT_SHADOW_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
     "translucent_shadow_0",
     "translucent_shadow_1",
     "translucent_shadow_2",
+    "translucent_shadow_3",
 ];
 
-pub(crate) const SHADOW_CASCADE_COUNT: usize = 3;
+pub(crate) const SHADOW_CASCADE_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum GraphResource {
@@ -22,9 +27,11 @@ pub(crate) enum GraphResource {
     ShadowCascade0,
     ShadowCascade1,
     ShadowCascade2,
+    ShadowCascade3,
     TranslucentShadow0,
     TranslucentShadow1,
     TranslucentShadow2,
+    TranslucentShadow3,
     SceneColor,
     SceneNormalRoughness,
     SceneTransparentNormalRoughness,
@@ -39,9 +46,11 @@ impl GraphResource {
             Self::ShadowCascade0 => "shadow_cascade_0",
             Self::ShadowCascade1 => "shadow_cascade_1",
             Self::ShadowCascade2 => "shadow_cascade_2",
+            Self::ShadowCascade3 => "shadow_cascade_3",
             Self::TranslucentShadow0 => "translucent_shadow_0",
             Self::TranslucentShadow1 => "translucent_shadow_1",
             Self::TranslucentShadow2 => "translucent_shadow_2",
+            Self::TranslucentShadow3 => "translucent_shadow_3",
             Self::SceneColor => "scene_color",
             Self::SceneNormalRoughness => "scene_normal_roughness",
             Self::SceneTransparentNormalRoughness => "scene_transparent_normal_roughness",
@@ -54,12 +63,14 @@ pub(crate) const SHADOW_CASCADE_RESOURCES: [GraphResource; SHADOW_CASCADE_COUNT]
     GraphResource::ShadowCascade0,
     GraphResource::ShadowCascade1,
     GraphResource::ShadowCascade2,
+    GraphResource::ShadowCascade3,
 ];
 
 pub(crate) const TRANSLUCENT_SHADOW_RESOURCES: [GraphResource; SHADOW_CASCADE_COUNT] = [
     GraphResource::TranslucentShadow0,
     GraphResource::TranslucentShadow1,
     GraphResource::TranslucentShadow2,
+    GraphResource::TranslucentShadow3,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1208,22 +1219,13 @@ mod tests {
             .iter()
             .map(GraphPass::name)
             .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        expected.extend(SHADOW_PASSES);
+        expected.extend(TRANSLUCENT_SHADOW_PASSES);
+        expected.extend([SCENE_PASS, POST_PASS, PRESENT_PASS]);
 
-        assert_eq!(
-            names,
-            [
-                SHADOW_PASSES[0],
-                SHADOW_PASSES[1],
-                SHADOW_PASSES[2],
-                TRANSLUCENT_SHADOW_PASSES[0],
-                TRANSLUCENT_SHADOW_PASSES[1],
-                TRANSLUCENT_SHADOW_PASSES[2],
-                SCENE_PASS,
-                POST_PASS,
-                PRESENT_PASS
-            ]
-        );
-        assert_eq!(graph.resource_count(), 11);
+        assert_eq!(names, expected);
+        assert_eq!(graph.resource_count(), 13);
         assert!(graph.transition_count() >= 10);
         assert!(graph.barrier_count() >= 6);
     }
@@ -1371,19 +1373,12 @@ mod tests {
             .iter()
             .map(GraphPass::name)
             .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        expected.extend(SHADOW_PASSES);
+        expected.extend([SCENE_PASS, POST_PASS, PRESENT_PASS]);
 
-        assert_eq!(
-            names,
-            [
-                SHADOW_PASSES[0],
-                SHADOW_PASSES[1],
-                SHADOW_PASSES[2],
-                SCENE_PASS,
-                POST_PASS,
-                PRESENT_PASS
-            ]
-        );
-        assert_eq!(graph.resource_count(), 8);
+        assert_eq!(names, expected);
+        assert_eq!(graph.resource_count(), 9);
         assert_eq!(
             graph.final_state_for(GraphResource::TranslucentShadow0),
             None
@@ -1456,9 +1451,11 @@ mod tests {
             GraphResource::ShadowCascade0
                 | GraphResource::ShadowCascade1
                 | GraphResource::ShadowCascade2
+                | GraphResource::ShadowCascade3
                 | GraphResource::TranslucentShadow0
                 | GraphResource::TranslucentShadow1
                 | GraphResource::TranslucentShadow2
+                | GraphResource::TranslucentShadow3
         )));
     }
 
@@ -1486,22 +1483,17 @@ mod tests {
             .iter()
             .map(GraphPass::name)
             .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        expected.extend(SHADOW_PASSES);
+        expected.extend(TRANSLUCENT_SHADOW_PASSES);
+        expected.extend([
+            SCENE_PASS,
+            POST_PASS,
+            FRAMEBUFFER_READBACK_PASS,
+            PRESENT_PASS,
+        ]);
 
-        assert_eq!(
-            names,
-            [
-                SHADOW_PASSES[0],
-                SHADOW_PASSES[1],
-                SHADOW_PASSES[2],
-                TRANSLUCENT_SHADOW_PASSES[0],
-                TRANSLUCENT_SHADOW_PASSES[1],
-                TRANSLUCENT_SHADOW_PASSES[2],
-                SCENE_PASS,
-                POST_PASS,
-                FRAMEBUFFER_READBACK_PASS,
-                PRESENT_PASS
-            ]
-        );
+        assert_eq!(names, expected);
         assert!(graph.barriers().iter().any(|barrier| {
             barrier.resource() == GraphResource::SwapchainImage
                 && barrier.from() == ResourceState::ColorAttachment

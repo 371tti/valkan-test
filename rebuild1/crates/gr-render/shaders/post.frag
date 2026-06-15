@@ -16,6 +16,7 @@ layout(push_constant) uniform PostParams {
     vec4 ssao;
     vec4 ssr;
     vec4 aa;
+    vec4 shadow;
     float exposure;
     float contrast;
     float saturation;
@@ -30,6 +31,7 @@ layout(push_constant) uniform PostParams {
 void main() {
     bool ssao_enabled = params.ssao.x > 0.0;
     bool ssr_enabled = params.ssr.x > 0.0 && params.ssr.y >= 1.0;
+    bool shadow_softening_enabled = params.shadow.x > 0.0 && params.shadow.y > 0.0;
 
     SurfaceMaterial material = SurfaceMaterial(
         vec3(0.0, 0.0, 1.0),
@@ -40,12 +42,16 @@ void main() {
     );
     bool material_valid = false;
 
-    if (ssao_enabled || ssr_enabled) {
+    if (ssao_enabled || ssr_enabled || shadow_softening_enabled) {
         material = surface_material(frag_uv);
         material_valid = true;
     }
 
     vec3 color = texture(scene_color, frag_uv).rgb;
+
+    if (shadow_softening_enabled && material_valid) {
+        color = shadow_softened_scene_color(frag_uv, color, material);
+    }
 
     color = high_quality_fxaa_scene_color(
         frag_uv,

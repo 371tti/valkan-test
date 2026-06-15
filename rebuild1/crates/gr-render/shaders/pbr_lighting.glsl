@@ -83,12 +83,17 @@ vec3 pbr_shadow(float ndotl) {
         shadow_cascade_0,
         shadow_cascade_1,
         shadow_cascade_2,
+        shadow_cascade_3,
         translucent_shadow_0,
         translucent_shadow_1,
         translucent_shadow_2,
+        translucent_shadow_3,
         frag_shadow_pos,
         camera_distance_sq,
         frame_camera.shadow_cascade_splits,
+        frame_camera.shadow_cascade_texel_world,
+        frame_camera.shadow_cascade_depth_span,
+        frame_camera.light_color.w,
         ndotl
     );
 }

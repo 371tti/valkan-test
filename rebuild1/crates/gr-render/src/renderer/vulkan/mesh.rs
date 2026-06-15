@@ -86,7 +86,8 @@ struct MeshPipelineVariants {
 pub(super) struct MeshPassResources {
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
-    sampler: vk::Sampler,
+    shadow_sampler: vk::Sampler,
+    transmittance_sampler: vk::Sampler,
 }
 
 #[derive(Clone, Copy)]
@@ -638,11 +639,19 @@ impl MeshPassResources {
         shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
         translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     ) -> Result<Self, VulkanError> {
-        let sampler = create_pass_sampler(device)?;
+        let shadow_sampler = create_pass_sampler(device, vk::Filter::NEAREST)?;
+        let transmittance_sampler = match create_pass_sampler(device, vk::Filter::LINEAR) {
+            Ok(sampler) => sampler,
+            Err(error) => {
+                destroy_sampler(device, shadow_sampler);
+                return Err(error);
+            }
+        };
         let descriptor_pool = match create_pass_descriptor_pool(device) {
             Ok(pool) => pool,
             Err(error) => {
-                destroy_sampler(device, sampler);
+                destroy_sampler(device, transmittance_sampler);
+                destroy_sampler(device, shadow_sampler);
                 return Err(error);
             }
         };
@@ -651,7 +660,8 @@ impl MeshPassResources {
                 Ok(set) => set,
                 Err(error) => {
                     destroy_descriptor_pool(device, descriptor_pool);
-                    destroy_sampler(device, sampler);
+                    destroy_sampler(device, transmittance_sampler);
+                    destroy_sampler(device, shadow_sampler);
                     return Err(error);
                 }
             };
@@ -659,7 +669,8 @@ impl MeshPassResources {
         update_pass_descriptor_set(
             device,
             descriptor_set,
-            sampler,
+            shadow_sampler,
+            transmittance_sampler,
             shadow_views,
             translucent_shadow_views,
         );
@@ -667,7 +678,8 @@ impl MeshPassResources {
         Ok(Self {
             descriptor_pool,
             descriptor_set,
-            sampler,
+            shadow_sampler,
+            transmittance_sampler,
         })
     }
 
@@ -679,7 +691,8 @@ impl MeshPassResources {
     /// Destroys scene-pass descriptor resources before graph target image views are released.
     pub(super) fn destroy(self, device: &Device) {
         destroy_descriptor_pool(device, self.descriptor_pool);
-        destroy_sampler(device, self.sampler);
+        destroy_sampler(device, self.transmittance_sampler);
+        destroy_sampler(device, self.shadow_sampler);
     }
 }
 
@@ -965,6 +978,8 @@ pub(super) struct MeshFrameUniform {
     pub(super) view: [f32; 16],
     pub(super) shadow_view_proj: [[f32; 16]; SHADOW_CASCADE_COUNT],
     pub(super) shadow_cascade_splits: [f32; 4],
+    pub(super) shadow_cascade_texel_world: [f32; 4],
+    pub(super) shadow_cascade_depth_span: [f32; 4],
     pub(super) camera_pos: [f32; 4],
     pub(super) light_dir: [f32; 4],
     pub(super) light_color: [f32; 4],
@@ -1109,10 +1124,10 @@ fn update_frame_descriptor_sets(
 }
 
 /// Creates a sampler for graph target reads performed by mesh scene shaders.
-fn create_pass_sampler(device: &Device) -> Result<vk::Sampler, VulkanError> {
+fn create_pass_sampler(device: &Device, filter: vk::Filter) -> Result<vk::Sampler, VulkanError> {
     let create_info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::LINEAR)
-        .min_filter(vk::Filter::LINEAR)
+        .mag_filter(filter)
+        .min_filter(filter)
         .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
         .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
@@ -1127,14 +1142,13 @@ fn create_pass_sampler(device: &Device) -> Result<vk::Sampler, VulkanError> {
 
 /// Returns pass descriptor bindings in cascade order for opaque then translucent shadow maps.
 fn pass_shadow_bindings() -> [u32; SHADOW_CASCADE_COUNT * 2] {
-    [
-        shader_interface::PASS_SHADOW_CASCADE_BINDINGS[0],
-        shader_interface::PASS_SHADOW_CASCADE_BINDINGS[1],
-        shader_interface::PASS_SHADOW_CASCADE_BINDINGS[2],
-        shader_interface::PASS_TRANSLUCENT_SHADOW_BINDINGS[0],
-        shader_interface::PASS_TRANSLUCENT_SHADOW_BINDINGS[1],
-        shader_interface::PASS_TRANSLUCENT_SHADOW_BINDINGS[2],
-    ]
+    std::array::from_fn(|index| {
+        if index < SHADOW_CASCADE_COUNT {
+            shader_interface::PASS_SHADOW_CASCADE_BINDINGS[index]
+        } else {
+            shader_interface::PASS_TRANSLUCENT_SHADOW_BINDINGS[index - SHADOW_CASCADE_COUNT]
+        }
+    })
 }
 
 /// Returns the image views written into pass descriptors in binding order.
@@ -1142,14 +1156,13 @@ fn pass_shadow_views(
     shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
 ) -> [vk::ImageView; SHADOW_CASCADE_COUNT * 2] {
-    [
-        shadow_views[0],
-        shadow_views[1],
-        shadow_views[2],
-        translucent_shadow_views[0],
-        translucent_shadow_views[1],
-        translucent_shadow_views[2],
-    ]
+    std::array::from_fn(|index| {
+        if index < SHADOW_CASCADE_COUNT {
+            shadow_views[index]
+        } else {
+            translucent_shadow_views[index - SHADOW_CASCADE_COUNT]
+        }
+    })
 }
 
 /// Views a single `u32` as push-constant bytes for the duration of one Vulkan call.
@@ -1193,18 +1206,26 @@ fn allocate_pass_descriptor_set(
 fn update_pass_descriptor_set(
     device: &Device,
     descriptor_set: vk::DescriptorSet,
-    sampler: vk::Sampler,
+    shadow_sampler: vk::Sampler,
+    transmittance_sampler: vk::Sampler,
     shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
 ) {
     let image_infos = pass_shadow_views(shadow_views, translucent_shadow_views)
-        .map(|view| {
+        .into_iter()
+        .enumerate()
+        .map(|(index, view)| {
+            let sampler = if index < SHADOW_CASCADE_COUNT {
+                shadow_sampler
+            } else {
+                transmittance_sampler
+            };
             vk::DescriptorImageInfo::default()
                 .sampler(sampler)
                 .image_view(view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         })
-        .to_vec();
+        .collect::<Vec<_>>();
     let writes = pass_shadow_bindings()
         .iter()
         .zip(image_infos.iter())
@@ -1229,7 +1250,9 @@ fn identity_frame_uniform() -> MeshFrameUniform {
         view_proj: identity_mat4(),
         view: identity_mat4(),
         shadow_view_proj: [identity_mat4(); SHADOW_CASCADE_COUNT],
-        shadow_cascade_splits: [24.0, 80.0, 220.0, 0.0],
+        shadow_cascade_splits: [20.0, 52.0, 128.0, 320.0],
+        shadow_cascade_texel_world: [1.0, 1.0, 1.0, 1.0],
+        shadow_cascade_depth_span: [1.0, 1.0, 1.0, 1.0],
         camera_pos: [0.0, 0.0, 0.0, 1.0],
         light_dir: [0.3577709, -0.8944272, 0.26832816, 0.0],
         light_color: [3.00, 2.65, 2.15, 0.0],

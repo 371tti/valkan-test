@@ -1,21 +1,6 @@
 #ifndef REBUILD1_POST_SSR_GLSL
 #define REBUILD1_POST_SSR_GLSL
 
-vec2 project_view_position(vec3 position) {
-    float inv_depth = rcp_safe(-position.z, 0.0001);
-    vec2 ndc = vec2(
-        position.x * params.camera.x * inv_depth,
-        position.y * params.camera.y * inv_depth
-    );
-
-    return ndc * 0.5 + 0.5;
-}
-
-float screen_edge_fade(vec2 uv) {
-    vec2 edge = min(uv, vec2(1.0) - uv);
-    return smoothstep(0.02, 0.18, min(edge.x, edge.y));
-}
-
 vec2 normalize2_safe(vec2 value) {
     return value * inversesqrt(max(dot(value, value), 0.000001));
 }
@@ -53,16 +38,14 @@ vec3 ssr_reflection_color(
     return mix(center, glossy, blur);
 }
 
-float ssr_depth_delta(vec2 uv, vec3 ray_position, out float thickness) {
-    float hit_depth = depth_at_ssr(uv);
-
+float ssr_depth_delta(float hit_depth, vec3 ray_position, out float thickness) {
     if (hit_depth >= 0.9999) {
         thickness = 0.0;
         return -100000.0;
     }
 
     float ray_view_depth = -ray_position.z;
-    float surface_view_depth = -view_position(uv, hit_depth).z;
+    float surface_view_depth = linear_depth(hit_depth);
     thickness = max(params.ssr.w, 0.01) +
         surface_view_depth * 0.006 +
         max(ray_view_depth - surface_view_depth, 0.0) * 0.18;
@@ -98,8 +81,9 @@ vec2 refined_ssr_hit_uv(
             continue;
         }
 
+        float hit_depth = depth_at_ssr(mid_uv);
         float thickness;
-        float delta = ssr_depth_delta(mid_uv, mid_position, thickness);
+        float delta = ssr_depth_delta(hit_depth, mid_position, thickness);
 
         if (delta >= -thickness * 0.35) {
             high = mid;
@@ -164,6 +148,8 @@ vec4 screen_space_reflection(vec2 uv, SurfaceMaterial material, float ao) {
     float previous_delta = -100000.0;
     vec2 previous_uv = uv;
     bool previous_has_depth = false;
+    float origin_edge_fade = screen_edge_fade(uv);
+    float pixel_scale = rcp_safe(length(params.aa.xy), 0.000001);
 
     for (int i = 0; i < 96; i++) {
         if (i >= max_steps) {
@@ -195,7 +181,7 @@ vec4 screen_space_reflection(vec2 uv, SurfaceMaterial material, float ao) {
         }
 
         float thickness;
-        float depth_delta = ssr_depth_delta(hit_uv, ray_position, thickness);
+        float depth_delta = ssr_depth_delta(hit_depth, ray_position, thickness);
         float negative_slack = mix(base_thickness * 0.35, thickness * 0.42, water_weight);
         bool crossed_surface = previous_has_depth
             ? previous_delta < -negative_slack && depth_delta >= -negative_slack
@@ -224,7 +210,7 @@ vec4 screen_space_reflection(vec2 uv, SurfaceMaterial material, float ao) {
             );
             SurfaceMaterial hit_material = surface_material(refined_uv);
             float normal_fade = saturate(dot(hit_material.normal, -ray_dir) * 0.5 + 0.5);
-            float pixel_span = length((refined_uv - uv) * rcp_safe(length(params.aa.xy), 0.000001));
+            float pixel_span = length((refined_uv - uv) * pixel_scale);
             float close_self_fade = smoothstep(2.0, 10.0, pixel_span);
             float water_self_fade = smoothstep(0.45, 3.0, pixel_span);
             float self_fade = mix(close_self_fade, water_self_fade, water_weight);
@@ -242,7 +228,7 @@ vec4 screen_space_reflection(vec2 uv, SurfaceMaterial material, float ao) {
             float highlight_lift = 1.0 + saturate(luminance_of(hit_color) - 0.6) * 0.42;
             float weight = params.ssr.x *
                 material_weight *
-                screen_edge_fade(uv) *
+                origin_edge_fade *
                 screen_edge_fade(refined_uv) *
                 distance_fade *
                 hit_fade *

@@ -3,8 +3,8 @@
 
 layout(location = 1) in vec3 frag_normal;
 layout(location = 3) in vec4 frag_color;
-layout(location = 5) in vec4 frag_shadow_pos[3];
-layout(location = 8) in vec3 frag_world_pos;
+layout(location = 5) in vec4 frag_shadow_pos[4];
+layout(location = 9) in vec3 frag_world_pos;
 layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_normal_roughness;
 layout(location = 2) out vec4 out_transparent_normal_roughness;
@@ -12,8 +12,10 @@ layout(location = 2) out vec4 out_transparent_normal_roughness;
 layout(set = 0, binding = 0) uniform FrameCamera {
     mat4 view_proj;
     mat4 view;
-    mat4 shadow_view_proj[3];
+    mat4 shadow_view_proj[4];
     vec4 shadow_cascade_splits;
+    vec4 shadow_cascade_texel_world;
+    vec4 shadow_cascade_depth_span;
     vec4 camera_pos;
     vec4 light_dir;
     vec4 light_color;
@@ -30,9 +32,11 @@ layout(set = 1, binding = 0) uniform MaterialParams {
 layout(set = 2, binding = 0) uniform sampler2D shadow_cascade_0;
 layout(set = 2, binding = 1) uniform sampler2D shadow_cascade_1;
 layout(set = 2, binding = 2) uniform sampler2D shadow_cascade_2;
-layout(set = 2, binding = 3) uniform sampler2D translucent_shadow_0;
-layout(set = 2, binding = 4) uniform sampler2D translucent_shadow_1;
-layout(set = 2, binding = 5) uniform sampler2D translucent_shadow_2;
+layout(set = 2, binding = 3) uniform sampler2D shadow_cascade_3;
+layout(set = 2, binding = 4) uniform sampler2D translucent_shadow_0;
+layout(set = 2, binding = 5) uniform sampler2D translucent_shadow_1;
+layout(set = 2, binding = 6) uniform sampler2D translucent_shadow_2;
+layout(set = 2, binding = 7) uniform sampler2D translucent_shadow_3;
 
 #include "shadow_sampling.glsl"
 #include "pbr_lighting.glsl"

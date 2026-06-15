@@ -13,7 +13,7 @@ use crate::renderer::graph::{
     FrameGraphInitialStates, GraphResource, ResourceState, SHADOW_CASCADE_COUNT,
     SHADOW_CASCADE_RESOURCES, TRANSLUCENT_SHADOW_RESOURCES,
 };
-use crate::renderer::shadow_map_size;
+use crate::renderer::shadow_cascade_size;
 
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 
@@ -31,7 +31,6 @@ const SCENE_TRANSPARENT_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R16G16
 
 const TRANSLUCENT_SHADOW_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const FALLBACK_SHADOW_TRANSMITTANCE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-const MIN_FAR_SHADOW_MAP_SIZE: u32 = 512;
 
 pub(super) struct VulkanSwapchain {
     pub(super) handle: vk::SwapchainKHR,
@@ -534,9 +533,10 @@ impl VulkanDevice {
 
         tracing::info!(
             cascade_count = SHADOW_CASCADE_COUNT,
-            near_size = build.cascades[0].extent.width(),
-            mid_size = build.cascades[1].extent.width(),
-            far_size = build.cascades[2].extent.width(),
+            cascade_0_size = build.cascades[0].extent.width(),
+            cascade_1_size = build.cascades[1].extent.width(),
+            cascade_2_size = build.cascades[2].extent.width(),
+            cascade_3_size = build.cascades[3].extent.width(),
             translucent_format = ?TRANSLUCENT_SHADOW_FORMAT,
             "created fixed Vulkan shadow resources"
         );
@@ -961,9 +961,11 @@ impl VulkanSwapchain {
             GraphResource::ShadowCascade0
             | GraphResource::ShadowCascade1
             | GraphResource::ShadowCascade2
+            | GraphResource::ShadowCascade3
             | GraphResource::TranslucentShadow0
             | GraphResource::TranslucentShadow1
-            | GraphResource::TranslucentShadow2 => Err(VulkanError::GraphCompile(format!(
+            | GraphResource::TranslucentShadow2
+            | GraphResource::TranslucentShadow3 => Err(VulkanError::GraphCompile(format!(
                 "shadow graph resource {} is not owned by the swapchain",
                 resource.name()
             ))),
@@ -1926,12 +1928,7 @@ fn create_depth_target(
 }
 
 fn shadow_cascade_extent(cascade_index: usize) -> NonZeroExtent {
-    let base = shadow_map_size();
-    let size = match cascade_index {
-        0 => base,
-        1 => (base / 2).max(1024),
-        _ => (base / 4).max(MIN_FAR_SHADOW_MAP_SIZE),
-    };
+    let size = shadow_cascade_size(cascade_index);
     NonZeroExtent::new(size, size).expect("shadow map extent must be non-zero")
 }
 

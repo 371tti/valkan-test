@@ -19,10 +19,10 @@ pub mod prelude {
         MaterialDescriptor, MaterialHandle, MaterialTextureSlot, MeshHandle, MessageEnvelope,
         NativeSurfaceHandle, NonZeroExtent, PostQualitySettings, RenderItemPacket,
         RenderQualitySettings, RendererCommand, RendererEndpoint, RendererEvent,
-        RendererEventEnvelope, RequestId, SceneBounds, SceneHandle, SnapshotError,
-        SsaoQualitySettings, SsrQualitySettings, SurfaceDescriptor, SurfaceGeneration, SurfaceId,
-        TextureDescriptor, TextureHandle, TransportError, ViewId, ViewPacket, Win32SurfaceHandle,
-        WindowId, renderer_transport,
+        RendererEventEnvelope, RequestId, SceneBounds, SceneHandle, ShadowSofteningQualitySettings,
+        SnapshotError, SsaoQualitySettings, SsrQualitySettings, SurfaceDescriptor,
+        SurfaceGeneration, SurfaceId, TextureDescriptor, TextureHandle, TransportError, ViewId,
+        ViewPacket, Win32SurfaceHandle, WindowId, renderer_transport,
     };
     pub use crate::renderer::{
         NullRendererBackend, RendererBackend, RendererError, RendererResult, RendererThread,

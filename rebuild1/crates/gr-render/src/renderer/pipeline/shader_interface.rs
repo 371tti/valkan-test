@@ -12,8 +12,8 @@ pub(crate) const MATERIAL_NORMAL_BINDING: u32 = 2;
 pub(crate) const MATERIAL_METALLIC_ROUGHNESS_BINDING: u32 = 3;
 pub(crate) const MATERIAL_OCCLUSION_BINDING: u32 = 4;
 pub(crate) const MATERIAL_EMISSIVE_BINDING: u32 = 5;
-pub(crate) const PASS_SHADOW_CASCADE_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [0, 1, 2];
-pub(crate) const PASS_TRANSLUCENT_SHADOW_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [3, 4, 5];
+pub(crate) const PASS_SHADOW_CASCADE_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [0, 1, 2, 3];
+pub(crate) const PASS_TRANSLUCENT_SHADOW_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [4, 5, 6, 7];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ShaderBinding {
@@ -75,6 +75,11 @@ pub(crate) const MESH_SHADER_BINDINGS: &[ShaderBinding] = &[
     },
     ShaderBinding {
         set: PASS_SET,
+        binding: PASS_SHADOW_CASCADE_BINDINGS[3],
+        name: "shadow_cascade_3",
+    },
+    ShaderBinding {
+        set: PASS_SET,
         binding: PASS_TRANSLUCENT_SHADOW_BINDINGS[0],
         name: "translucent_shadow_0",
     },
@@ -87,6 +92,11 @@ pub(crate) const MESH_SHADER_BINDINGS: &[ShaderBinding] = &[
         set: PASS_SET,
         binding: PASS_TRANSLUCENT_SHADOW_BINDINGS[2],
         name: "translucent_shadow_2",
+    },
+    ShaderBinding {
+        set: PASS_SET,
+        binding: PASS_TRANSLUCENT_SHADOW_BINDINGS[3],
+        name: "translucent_shadow_3",
     },
 ];
 
@@ -109,14 +119,9 @@ pub(crate) fn validate_mesh_interface() -> Result<(), &'static str> {
     if bindings.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("material texture bindings must be unique");
     }
-    let mut pass_bindings = [
-        PASS_SHADOW_CASCADE_BINDINGS[0],
-        PASS_SHADOW_CASCADE_BINDINGS[1],
-        PASS_SHADOW_CASCADE_BINDINGS[2],
-        PASS_TRANSLUCENT_SHADOW_BINDINGS[0],
-        PASS_TRANSLUCENT_SHADOW_BINDINGS[1],
-        PASS_TRANSLUCENT_SHADOW_BINDINGS[2],
-    ];
+    let mut pass_bindings = Vec::with_capacity(SHADOW_CASCADE_COUNT * 2);
+    pass_bindings.extend(PASS_SHADOW_CASCADE_BINDINGS);
+    pass_bindings.extend(PASS_TRANSLUCENT_SHADOW_BINDINGS);
     pass_bindings.sort_unstable();
     if pass_bindings.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("pass shadow bindings must be unique");

@@ -35,6 +35,7 @@ use super::{RendererBackend, RendererResult, assets::GpuAssetStore};
 
 const APP_NAME: &CStr = c"rebuild1";
 const ENGINE_NAME: &CStr = c"rebuild1";
+const DEFAULT_DIRECTIONAL_LIGHT_DIR: [f32; 3] = [0.45, -1.0, 0.25];
 
 #[derive(Debug, Error)]
 pub enum VulkanError {
@@ -748,6 +749,8 @@ pub(super) struct ShadowFrameSignature {
 pub(super) struct ShadowFrameData {
     pub(super) view_proj: [[f32; 16]; crate::renderer::graph::SHADOW_CASCADE_COUNT],
     pub(super) splits: [f32; 4],
+    pub(super) texel_world: [f32; 4],
+    pub(super) depth_span: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -1,12 +1,11 @@
 #ifndef REBUILD1_POST_FXAA_GLSL
 #define REBUILD1_POST_FXAA_GLSL
 
-float depth_edge_from_depths(float center_depth, float sample_depth) {
+float depth_edge_from_depths(float center_depth, float center_z, float sample_depth) {
     if (center_depth >= 0.9999 && sample_depth >= 0.9999) {
         return 0.0;
     }
 
-    float center_z = linear_depth(center_depth);
     float sample_z = linear_depth(sample_depth);
 
     float scale = max(min(center_z, sample_z) * 0.018, 0.015);
@@ -75,11 +74,12 @@ vec3 high_quality_fxaa_scene_color(
         float depth_s = depth_at(uv_s);
         float depth_w = depth_at(uv_w);
         float depth_e = depth_at(uv_e);
+        float center_z = linear_depth(material.source_depth);
 
-        float depth_edge_n = depth_edge_from_depths(material.source_depth, depth_n);
-        float depth_edge_s = depth_edge_from_depths(material.source_depth, depth_s);
-        float depth_edge_w = depth_edge_from_depths(material.source_depth, depth_w);
-        float depth_edge_e = depth_edge_from_depths(material.source_depth, depth_e);
+        float depth_edge_n = depth_edge_from_depths(material.source_depth, center_z, depth_n);
+        float depth_edge_s = depth_edge_from_depths(material.source_depth, center_z, depth_s);
+        float depth_edge_w = depth_edge_from_depths(material.source_depth, center_z, depth_w);
+        float depth_edge_e = depth_edge_from_depths(material.source_depth, center_z, depth_e);
 
         geometry_horizontal = max(depth_edge_n, depth_edge_s);
         geometry_vertical = max(depth_edge_w, depth_edge_e);
@@ -119,7 +119,7 @@ vec3 high_quality_fxaa_scene_color(
             max(normal_edge_w, normal_edge_e)
         );
 
-        edge_signal = max(edge_signal, max(depth_signal, normal_signal) * 0.32);
+        edge_signal = max(edge_signal, max(depth_signal, normal_signal) * 0.50);
     }
 
     if (edge_signal <= params.aa.z) {

@@ -39,6 +39,24 @@ pub(crate) fn shadow_map_size() -> u32 {
     })
 }
 
+/// Returns the per-cascade shadow-map edge length for a smoother CSM quality curve.
+pub(crate) fn shadow_cascade_size(cascade_index: usize) -> u32 {
+    let base = shadow_map_size();
+    let scaled = match cascade_index {
+        0 => base,
+        1 => base.saturating_mul(3) / 4,
+        2 => base / 2,
+        _ => base.saturating_mul(3) / 8,
+    };
+    let minimum = match cascade_index {
+        0 | 1 => 1024,
+        2 => 768,
+        _ => 512,
+    };
+
+    scaled.max(minimum).min(base)
+}
+
 pub type RendererResult = Result<(), RendererError>;
 
 #[derive(Debug, Error)]

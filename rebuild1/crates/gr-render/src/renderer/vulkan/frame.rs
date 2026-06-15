@@ -8,7 +8,7 @@ use crate::{
             BarrierLocation, FrameGraphPlan, GraphPass, PassOutput, ResourceBarrier, ResourceState,
             SHADOW_CASCADE_COUNT,
         },
-        shadow_map_size,
+        shadow_cascade_size,
     },
 };
 
@@ -26,12 +26,11 @@ use super::{
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.015, 0.018, 0.026, 1.0];
 const DEFAULT_AMBIENT_COLOR: [f32; 4] = [0.014, 0.017, 0.024, 0.55];
-const NEAR_SHADOW_CASCADE_END: f32 = 12.0;
-const MID_SHADOW_CASCADE_END: f32 = 64.0;
+const SHADOW_SPLIT_LAMBDA: f32 = 0.78;
+const SHADOW_SPLIT_NEAR_FLOOR: f32 = 1.0;
 const SHADOW_RADIUS_PADDING: f32 = 1.04;
 const SHADOW_MIN_RADIUS: f32 = 4.0;
 const SHADOW_DEPTH_PADDING: f32 = 24.0;
-const MIN_FAR_SHADOW_MAP_SIZE: u32 = 512;
 const SHADOW_SIGNATURE_POSITION_STEP: f32 = 0.45;
 const SHADOW_SIGNATURE_DIRECTION_STEP: f32 = 0.012;
 const SHADOW_SIGNATURE_FOV_STEP: f32 = 0.010;
@@ -1133,17 +1132,19 @@ fn shadow_frame_data(
             1.0
         };
         let camera = active_camera(snapshot);
-        let light_dir = normalize_or([0.45, -1.0, 0.25], [0.0, -1.0, 0.0]);
-        let mut splits = shadow_cascade_splits(camera);
-        splits[3] = if features.has_translucent_shadow_casters {
-            1.0
-        } else {
-            0.0
-        };
+        let light_dir = normalize_or(super::DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
+        let splits = shadow_cascade_splits(camera);
 
+        let projections = shadow_view_projections(camera, aspect, light_dir);
         ShadowFrameData {
-            view_proj: shadow_view_projections(camera, aspect, light_dir),
+            view_proj: std::array::from_fn(|index| projections[index].view_projection),
             splits,
+            texel_world: shadow_cascade_metric_vec4(&projections, |projection| {
+                projection.texel_world
+            }),
+            depth_span: shadow_cascade_metric_vec4(&projections, |projection| {
+                projection.depth_span
+            }),
         }
     })
 }
@@ -1227,7 +1228,7 @@ fn mesh_frame_uniform_for_frame(
         .map(|light| light.intensity)
         .unwrap_or(1.0)
         .max(0.0);
-    let light_dir = normalize_or([0.45, -1.0, 0.25], [0.0, -1.0, 0.0]);
+    let light_dir = normalize_or(super::DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
     let shadow_data = shadow_data.unwrap_or_else(disabled_shadow_frame_data);
 
     MeshFrameUniform {
@@ -1235,6 +1236,8 @@ fn mesh_frame_uniform_for_frame(
         view: look_at_rh(camera.eye, camera.target, camera.up),
         shadow_view_proj: shadow_data.view_proj,
         shadow_cascade_splits: shadow_data.splits,
+        shadow_cascade_texel_world: shadow_data.texel_world,
+        shadow_cascade_depth_span: shadow_data.depth_span,
         camera_pos: [camera.eye[0], camera.eye[1], camera.eye[2], 1.0],
         light_dir: [
             light_dir[0],
@@ -1250,7 +1253,11 @@ fn mesh_frame_uniform_for_frame(
             3.00 * light_intensity,
             2.65 * light_intensity,
             2.15 * light_intensity,
-            0.0,
+            if features.has_translucent_shadow_casters {
+                1.0
+            } else {
+                0.0
+            },
         ],
         ambient_color: DEFAULT_AMBIENT_COLOR,
     }
@@ -1260,8 +1267,29 @@ fn mesh_frame_uniform_for_frame(
 fn disabled_shadow_frame_data() -> ShadowFrameData {
     ShadowFrameData {
         view_proj: [identity_mat4(); SHADOW_CASCADE_COUNT],
-        splits: [24.0, 80.0, 220.0, 0.0],
+        splits: [20.0, 52.0, 128.0, 320.0],
+        texel_world: [1.0, 1.0, 1.0, 1.0],
+        depth_span: [1.0, 1.0, 1.0, 1.0],
     }
+}
+
+#[derive(Clone, Copy)]
+struct ShadowCascadeProjection {
+    view_projection: [f32; 16],
+    texel_world: f32,
+    depth_span: f32,
+}
+
+/// Packs cascade metrics into the vec4 layout consumed by mesh shaders.
+fn shadow_cascade_metric_vec4(
+    projections: &[ShadowCascadeProjection; SHADOW_CASCADE_COUNT],
+    value: impl Fn(ShadowCascadeProjection) -> f32,
+) -> [f32; 4] {
+    let mut output = [0.0; 4];
+    for (index, projection) in projections.iter().copied().enumerate() {
+        output[index] = value(projection);
+    }
+    output
 }
 
 /// Returns an identity matrix for disabled shadow sampling state.
@@ -1276,13 +1304,13 @@ fn shadow_view_projections(
     camera: CameraSnapshot,
     aspect: f32,
     light_dir: [f32; 3],
-) -> [[f32; 16]; SHADOW_CASCADE_COUNT] {
+) -> [ShadowCascadeProjection; SHADOW_CASCADE_COUNT] {
     let splits = shadow_cascade_splits(camera);
     let mut cascade_near = camera.near.max(0.03);
 
     std::array::from_fn(|cascade_index| {
         let cascade_far = splits[cascade_index].max(cascade_near + 1.0);
-        let view_projection = shadow_view_projection(
+        let projection = shadow_view_projection(
             camera,
             aspect,
             light_dir,
@@ -1291,7 +1319,7 @@ fn shadow_view_projections(
             cascade_index,
         );
         cascade_near = cascade_far;
-        view_projection
+        projection
     })
 }
 
@@ -1303,7 +1331,7 @@ fn shadow_view_projection(
     cascade_near: f32,
     cascade_far: f32,
     cascade_index: usize,
-) -> [f32; 16] {
+) -> ShadowCascadeProjection {
     let frustum = camera_frustum_corners(camera, aspect, cascade_near, cascade_far);
     let (center, radius) = bounding_sphere(&frustum);
     let shadow_resolution = shadow_cascade_resolution(cascade_index);
@@ -1315,42 +1343,55 @@ fn shadow_view_projection(
 
     snap_shadow_view_to_texels(&mut view, center, radius, shadow_resolution);
     let (near, far) = shadow_depth_range(&view, radius, &frustum, center);
+    let texel_world = radius * 2.0 / shadow_resolution;
+    let depth_span = (far - near).max(1.0);
 
     tracing::trace!(
         cascade_index,
         cascade_near,
         cascade_far,
         radius,
-        texel_world = radius * 2.0 / shadow_resolution,
+        texel_world,
         shadow_resolution,
         near,
         far,
         "built camera-cascade shadow projection"
     );
 
-    mat4_mul(
-        orthographic_vulkan(radius * 2.0, radius * 2.0, near, far),
-        view,
-    )
+    ShadowCascadeProjection {
+        view_projection: mat4_mul(
+            orthographic_vulkan(radius * 2.0, radius * 2.0, near, far),
+            view,
+        ),
+        texel_world,
+        depth_span,
+    }
 }
 
 fn shadow_cascade_splits(camera: CameraSnapshot) -> [f32; 4] {
     let near = camera.near.max(0.03);
     let far = shadow_coverage_distance(camera);
-    let mut splits = [0.0; 4];
+    let range = (far - near).max(1.0);
+    let split_near = near.max(SHADOW_SPLIT_NEAR_FLOOR);
+    let ratio = (far / split_near).max(1.0);
+    let mut previous = near;
 
-    if far <= MID_SHADOW_CASCADE_END + 4.0 {
-        let range = far - near;
-        splits[0] = near + range * 0.20;
-        splits[1] = near + range * 0.55;
-        splits[2] = far;
-        return splits;
-    }
-
-    splits[0] = NEAR_SHADOW_CASCADE_END.max(near + 1.0).min(far - 2.0);
-    splits[1] = MID_SHADOW_CASCADE_END.max(splits[0] + 1.0).min(far - 1.0);
-    splits[2] = far;
-    splits
+    std::array::from_fn(|index| {
+        let t = (index + 1) as f32 / SHADOW_CASCADE_COUNT as f32;
+        let uniform = near + range * t;
+        let logarithmic = split_near * ratio.powf(t);
+        let split = logarithmic * SHADOW_SPLIT_LAMBDA + uniform * (1.0 - SHADOW_SPLIT_LAMBDA);
+        let split = if index + 1 == SHADOW_CASCADE_COUNT {
+            far
+        } else {
+            split.clamp(
+                previous + 1.0,
+                far - (SHADOW_CASCADE_COUNT - index - 1) as f32,
+            )
+        };
+        previous = split;
+        split
+    })
 }
 
 /// Returns the camera-local shadow distance so scene scale does not dilute cascade texels.
@@ -1358,16 +1399,14 @@ fn shadow_coverage_distance(camera: CameraSnapshot) -> f32 {
     const MAX_SHADOW_DISTANCE: f32 = 320.0;
     let near = camera.near.max(0.03);
 
-    camera.far.max(near + 3.0).min(MAX_SHADOW_DISTANCE)
+    camera
+        .far
+        .max(near + SHADOW_CASCADE_COUNT as f32)
+        .min(MAX_SHADOW_DISTANCE)
 }
 
 fn shadow_cascade_resolution(cascade_index: usize) -> f32 {
-    let base = shadow_map_size();
-    (match cascade_index {
-        0 => base,
-        1 => (base / 2).max(1024),
-        _ => (base / 4).max(MIN_FAR_SHADOW_MAP_SIZE),
-    }) as f32
+    shadow_cascade_size(cascade_index) as f32
 }
 
 fn quantize_shadow_radius(radius: f32, resolution: f32) -> f32 {
@@ -1913,21 +1952,48 @@ mod tests {
     fn shadow_cascade_splits_keep_near_density_without_following_scene_scale() {
         let splits = shadow_cascade_splits(camera());
 
-        assert_eq!(splits[0], NEAR_SHADOW_CASCADE_END);
-        assert_eq!(splits[1], MID_SHADOW_CASCADE_END);
-        assert!(splits[2] < camera().far);
-        assert_eq!(splits[2], shadow_coverage_distance(camera()));
+        assert!(splits[0] < 32.0);
+        assert!(splits[0] < splits[1]);
+        assert!(splits[1] < splits[2]);
+        assert!(splits[2] < splits[3]);
+        assert!(splits[3] < camera().far);
+        assert_eq!(splits[3], shadow_coverage_distance(camera()));
     }
 
     // Verifies that near cascade density is higher than far cascade density.
     #[test]
     fn near_shadow_cascade_has_smaller_world_texels() {
         let camera = camera();
-        let light_dir = normalize_or([0.45, -1.0, 0.25], [0.0, -1.0, 0.0]);
+        let light_dir = normalize_or(
+            super::super::DEFAULT_DIRECTIONAL_LIGHT_DIR,
+            [0.0, -1.0, 0.0],
+        );
         let splits = shadow_cascade_splits(camera);
         let near = shadow_view_projection(camera, 16.0 / 9.0, light_dir, camera.near, splits[0], 0);
-        let far = shadow_view_projection(camera, 16.0 / 9.0, light_dir, splits[1], splits[2], 2);
+        let far = shadow_view_projection(camera, 16.0 / 9.0, light_dir, splits[2], splits[3], 3);
 
-        assert!(near[0].abs() > far[0].abs());
+        assert!(near.view_projection[0].abs() > far.view_projection[0].abs());
+        assert!(near.texel_world < far.texel_world);
+        assert!(near.depth_span > 0.0);
+        assert!(far.depth_span > 0.0);
+    }
+
+    // Verifies that shader vec4 metrics pack all four cascade values.
+    #[test]
+    fn shadow_cascade_metrics_pack_four_values_into_vec4() {
+        let projections = std::array::from_fn(|index| ShadowCascadeProjection {
+            view_projection: identity_mat4(),
+            texel_world: (index + 1) as f32,
+            depth_span: 10.0 + index as f32,
+        });
+
+        assert_eq!(
+            shadow_cascade_metric_vec4(&projections, |projection| projection.texel_world),
+            [1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            shadow_cascade_metric_vec4(&projections, |projection| projection.depth_span),
+            [10.0, 11.0, 12.0, 13.0]
+        );
     }
 }

@@ -24,7 +24,7 @@ const EXPOSURE_FALL_STOPS_PER_SECOND: f32 = 5.5;
 const MIN_WHITE_BALANCE: f32 = 0.55;
 const MAX_WHITE_BALANCE: f32 = 1.85;
 const OLD_CAMERA_CONTRAST: f32 = 1.0;
-const OLD_CAMERA_SATURATION: f32 = 0.9;
+const OLD_CAMERA_SATURATION: f32 = 0.8;
 
 impl Default for CameraMetering {
     /// Creates an invalid metering sample that leaves the current camera response unchanged.

@@ -17,6 +17,7 @@ layout(set = 1, binding = 1) uniform sampler2D base_color_texture;
 layout(set = 2, binding = 0) uniform sampler2D shadow_cascade_0;
 layout(set = 2, binding = 1) uniform sampler2D shadow_cascade_1;
 layout(set = 2, binding = 2) uniform sampler2D shadow_cascade_2;
+layout(set = 2, binding = 3) uniform sampler2D shadow_cascade_3;
 
 layout(push_constant) uniform ShadowCascade {
     uint cascade_index;
@@ -34,18 +35,21 @@ ivec2 shadow_texel_coord(ivec2 size) {
 }
 
 float opaque_depth_for_cascade(uint index) {
-    index = min(index, 2u);
+    index = min(index, 3u);
     if (index == 0u) {
         return texelFetch(shadow_cascade_0, shadow_texel_coord(textureSize(shadow_cascade_0, 0)), 0).r;
     }
     if (index == 1u) {
         return texelFetch(shadow_cascade_1, shadow_texel_coord(textureSize(shadow_cascade_1, 0)), 0).r;
     }
-    return texelFetch(shadow_cascade_2, shadow_texel_coord(textureSize(shadow_cascade_2, 0)), 0).r;
+    if (index == 2u) {
+        return texelFetch(shadow_cascade_2, shadow_texel_coord(textureSize(shadow_cascade_2, 0)), 0).r;
+    }
+    return texelFetch(shadow_cascade_3, shadow_texel_coord(textureSize(shadow_cascade_3, 0)), 0).r;
 }
 
 void discard_when_behind_opaque_depth(float fragment_depth) {
-    uint index = min(shadow_cascade.cascade_index, 2u);
+    uint index = min(shadow_cascade.cascade_index, 3u);
     float opaque_depth = opaque_depth_for_cascade(index);
     if (fragment_depth > opaque_depth + 0.0008) {
         discard;

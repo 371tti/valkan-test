@@ -3,7 +3,10 @@ use std::{ffi::CStr, io::Cursor, mem::size_of};
 use ash::{Device, util, vk};
 
 use crate::{
-    protocol::{AntiAliasingQualitySettings, CameraEffects, CameraSnapshot, RenderQualitySettings},
+    protocol::{
+        AntiAliasingQualitySettings, CameraEffects, CameraSnapshot, RenderQualitySettings,
+        ShadowSofteningQualitySettings,
+    },
     renderer::pipeline::shader_interface,
 };
 
@@ -154,6 +157,7 @@ struct PostPushConstants {
     ssao: [f32; 4],
     ssr: [f32; 4],
     aa: [f32; 4],
+    shadow: [f32; 4],
     exposure: f32,
     contrast: f32,
     saturation: f32,
@@ -231,6 +235,7 @@ impl PostPipeline {
         let ssao = quality.ssao();
         let ssr = quality.ssr();
         let anti_aliasing = quality.anti_aliasing();
+        let shadow_softening = quality.shadow_softening();
         let post = quality.post();
         let push = PostPushConstants {
             white_balance: [white_balance[0], white_balance[1], white_balance[2], 1.0],
@@ -249,6 +254,7 @@ impl PostPipeline {
                 ssr.thickness(),
             ],
             aa: post_aa_params(extent, anti_aliasing),
+            shadow: post_shadow_params(shadow_softening),
             exposure: camera_effects.exposure().value(),
             contrast: (camera_effects.contrast() * post.contrast()).clamp(0.25, 4.0),
             saturation: (camera_effects.saturation() * post.saturation()).clamp(0.0, 4.0),
@@ -269,6 +275,8 @@ impl PostPipeline {
             ssr_steps = push.ssr[1],
             aa_threshold = push.aa[2],
             aa_blend = push.aa[3],
+            shadow_softening = push.shadow[0],
+            shadow_softening_radius = push.shadow[1],
             "recording Vulkan post pass"
         );
 
@@ -513,6 +521,16 @@ fn post_aa_params(extent: vk::Extent2D, anti_aliasing: AntiAliasingQualitySettin
         1.0 / extent.height.max(1) as f32,
         anti_aliasing.edge_threshold(),
         anti_aliasing.blend(),
+    ]
+}
+
+/// Packs post-process shadow cleanup parameters for the fragment shader.
+fn post_shadow_params(shadow_softening: ShadowSofteningQualitySettings) -> [f32; 4] {
+    [
+        shadow_softening.intensity(),
+        shadow_softening.radius_pixels(),
+        shadow_softening.depth_sensitivity(),
+        shadow_softening.max_luma_delta(),
     ]
 }
 

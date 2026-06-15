@@ -66,7 +66,7 @@
 - `old/assets/model.glb` は app-level sample として `rebuild1/assets/model.glb` にコピー済み。window path はこのファイルが存在するときだけ `LoadAsset` を送り、全 mesh/material pair を `render_items` として submit する。
 - `render_items` は `vulkan/mesh.rs` の mesh pipeline で indexed draw を記録する。`FrameSnapshot` は owned `CameraSnapshot` を持ち、mesh shader は app-side camera の view-projection で world-space GLB を描画する。
 - window path は old-style free camera controls を持つ。left click で cursor capture、Escape で release、WASD/arrow、Space/E、Shift/Q、Ctrl、mouse wheel で移動する。
-- shadow resource は device-owned fixed cascade で、swapchain resize では作り直さない。near cascade は高解像度、mid/far cascade は段階的に軽くし、scene size ではなく camera frustum から shadow projection を作る。interactive default は 2048 shadow map で、重い visual inspection 時だけ `REBUILD1_SHADOW_MAP_SIZE` で上げる。
+- shadow resource は device-owned fixed cascade で、swapchain resize では作り直さない。near cascade は高解像度、mid/far cascade は段階的に軽くし、scene size ではなく camera frustum から shadow projection を作る。shadow map 自体は固定サイズに保ち、PCSS の粒状感は screen-space の深度/法線つき高解像度 blur でならす。必要な visual inspection 時だけ `REBUILD1_SHADOW_MAP_SIZE` で固定リソースサイズを変える。
 - shadow sampling は通常 1 cascade だけを評価し、cascade 境界の blend 範囲だけ 2 cascade を読む。PCF tap は near/mid/far で 16/10/6 に分け、far shadow pass は low LOD geometry を使う。
 - mesh LOD は三角形を単純に間引かない。meshoptimizer の border-locked simplification と vertex-cache reorder で index LOD を作り、同一 LOD stream は upload しない。
 - translucent shadow は cascade ごとの独立 pass で opaque depth を shader sample し、transparent caster だけを transmittance color target へ multiplicative blend で記録する。複数透明 caster は色付き透過として合成し、scene shader が opaque shadow と transmittance をまとめて読む。

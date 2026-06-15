@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunMode {
     Headless,
     Windowed,
@@ -32,10 +33,15 @@ enum RunMode {
 
 /// Parses the tiny command line used by this implementation slice.
 fn selected_run_mode() -> Result<RunMode, String> {
-    let mut args = std::env::args().skip(1);
+    run_mode_from_args(std::env::args().skip(1))
+}
+
+/// Converts already-split command line arguments into the selected app path.
+fn run_mode_from_args(args: impl IntoIterator<Item = String>) -> Result<RunMode, String> {
+    let mut args = args.into_iter();
     let Some(arg) = args.next() else {
-        tracing::trace!(mode = "headless", "selected default run mode");
-        return Ok(RunMode::Headless);
+        tracing::trace!(mode = "windowed", "selected default run mode");
+        return Ok(RunMode::Windowed);
     };
 
     if args.next().is_some() {
@@ -60,5 +66,23 @@ fn selected_run_mode() -> Result<RunMode, String> {
         _ => Err(format!(
             "unknown argument: {arg}; expected --headless, --window, or --window-smoke"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_run_mode_is_windowed() {
+        assert_eq!(run_mode_from_args([]), Ok(RunMode::Windowed));
+    }
+
+    #[test]
+    fn explicit_headless_mode_is_still_available() {
+        assert_eq!(
+            run_mode_from_args(["--headless".to_owned()]),
+            Ok(RunMode::Headless)
+        );
     }
 }
