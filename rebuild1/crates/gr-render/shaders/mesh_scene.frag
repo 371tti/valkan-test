@@ -52,7 +52,7 @@ vec4 apply_alpha(vec4 base_color) {
 }
 
 vec3 surface_normal() {
-    vec3 normal = pbr_normalize_fast(frag_normal);
+    vec3 normal = normalize_fast(frag_normal);
     if (material.flags.z != 0u && !gl_FrontFacing) {
         normal = -normal;
     }

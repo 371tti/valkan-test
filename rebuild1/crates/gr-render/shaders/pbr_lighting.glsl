@@ -1,25 +1,10 @@
 #ifndef REBUILD1_PBR_LIGHTING_GLSL
 #define REBUILD1_PBR_LIGHTING_GLSL
 
+#include "common_math.glsl"
+
 const float PBR_PI = 3.14159265359;
 const float INV_PBR_PI = 0.31830988618;
-
-float saturate(float value) {
-    return clamp(value, 0.0, 1.0);
-}
-
-float pow5(float value) {
-    float value2 = value * value;
-    return value2 * value2 * value;
-}
-
-float pbr_rcp_safe(float value, float floor_value) {
-    return 1.0 / max(value, floor_value);
-}
-
-vec3 pbr_normalize_fast(vec3 value) {
-    return value * inversesqrt(max(dot(value, value), 0.000001));
-}
 
 vec3 fresnel_schlick(float cos_theta, vec3 f0) {
     return f0 + (1.0 - f0) * pow5(saturate(1.0 - cos_theta));
@@ -69,7 +54,7 @@ vec3 hemisphere_light(vec3 direction) {
 
 float transparent_specular_boost(float alpha) {
     float transparency = 1.0 - clamp(alpha, 0.0, 1.0);
-    return mix(1.0, pbr_rcp_safe(max(alpha, 0.22), 0.22), transparency * 0.55);
+    return mix(1.0, rcp_safe(max(alpha, 0.22), 0.22), transparency * 0.55);
 }
 
 vec3 pbr_shadow(float ndotl) {
@@ -111,9 +96,9 @@ vec3 shade_pbr(
     roughness = clamp(roughness, 0.04, 1.0);
     metallic = clamp(metallic, 0.0, 1.0);
     occlusion = clamp(occlusion, 0.0, 1.0);
-    normal = pbr_normalize_fast(normal);
+    normal = normalize_fast(normal);
 
-    vec3 view = pbr_normalize_fast(frame_camera.camera_pos.xyz - frag_world_pos);
+    vec3 view = normalize_fast(frame_camera.camera_pos.xyz - frag_world_pos);
     float ndotv = max(dot(normal, view), 0.0001);
 
     vec3 f0 = mix(vec3(0.04), base_color, metallic);
@@ -122,11 +107,11 @@ vec3 shade_pbr(
     vec3 direct = vec3(0.0);
 
     if (frame_camera.light_dir.w > 0.5) {
-        vec3 light = pbr_normalize_fast(-frame_camera.light_dir.xyz);
+        vec3 light = normalize_fast(-frame_camera.light_dir.xyz);
         float ndotl = saturate(dot(normal, light));
 
         if (ndotl > 0.0001) {
-            vec3 half_vector = pbr_normalize_fast(light + view);
+            vec3 half_vector = normalize_fast(light + view);
             float vdoth = saturate(dot(view, half_vector));
 
             vec3 fresnel = fresnel_schlick(vdoth, f0);
@@ -136,8 +121,10 @@ vec3 shade_pbr(
 
             float distribution = distribution_ggx(normal, half_vector, roughness);
             float geometry = geometry_smith(ndotv, ndotl, roughness);
-            vec3 specular = distribution * geometry * fresnel /
-                max(4.0 * ndotv * ndotl, 0.0001);
+            vec3 specular = distribution *
+                geometry *
+                fresnel *
+                rcp_safe(4.0 * ndotv * ndotl, 0.0001);
             specular *= spec_boost;
 
             vec3 shadow = pbr_shadow(ndotl);
@@ -190,13 +177,9 @@ float material_reflectance(vec3 base_color, float metallic, float roughness) {
     return clamp(mix(dielectric, conductor, metallic), 0.0, 1.0);
 }
 
-vec2 sign_not_zero(vec2 value) {
-    return vec2(value.x >= 0.0 ? 1.0 : -1.0, value.y >= 0.0 ? 1.0 : -1.0);
-}
-
 vec2 oct_encode(vec3 normal) {
-    normal = pbr_normalize_fast(normal);
-    normal *= pbr_rcp_safe(abs(normal.x) + abs(normal.y) + abs(normal.z), 0.0001);
+    normal = normalize_fast(normal);
+    normal *= rcp_safe(abs(normal.x) + abs(normal.y) + abs(normal.z), 0.0001);
     if (normal.z < 0.0) {
         normal.xy = (1.0 - abs(normal.yx)) * sign_not_zero(normal.xy);
     }
@@ -204,7 +187,7 @@ vec2 oct_encode(vec3 normal) {
 }
 
 vec4 pack_view_normal_material(vec3 normal, float roughness, float metallic, vec3 base_color) {
-    vec3 view_normal = pbr_normalize_fast((frame_camera.view * vec4(normal, 0.0)).xyz);
+    vec3 view_normal = normalize_fast((frame_camera.view * vec4(normal, 0.0)).xyz);
     return vec4(
         oct_encode(view_normal),
         clamp(roughness, 0.04, 1.0),

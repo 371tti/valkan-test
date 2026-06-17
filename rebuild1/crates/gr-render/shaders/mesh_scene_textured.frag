@@ -78,27 +78,28 @@ vec3 normal_from_derivatives(vec3 vertex_normal, vec3 tangent_space_normal) {
         return vertex_normal;
     }
 
-    vec3 tangent_raw = (dp1 * duv2.y - dp2 * duv1.y) / det;
+    float inv_det = 1.0 / det;
+    vec3 tangent_raw = (dp1 * duv2.y - dp2 * duv1.y) * inv_det;
     if (dot(tangent_raw, tangent_raw) < 0.000001) {
         return vertex_normal;
     }
 
     vec3 tangent = tangent_raw - vertex_normal * dot(vertex_normal, tangent_raw);
-    tangent = pbr_normalize_fast(tangent);
+    tangent = normalize_fast(tangent);
 
     vec3 bitangent = cross(vertex_normal, tangent);
-    vec3 bitangent_raw = (-dp1 * duv2.x + dp2 * duv1.x) / det;
+    vec3 bitangent_raw = (-dp1 * duv2.x + dp2 * duv1.x) * inv_det;
     if (dot(bitangent, bitangent_raw) < 0.0) {
         bitangent = -bitangent;
     }
 
-    return pbr_normalize_fast(mat3(tangent, bitangent, vertex_normal) * tangent_space_normal);
+    return normalize_fast(mat3(tangent, bitangent, vertex_normal) * tangent_space_normal);
 }
 
 vec3 normal_from_map(vec3 vertex_normal, vec4 vertex_tangent) {
     vec3 map = texture(normal_texture, frag_uv).xyz * 2.0 - 1.0;
     map.xy *= material.pbr_alpha.w;
-    vec3 tangent_space_normal = pbr_normalize_fast(map);
+    vec3 tangent_space_normal = normalize_fast(map);
 
     vec3 tangent = vertex_tangent.xyz;
     float tangent_len_sq = dot(tangent, tangent);
@@ -111,15 +112,15 @@ vec3 normal_from_map(vec3 vertex_normal, vec4 vertex_tangent) {
     if (dot(tangent, tangent) < 0.000001) {
         return normal_from_derivatives(vertex_normal, tangent_space_normal);
     }
-    tangent = pbr_normalize_fast(tangent);
+    tangent = normalize_fast(tangent);
 
     float tangent_sign = vertex_tangent.w < 0.0 ? -1.0 : 1.0;
     vec3 bitangent = cross(vertex_normal, tangent) * tangent_sign;
-    return pbr_normalize_fast(mat3(tangent, bitangent, vertex_normal) * tangent_space_normal);
+    return normalize_fast(mat3(tangent, bitangent, vertex_normal) * tangent_space_normal);
 }
 
 vec3 surface_normal() {
-    vec3 normal = pbr_normalize_fast(frag_normal);
+    vec3 normal = normalize_fast(frag_normal);
     if (material.flags.z != 0u && !gl_FrontFacing) {
         normal = -normal;
     }

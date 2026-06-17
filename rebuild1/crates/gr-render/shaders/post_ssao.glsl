@@ -2,7 +2,7 @@
 #define REBUILD1_POST_SSAO_GLSL
 
 float screen_space_ao(vec2 uv, SurfaceMaterial material) {
-    if (material.source_depth >= 0.9999 || params.ssao.x <= 0.0) {
+    if (surface_material_is_background(material) || !post_ssao_enabled()) {
         return 1.0;
     }
 
@@ -11,6 +11,7 @@ float screen_space_ao(vec2 uv, SurfaceMaterial material) {
 
     float radius = max(params.ssao.y, 0.001);
     float radius_sq = radius * radius;
+    float inner_radius_sq = radius_sq * 0.0324;
     float bias = max(params.ssao.z, max(0.0005, view_z * 0.0015));
 
     float radius_uv = clamp(
@@ -53,7 +54,7 @@ float screen_space_ao(vec2 uv, SurfaceMaterial material) {
 
         float sample_depth = depth_at(sample_uv);
 
-        if (sample_depth >= 0.9999) {
+        if (is_background_depth(sample_depth)) {
             continue;
         }
 
@@ -66,7 +67,7 @@ float screen_space_ao(vec2 uv, SurfaceMaterial material) {
         }
 
         float closer = step(position.z + bias, sample_position.z);
-        float range = 1.0 - smoothstep(radius_sq * 0.0324, radius_sq, distance_sq);
+        float range = 1.0 - smoothstep(inner_radius_sq, radius_sq, distance_sq);
         float facing = saturate(dot(material.normal, delta) * inversesqrt(distance_sq));
 
         occlusion += closer * range * facing;

@@ -29,27 +29,12 @@ layout(push_constant) uniform PostParams {
 #include "post_ssr.glsl"
 
 void main() {
-    bool ssao_enabled = params.ssao.x > 0.0;
-    bool ssr_enabled = params.ssr.x > 0.0 && params.ssr.y >= 1.0;
-    bool shadow_softening_enabled = params.shadow.x > 0.0 && params.shadow.y > 0.0;
-
-    SurfaceMaterial material = SurfaceMaterial(
-        vec3(0.0, 0.0, 1.0),
-        1.0,
-        1.0,
-        0.0,
-        0.0
-    );
-    bool material_valid = false;
-
-    if (ssao_enabled || ssr_enabled || shadow_softening_enabled) {
-        material = surface_material(frag_uv);
-        material_valid = true;
-    }
+    bool material_valid;
+    SurfaceMaterial material = load_feature_surface_material(frag_uv, material_valid);
 
     vec3 color = texture(scene_color, frag_uv).rgb;
 
-    if (shadow_softening_enabled && material_valid) {
+    if (material_valid) {
         color = shadow_softened_scene_color(frag_uv, color, material);
     }
 
@@ -62,7 +47,7 @@ void main() {
 
     float ao = 1.0;
 
-    if (ssao_enabled) {
+    if (post_ssao_enabled()) {
         ao = screen_space_ao(frag_uv, material);
 
         float ao_strength = clamp(params.ssao.x, 0.0, 1.0) *
@@ -76,7 +61,7 @@ void main() {
         );
     }
 
-    if (ssr_enabled) {
+    if (post_ssr_enabled()) {
         vec4 reflection = screen_space_reflection(frag_uv, material, ao);
         color = apply_screen_space_reflection(color, reflection);
     }

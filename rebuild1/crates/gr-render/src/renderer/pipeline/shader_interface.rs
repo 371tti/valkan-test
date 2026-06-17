@@ -14,6 +14,18 @@ pub(crate) const MATERIAL_OCCLUSION_BINDING: u32 = 4;
 pub(crate) const MATERIAL_EMISSIVE_BINDING: u32 = 5;
 pub(crate) const PASS_SHADOW_CASCADE_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [0, 1, 2, 3];
 pub(crate) const PASS_TRANSLUCENT_SHADOW_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [4, 5, 6, 7];
+const PASS_SHADOW_CASCADE_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
+    "shadow_cascade_0",
+    "shadow_cascade_1",
+    "shadow_cascade_2",
+    "shadow_cascade_3",
+];
+const PASS_TRANSLUCENT_SHADOW_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
+    "translucent_shadow_0",
+    "translucent_shadow_1",
+    "translucent_shadow_2",
+    "translucent_shadow_3",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ShaderBinding {
@@ -22,83 +34,65 @@ pub(crate) struct ShaderBinding {
     pub(crate) name: &'static str,
 }
 
-pub(crate) const MESH_SHADER_BINDINGS: &[ShaderBinding] = &[
-    ShaderBinding {
-        set: FRAME_SET,
-        binding: FRAME_CAMERA_BINDING,
-        name: "frame_camera",
-    },
-    ShaderBinding {
-        set: MATERIAL_SET,
-        binding: MATERIAL_PARAMS_BINDING,
-        name: "material_params",
-    },
-    ShaderBinding {
-        set: MATERIAL_SET,
-        binding: MATERIAL_BASE_COLOR_BINDING,
-        name: "base_color",
-    },
-    ShaderBinding {
-        set: MATERIAL_SET,
-        binding: MATERIAL_NORMAL_BINDING,
-        name: "normal",
-    },
-    ShaderBinding {
-        set: MATERIAL_SET,
-        binding: MATERIAL_METALLIC_ROUGHNESS_BINDING,
-        name: "metallic_roughness",
-    },
-    ShaderBinding {
-        set: MATERIAL_SET,
-        binding: MATERIAL_OCCLUSION_BINDING,
-        name: "occlusion",
-    },
-    ShaderBinding {
-        set: MATERIAL_SET,
-        binding: MATERIAL_EMISSIVE_BINDING,
-        name: "emissive",
-    },
-    ShaderBinding {
+fn mesh_shader_bindings() -> Vec<ShaderBinding> {
+    let mut bindings = vec![
+        ShaderBinding {
+            set: FRAME_SET,
+            binding: FRAME_CAMERA_BINDING,
+            name: "frame_camera",
+        },
+        ShaderBinding {
+            set: MATERIAL_SET,
+            binding: MATERIAL_PARAMS_BINDING,
+            name: "material_params",
+        },
+        ShaderBinding {
+            set: MATERIAL_SET,
+            binding: MATERIAL_BASE_COLOR_BINDING,
+            name: "base_color",
+        },
+        ShaderBinding {
+            set: MATERIAL_SET,
+            binding: MATERIAL_NORMAL_BINDING,
+            name: "normal",
+        },
+        ShaderBinding {
+            set: MATERIAL_SET,
+            binding: MATERIAL_METALLIC_ROUGHNESS_BINDING,
+            name: "metallic_roughness",
+        },
+        ShaderBinding {
+            set: MATERIAL_SET,
+            binding: MATERIAL_OCCLUSION_BINDING,
+            name: "occlusion",
+        },
+        ShaderBinding {
+            set: MATERIAL_SET,
+            binding: MATERIAL_EMISSIVE_BINDING,
+            name: "emissive",
+        },
+    ];
+    bindings.extend(pass_shader_bindings(
+        PASS_SHADOW_CASCADE_BINDINGS,
+        PASS_SHADOW_CASCADE_NAMES,
+    ));
+    bindings.extend(pass_shader_bindings(
+        PASS_TRANSLUCENT_SHADOW_BINDINGS,
+        PASS_TRANSLUCENT_SHADOW_NAMES,
+    ));
+    bindings
+}
+
+fn pass_shader_bindings(
+    bindings: [u32; SHADOW_CASCADE_COUNT],
+    names: [&'static str; SHADOW_CASCADE_COUNT],
+) -> [ShaderBinding; SHADOW_CASCADE_COUNT] {
+    std::array::from_fn(|index| ShaderBinding {
         set: PASS_SET,
-        binding: PASS_SHADOW_CASCADE_BINDINGS[0],
-        name: "shadow_cascade_0",
-    },
-    ShaderBinding {
-        set: PASS_SET,
-        binding: PASS_SHADOW_CASCADE_BINDINGS[1],
-        name: "shadow_cascade_1",
-    },
-    ShaderBinding {
-        set: PASS_SET,
-        binding: PASS_SHADOW_CASCADE_BINDINGS[2],
-        name: "shadow_cascade_2",
-    },
-    ShaderBinding {
-        set: PASS_SET,
-        binding: PASS_SHADOW_CASCADE_BINDINGS[3],
-        name: "shadow_cascade_3",
-    },
-    ShaderBinding {
-        set: PASS_SET,
-        binding: PASS_TRANSLUCENT_SHADOW_BINDINGS[0],
-        name: "translucent_shadow_0",
-    },
-    ShaderBinding {
-        set: PASS_SET,
-        binding: PASS_TRANSLUCENT_SHADOW_BINDINGS[1],
-        name: "translucent_shadow_1",
-    },
-    ShaderBinding {
-        set: PASS_SET,
-        binding: PASS_TRANSLUCENT_SHADOW_BINDINGS[2],
-        name: "translucent_shadow_2",
-    },
-    ShaderBinding {
-        set: PASS_SET,
-        binding: PASS_TRANSLUCENT_SHADOW_BINDINGS[3],
-        name: "translucent_shadow_3",
-    },
-];
+        binding: bindings[index],
+        name: names[index],
+    })
+}
 
 /// Validates the hard-coded mesh shader descriptor contract before Vulkan layouts are created.
 pub(crate) fn validate_mesh_interface() -> Result<(), &'static str> {
@@ -126,7 +120,7 @@ pub(crate) fn validate_mesh_interface() -> Result<(), &'static str> {
     if pass_bindings.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("pass shadow bindings must be unique");
     }
-    if MESH_SHADER_BINDINGS.is_empty() {
+    if mesh_shader_bindings().is_empty() {
         return Err("mesh shader interface must declare at least one binding");
     }
 

@@ -41,3 +41,10 @@ pub(crate) fn normalize_or(value: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
 
     [value[0] / length, value[1] / length, value[2] / length]
 }
+
+/// Returns a 4x4 identity matrix in the flat layout consumed by renderer uniforms.
+pub(crate) fn identity_mat4() -> [f32; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]
+}

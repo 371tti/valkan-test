@@ -2,11 +2,17 @@ mod buffer;
 mod debug;
 mod frame;
 mod immediate;
+mod lod;
 mod material;
+mod material_texture;
 mod mesh;
 mod post;
 mod readback;
+mod shadow;
+mod shadow_blur;
 mod swapchain;
+mod swapchain_pass;
+mod swapchain_target;
 
 use std::{collections::BTreeMap, ffi::CStr};
 
@@ -29,13 +35,13 @@ use self::{
     material::VulkanMaterialStore,
     mesh::VulkanMeshStore,
     readback::{FramebufferReadbackConfig, FramebufferReadbackState},
+    shadow::{ShadowFrameData, ShadowFrameSignature},
     swapchain::{ShadowResources, ShadowSamplerFallback, VulkanSwapchain},
 };
 use super::{RendererBackend, RendererResult, assets::GpuAssetStore};
 
 const APP_NAME: &CStr = c"rebuild1";
 const ENGINE_NAME: &CStr = c"rebuild1";
-const DEFAULT_DIRECTIONAL_LIGHT_DIR: [f32; 3] = [0.45, -1.0, 0.25];
 
 #[derive(Debug, Error)]
 pub enum VulkanError {
@@ -734,23 +740,6 @@ struct VulkanDevice {
     shadow_cache: ShadowCacheState,
     readback: FramebufferReadbackState,
     quality: RenderQualitySettings,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct ShadowFrameSignature {
-    camera_eye_bucket: [i32; 3],
-    camera_forward_bucket: [i32; 3],
-    fov_bucket: i32,
-    caster_hash: u64,
-    translucent_casters: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct ShadowFrameData {
-    pub(super) view_proj: [[f32; 16]; crate::renderer::graph::SHADOW_CASCADE_COUNT],
-    pub(super) splits: [f32; 4],
-    pub(super) texel_world: [f32; 4],
-    pub(super) depth_span: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]

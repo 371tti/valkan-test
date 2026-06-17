@@ -8,6 +8,23 @@ pub struct RenderQualitySettings {
 }
 
 impl RenderQualitySettings {
+    /// Creates one full renderer quality profile without relying on defaulted subprofiles.
+    fn from_parts(
+        ssao: SsaoQualitySettings,
+        ssr: SsrQualitySettings,
+        anti_aliasing: AntiAliasingQualitySettings,
+        shadow_softening: ShadowSofteningQualitySettings,
+        post: PostQualitySettings,
+    ) -> Self {
+        Self {
+            ssao,
+            ssr,
+            anti_aliasing,
+            shadow_softening,
+            post,
+        }
+    }
+
     /// Creates a complete renderer quality profile for fullscreen post effects.
     pub fn new(
         ssao: SsaoQualitySettings,
@@ -41,29 +58,23 @@ impl RenderQualitySettings {
         shadow_softening: ShadowSofteningQualitySettings,
         post: PostQualitySettings,
     ) -> Self {
-        Self {
-            ssao,
-            ssr,
-            anti_aliasing,
-            shadow_softening,
-            post,
-        }
+        Self::from_parts(ssao, ssr, anti_aliasing, shadow_softening, post)
     }
 
     /// Returns the lightest profile intended for editing and camera navigation.
     pub fn performance() -> Self {
-        Self::new(
+        Self::from_parts(
             SsaoQualitySettings::disabled(),
+            SsrQualitySettings::disabled(),
             AntiAliasingQualitySettings::disabled(),
+            ShadowSofteningQualitySettings::disabled(),
             PostQualitySettings::natural(),
         )
-        .with_ssr(SsrQualitySettings::disabled())
-        .with_shadow_softening(ShadowSofteningQualitySettings::disabled())
     }
 
     /// Returns the interactive profile used when the app does not override renderer quality.
     pub fn interactive() -> Self {
-        Self::new_with_shadow_softening(
+        Self::from_parts(
             SsaoQualitySettings::interactive(),
             SsrQualitySettings::interactive(),
             AntiAliasingQualitySettings::interactive(),
@@ -74,7 +85,7 @@ impl RenderQualitySettings {
 
     /// Returns the balanced profile for scenes that can spend more post-process budget.
     pub fn balanced() -> Self {
-        Self::new_with_shadow_softening(
+        Self::from_parts(
             SsaoQualitySettings::balanced(),
             SsrQualitySettings::balanced(),
             AntiAliasingQualitySettings::balanced(),
@@ -85,7 +96,7 @@ impl RenderQualitySettings {
 
     /// Returns the expensive profile used when visual inspection matters more than frame time.
     pub fn high_quality() -> Self {
-        Self::new_with_shadow_softening(
+        Self::from_parts(
             SsaoQualitySettings::balanced(),
             SsrQualitySettings::high_quality(),
             AntiAliasingQualitySettings::high_quality(),
@@ -153,9 +164,10 @@ pub struct ShadowSofteningQualitySettings {
 impl ShadowSofteningQualitySettings {
     /// Creates bounded controls for post-process cleanup of noisy soft shadow edges.
     ///
-    /// The pass only adjusts local luminance and uses depth/normal weights, so it can
-    /// hide low-sample PCSS grain without blurring object silhouettes as aggressively
-    /// as a full color blur.
+    /// The pass upscales low-frequency shadow edges in screen space. It only adjusts
+    /// local luminance and uses depth/normal weights, so it can hide lower-resolution
+    /// shadow-map stair steps without blurring object silhouettes as aggressively as
+    /// a full color blur.
     pub fn new(
         intensity: f32,
         radius_pixels: f32,
@@ -164,7 +176,7 @@ impl ShadowSofteningQualitySettings {
     ) -> Self {
         Self {
             intensity: finite_clamp(intensity, 0.0, 1.0, 0.0),
-            radius_pixels: finite_clamp(radius_pixels, 0.5, 4.0, 1.6),
+            radius_pixels: finite_clamp(radius_pixels, 0.5, 12.0, 4.5),
             depth_sensitivity: finite_clamp(depth_sensitivity, 0.1, 8.0, 1.7),
             max_luma_delta: finite_clamp(max_luma_delta, 0.005, 0.25, 0.075),
         }
@@ -177,17 +189,17 @@ impl ShadowSofteningQualitySettings {
 
     /// Returns a light cleanup profile for normal camera movement.
     pub fn interactive() -> Self {
-        Self::new(0.34, 1.15, 3.0, 0.085)
+        Self::new(0.42, 3.25, 3.1, 0.095)
     }
 
     /// Returns the default cleanup profile for balanced soft-shadow quality.
     pub fn balanced() -> Self {
-        Self::new(0.58, 1.85, 2.35, 0.150)
+        Self::new(0.64, 5.75, 2.45, 0.160)
     }
 
     /// Returns the stronger cleanup profile for visual inspection.
     pub fn high_quality() -> Self {
-        Self::new(0.72, 2.60, 1.90, 0.210)
+        Self::new(0.78, 8.50, 2.05, 0.220)
     }
 
     /// Returns the final blend strength of the shadow cleanup.
@@ -475,7 +487,7 @@ mod tests {
         let settings = ShadowSofteningQualitySettings::new(5.0, 100.0, f32::INFINITY, -1.0);
 
         assert_eq!(settings.intensity(), 1.0);
-        assert_eq!(settings.radius_pixels(), 4.0);
+        assert_eq!(settings.radius_pixels(), 12.0);
         assert!(settings.depth_sensitivity().is_finite());
         assert_eq!(settings.max_luma_delta(), 0.005);
     }

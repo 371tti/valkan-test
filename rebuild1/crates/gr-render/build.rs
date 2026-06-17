@@ -31,6 +31,10 @@ fn main() {
             "shaders/shadow_translucent_textured.frag",
             "shadow_translucent_textured.frag.spv",
         ),
+        (
+            "shaders/shadow_moment_blur.frag",
+            "shadow_moment_blur.frag.spv",
+        ),
         ("shaders/post.vert", "post.vert.spv"),
         ("shaders/post.frag", "post.frag.spv"),
     ] {

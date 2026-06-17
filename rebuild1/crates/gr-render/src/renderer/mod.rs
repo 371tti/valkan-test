@@ -22,6 +22,11 @@ pub use self::vulkan::{VulkanError, VulkanRendererBackend};
 const DEFAULT_SHADOW_MAP_SIZE: u32 = 4096;
 const MIN_SHADOW_MAP_SIZE: u32 = 1024;
 const MAX_SHADOW_MAP_SIZE: u32 = 8192;
+pub(crate) const DEFAULT_DIRECTIONAL_LIGHT_DIR: [f32; 3] = [0.45, -1.0, 0.25];
+pub(crate) const DEFAULT_DIRECTIONAL_LIGHT_COLOR: [f32; 3] = [3.00, 2.65, 2.15];
+pub(crate) const DEFAULT_AMBIENT_COLOR: [f32; 4] = [0.014, 0.017, 0.024, 0.55];
+pub(crate) const DEFAULT_SHADOW_CASCADE_SPLITS: [f32; 4] = [20.0, 52.0, 128.0, 320.0];
+pub(crate) const DEFAULT_SHADOW_CASCADE_METRICS: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 static SHADOW_MAP_SIZE: OnceLock<u32> = OnceLock::new();
 
 /// Returns the fixed shadow-map resolution for this renderer process.

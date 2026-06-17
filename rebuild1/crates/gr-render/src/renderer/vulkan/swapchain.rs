@@ -4,14 +4,24 @@ use crate::protocol::NonZeroExtent;
 
 use super::{
     VulkanDevice, VulkanError,
-    buffer::find_memory_type,
-    immediate::{submit_immediate_commands, transition_image},
     mesh::{MeshPassResources, MeshPipelineSet, VulkanMeshStore},
     post::PostPipeline,
+    shadow_blur::ShadowMomentBlurPipeline,
+    swapchain_pass::{
+        create_post_framebuffer, create_post_render_pass, create_scene_framebuffer,
+        create_scene_render_pass, create_shadow_blur_render_pass, create_shadow_framebuffer,
+        create_shadow_render_pass, create_translucent_shadow_framebuffer,
+        create_translucent_shadow_render_pass, destroy_framebuffer, destroy_render_pass,
+    },
+    swapchain_target::{
+        ColorTarget, DepthTarget, create_color_target, create_depth_target, destroy_color_target,
+        destroy_depth_target, destroy_image_view, initialize_shadow_sampler_fallback_images,
+    },
 };
 use crate::renderer::graph::{
     FrameGraphInitialStates, GraphResource, ResourceState, SHADOW_CASCADE_COUNT,
-    SHADOW_CASCADE_RESOURCES, TRANSLUCENT_SHADOW_RESOURCES,
+    SHADOW_CASCADE_RESOURCES, SHADOW_MOMENT_BLUR_RESOURCES, SHADOW_MOMENT_RAW_RESOURCES,
+    TRANSLUCENT_SHADOW_RESOURCES,
 };
 use crate::renderer::shadow_cascade_size;
 
@@ -29,6 +39,7 @@ const SCENE_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 // UNORM8 would clamp that to 1.0, so post.frag's `transparent.w > 1.0` test can never work.
 const SCENE_TRANSPARENT_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+const SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
 const TRANSLUCENT_SHADOW_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const FALLBACK_SHADOW_TRANSMITTANCE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 
@@ -42,14 +53,7 @@ pub(super) struct VulkanSwapchain {
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     image_states: Vec<ResourceState>,
-    scene_color: ColorTarget,
-    scene_normal_roughness: ColorTarget,
-    scene_transparent_normal_roughness: ColorTarget,
-    scene_depth: DepthTarget,
-    scene_color_state: ResourceState,
-    scene_normal_roughness_state: ResourceState,
-    scene_transparent_normal_roughness_state: ResourceState,
-    scene_depth_state: ResourceState,
+    scene: SceneTargets,
     scene_render_pass: vk::RenderPass,
     post_render_pass: vk::RenderPass,
     mesh_pipeline: MeshPipelineSet,
@@ -62,40 +66,118 @@ pub(super) struct VulkanSwapchain {
 pub(super) struct ShadowResources {
     cascades: [ShadowCascade; SHADOW_CASCADE_COUNT],
     shadow_render_pass: vk::RenderPass,
+    blur_render_pass: vk::RenderPass,
     translucent_render_pass: vk::RenderPass,
     mesh_pass_resources: MeshPassResources,
+    translucent_pass_resources: MeshPassResources,
     shadow_pipeline: MeshPipelineSet,
+    blur_pipeline: ShadowMomentBlurPipeline,
     translucent_pipeline: MeshPipelineSet,
 }
 
 pub(super) struct ShadowSamplerFallback {
-    depth: DepthTarget,
+    moments: ColorTarget,
     transmittance: ColorTarget,
     mesh_pass_resources: MeshPassResources,
 }
 
 struct ShadowCascade {
+    moments: ColorTarget,
+    blurred_moments: ColorTarget,
+    filtered_moments: ColorTarget,
     depth: DepthTarget,
     transmittance: ColorTarget,
-    depth_state: ResourceState,
+    raw_moment_state: ResourceState,
+    blur_moment_state: ResourceState,
+    moment_state: ResourceState,
     transmittance_state: ResourceState,
     shadow_framebuffer: vk::Framebuffer,
+    blur_h_framebuffer: vk::Framebuffer,
+    blur_v_framebuffer: vk::Framebuffer,
     translucent_framebuffer: vk::Framebuffer,
     extent: NonZeroExtent,
 }
 
-struct ColorTarget {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    format: vk::Format,
+struct SceneTargets {
+    color: ColorTarget,
+    normal_roughness: ColorTarget,
+    transparent_normal_roughness: ColorTarget,
+    depth: DepthTarget,
+    color_state: ResourceState,
+    normal_roughness_state: ResourceState,
+    transparent_normal_roughness_state: ResourceState,
+    depth_state: ResourceState,
 }
 
-struct DepthTarget {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    format: vk::Format,
+impl SceneTargets {
+    /// Groups scene attachments and their graph states behind one runtime-owned boundary.
+    fn new(
+        color: ColorTarget,
+        normal_roughness: ColorTarget,
+        transparent_normal_roughness: ColorTarget,
+        depth: DepthTarget,
+    ) -> Self {
+        Self {
+            color,
+            normal_roughness,
+            transparent_normal_roughness,
+            depth,
+            color_state: ResourceState::Undefined,
+            normal_roughness_state: ResourceState::Undefined,
+            transparent_normal_roughness_state: ResourceState::Undefined,
+            depth_state: ResourceState::Undefined,
+        }
+    }
+
+    /// Returns the tracked graph states for the scene MRT and depth attachments.
+    fn graph_states(&self) -> (ResourceState, ResourceState, ResourceState, ResourceState) {
+        (
+            self.color_state,
+            self.normal_roughness_state,
+            self.transparent_normal_roughness_state,
+            self.depth_state,
+        )
+    }
+
+    /// Applies graph final states back into the tracked scene attachment states.
+    fn apply_graph_final_states(&mut self, plan: &crate::renderer::graph::FrameGraphPlan) {
+        if let Some(state) = plan.final_state_for(GraphResource::SceneColor) {
+            self.color_state = state;
+        }
+        if let Some(state) = plan.final_state_for(GraphResource::SceneNormalRoughness) {
+            self.normal_roughness_state = state;
+        }
+        if let Some(state) = plan.final_state_for(GraphResource::SceneTransparentNormalRoughness) {
+            self.transparent_normal_roughness_state = state;
+        }
+        if let Some(state) = plan.final_state_for(GraphResource::SceneDepth) {
+            self.depth_state = state;
+        }
+    }
+
+    /// Resolves one scene graph resource to its image and aspect range.
+    fn graph_image(&self, resource: GraphResource) -> Option<(vk::Image, vk::ImageAspectFlags)> {
+        match resource {
+            GraphResource::SceneColor => Some((self.color.image, vk::ImageAspectFlags::COLOR)),
+            GraphResource::SceneNormalRoughness => {
+                Some((self.normal_roughness.image, vk::ImageAspectFlags::COLOR))
+            }
+            GraphResource::SceneTransparentNormalRoughness => Some((
+                self.transparent_normal_roughness.image,
+                vk::ImageAspectFlags::COLOR,
+            )),
+            GraphResource::SceneDepth => Some((self.depth.image, vk::ImageAspectFlags::DEPTH)),
+            _ => None,
+        }
+    }
+
+    /// Destroys every scene attachment after the swapchain stops referencing them.
+    fn destroy(self, device: &Device) {
+        destroy_depth_target(device, self.depth);
+        destroy_color_target(device, self.transparent_normal_roughness);
+        destroy_color_target(device, self.normal_roughness);
+        destroy_color_target(device, self.color);
+    }
 }
 
 pub(super) struct SwapchainSupport {
@@ -187,20 +269,15 @@ impl<'a> SwapchainBuild<'a> {
             images: std::mem::take(&mut self.images),
             image_views: std::mem::take(&mut self.image_views),
             image_states,
-            scene_color: take_created(&mut self.scene_color, "scene color"),
-            scene_normal_roughness: take_created(
-                &mut self.scene_normal_roughness,
-                "scene normal roughness",
+            scene: SceneTargets::new(
+                take_created(&mut self.scene_color, "scene color"),
+                take_created(&mut self.scene_normal_roughness, "scene normal roughness"),
+                take_created(
+                    &mut self.scene_transparent_normal_roughness,
+                    "scene transparent normal roughness",
+                ),
+                take_created(&mut self.scene_depth, "scene depth"),
             ),
-            scene_transparent_normal_roughness: take_created(
-                &mut self.scene_transparent_normal_roughness,
-                "scene transparent normal roughness",
-            ),
-            scene_depth: take_created(&mut self.scene_depth, "scene depth"),
-            scene_color_state: ResourceState::Undefined,
-            scene_normal_roughness_state: ResourceState::Undefined,
-            scene_transparent_normal_roughness_state: ResourceState::Undefined,
-            scene_depth_state: ResourceState::Undefined,
             scene_render_pass: take_created(&mut self.scene_render_pass, "scene render pass"),
             post_render_pass: take_created(&mut self.post_render_pass, "post render pass"),
             mesh_pipeline: take_created(&mut self.mesh_pipeline, "mesh pipeline"),
@@ -270,9 +347,12 @@ struct ShadowBuild<'a> {
     device: &'a VulkanDevice,
     cascades: Vec<ShadowCascade>,
     shadow_render_pass: Option<vk::RenderPass>,
+    blur_render_pass: Option<vk::RenderPass>,
     translucent_render_pass: Option<vk::RenderPass>,
     mesh_pass_resources: Option<MeshPassResources>,
+    translucent_pass_resources: Option<MeshPassResources>,
     shadow_pipeline: Option<MeshPipelineSet>,
+    blur_pipeline: Option<ShadowMomentBlurPipeline>,
     translucent_pipeline: Option<MeshPipelineSet>,
     finished: bool,
 }
@@ -284,9 +364,12 @@ impl<'a> ShadowBuild<'a> {
             device,
             cascades: Vec::with_capacity(SHADOW_CASCADE_COUNT),
             shadow_render_pass: None,
+            blur_render_pass: None,
             translucent_render_pass: None,
             mesh_pass_resources: None,
+            translucent_pass_resources: None,
             shadow_pipeline: None,
+            blur_pipeline: None,
             translucent_pipeline: None,
             finished: false,
         }
@@ -300,6 +383,7 @@ impl<'a> ShadowBuild<'a> {
         let resources = ShadowResources {
             cascades,
             shadow_render_pass: take_created(&mut self.shadow_render_pass, "shadow render pass"),
+            blur_render_pass: take_created(&mut self.blur_render_pass, "shadow blur render pass"),
             translucent_render_pass: take_created(
                 &mut self.translucent_render_pass,
                 "translucent shadow render pass",
@@ -308,7 +392,12 @@ impl<'a> ShadowBuild<'a> {
                 &mut self.mesh_pass_resources,
                 "shadow pass resources",
             ),
+            translucent_pass_resources: take_created(
+                &mut self.translucent_pass_resources,
+                "translucent shadow pass resources",
+            ),
             shadow_pipeline: take_created(&mut self.shadow_pipeline, "shadow pipeline"),
+            blur_pipeline: take_created(&mut self.blur_pipeline, "shadow blur pipeline"),
             translucent_pipeline: take_created(
                 &mut self.translucent_pipeline,
                 "translucent shadow pipeline",
@@ -329,10 +418,16 @@ impl Drop for ShadowBuild<'_> {
         if let Some(resources) = self.mesh_pass_resources.take() {
             resources.destroy(&self.device.device);
         }
+        if let Some(resources) = self.translucent_pass_resources.take() {
+            resources.destroy(&self.device.device);
+        }
         if let Some(pipeline) = self.translucent_pipeline.take() {
             self.device
                 .meshes
                 .destroy_pipeline_set(&self.device.device, pipeline);
+        }
+        if let Some(pipeline) = self.blur_pipeline.take() {
+            pipeline.destroy(&self.device.device);
         }
         if let Some(pipeline) = self.shadow_pipeline.take() {
             self.device
@@ -344,6 +439,7 @@ impl Drop for ShadowBuild<'_> {
         }
         for render_pass in [
             self.translucent_render_pass.take(),
+            self.blur_render_pass.take(),
             self.shadow_render_pass.take(),
         ]
         .into_iter()
@@ -370,11 +466,11 @@ impl ShadowSamplerFallback {
         meshes: &VulkanMeshStore,
     ) -> Result<Self, VulkanError> {
         let extent = NonZeroExtent::new(1, 1).expect("fallback shadow extent must be non-zero");
-        let depth = create_depth_target(
+        let moments = create_color_target(
             device,
             memory_properties,
             extent,
-            DEPTH_FORMAT,
+            SHADOW_MOMENT_FORMAT,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         )?;
         let transmittance = match create_color_target(
@@ -386,7 +482,7 @@ impl ShadowSamplerFallback {
         ) {
             Ok(target) => target,
             Err(error) => {
-                destroy_depth_target(device, depth);
+                destroy_color_target(device, moments);
                 return Err(error);
             }
         };
@@ -395,29 +491,29 @@ impl ShadowSamplerFallback {
             device,
             queue_family_index,
             queue,
-            depth.image,
+            moments.image,
             transmittance.image,
         ) {
             destroy_color_target(device, transmittance);
-            destroy_depth_target(device, depth);
+            destroy_color_target(device, moments);
             return Err(error);
         }
 
-        let shadow_views = [depth.view; SHADOW_CASCADE_COUNT];
+        let shadow_views = [moments.view; SHADOW_CASCADE_COUNT];
         let translucent_views = [transmittance.view; SHADOW_CASCADE_COUNT];
         let mesh_pass_resources =
             match meshes.create_pass_resources(device, shadow_views, translucent_views) {
                 Ok(resources) => resources,
                 Err(error) => {
                     destroy_color_target(device, transmittance);
-                    destroy_depth_target(device, depth);
+                    destroy_color_target(device, moments);
                     return Err(error);
                 }
             };
 
         tracing::trace!("created tiny Vulkan shadow sampler fallback");
         Ok(ShadowSamplerFallback {
-            depth,
+            moments,
             transmittance,
             mesh_pass_resources,
         })
@@ -428,7 +524,15 @@ impl VulkanDevice {
     /// Creates fixed shadow resources once per logical device instead of per swapchain resize.
     pub(super) fn create_shadow_resources(&self) -> Result<ShadowResources, VulkanError> {
         let mut build = ShadowBuild::new(self);
-        build.shadow_render_pass = Some(create_shadow_render_pass(&self.device, DEPTH_FORMAT)?);
+        build.shadow_render_pass = Some(create_shadow_render_pass(
+            &self.device,
+            SHADOW_MOMENT_FORMAT,
+            DEPTH_FORMAT,
+        )?);
+        build.blur_render_pass = Some(create_shadow_blur_render_pass(
+            &self.device,
+            SHADOW_MOMENT_FORMAT,
+        )?);
         build.translucent_render_pass = Some(create_translucent_shadow_render_pass(
             &self.device,
             TRANSLUCENT_SHADOW_FORMAT,
@@ -437,19 +541,64 @@ impl VulkanDevice {
         let shadow_render_pass = build
             .shadow_render_pass
             .expect("shadow render pass was just created");
+        let blur_render_pass = build
+            .blur_render_pass
+            .expect("shadow blur render pass was just created");
         let translucent_render_pass = build
             .translucent_render_pass
             .expect("translucent shadow render pass was just created");
 
         for cascade_index in 0..SHADOW_CASCADE_COUNT {
             let extent = shadow_cascade_extent(cascade_index);
-            let depth = create_depth_target(
+            let moments = create_color_target(
+                &self.device,
+                &self.memory_properties,
+                extent,
+                SHADOW_MOMENT_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            )?;
+            let blurred_moments = match create_color_target(
+                &self.device,
+                &self.memory_properties,
+                extent,
+                SHADOW_MOMENT_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    destroy_color_target(&self.device, moments);
+                    return Err(error);
+                }
+            };
+            let filtered_moments = match create_color_target(
+                &self.device,
+                &self.memory_properties,
+                extent,
+                SHADOW_MOMENT_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    destroy_color_target(&self.device, blurred_moments);
+                    destroy_color_target(&self.device, moments);
+                    return Err(error);
+                }
+            };
+            let depth = match create_depth_target(
                 &self.device,
                 &self.memory_properties,
                 extent,
                 DEPTH_FORMAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-            )?;
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            ) {
+                Ok(target) => target,
+                Err(error) => {
+                    destroy_color_target(&self.device, filtered_moments);
+                    destroy_color_target(&self.device, blurred_moments);
+                    destroy_color_target(&self.device, moments);
+                    return Err(error);
+                }
+            };
             let transmittance = match create_color_target(
                 &self.device,
                 &self.memory_properties,
@@ -460,12 +609,16 @@ impl VulkanDevice {
                 Ok(target) => target,
                 Err(error) => {
                     destroy_depth_target(&self.device, depth);
+                    destroy_color_target(&self.device, filtered_moments);
+                    destroy_color_target(&self.device, blurred_moments);
+                    destroy_color_target(&self.device, moments);
                     return Err(error);
                 }
             };
-            let shadow_framebuffer = match create_depth_framebuffer(
+            let shadow_framebuffer = match create_shadow_framebuffer(
                 &self.device,
                 shadow_render_pass,
+                moments.view,
                 depth.view,
                 extent,
             ) {
@@ -473,6 +626,44 @@ impl VulkanDevice {
                 Err(error) => {
                     destroy_color_target(&self.device, transmittance);
                     destroy_depth_target(&self.device, depth);
+                    destroy_color_target(&self.device, filtered_moments);
+                    destroy_color_target(&self.device, blurred_moments);
+                    destroy_color_target(&self.device, moments);
+                    return Err(error);
+                }
+            };
+            let blur_h_framebuffer = match create_post_framebuffer(
+                &self.device,
+                blur_render_pass,
+                blurred_moments.view,
+                extent,
+            ) {
+                Ok(framebuffer) => framebuffer,
+                Err(error) => {
+                    destroy_framebuffer(&self.device, shadow_framebuffer);
+                    destroy_color_target(&self.device, transmittance);
+                    destroy_depth_target(&self.device, depth);
+                    destroy_color_target(&self.device, filtered_moments);
+                    destroy_color_target(&self.device, blurred_moments);
+                    destroy_color_target(&self.device, moments);
+                    return Err(error);
+                }
+            };
+            let blur_v_framebuffer = match create_post_framebuffer(
+                &self.device,
+                blur_render_pass,
+                filtered_moments.view,
+                extent,
+            ) {
+                Ok(framebuffer) => framebuffer,
+                Err(error) => {
+                    destroy_framebuffer(&self.device, blur_h_framebuffer);
+                    destroy_framebuffer(&self.device, shadow_framebuffer);
+                    destroy_color_target(&self.device, transmittance);
+                    destroy_depth_target(&self.device, depth);
+                    destroy_color_target(&self.device, filtered_moments);
+                    destroy_color_target(&self.device, blurred_moments);
+                    destroy_color_target(&self.device, moments);
                     return Err(error);
                 }
             };
@@ -484,19 +675,31 @@ impl VulkanDevice {
             ) {
                 Ok(framebuffer) => framebuffer,
                 Err(error) => {
+                    destroy_framebuffer(&self.device, blur_v_framebuffer);
+                    destroy_framebuffer(&self.device, blur_h_framebuffer);
                     destroy_framebuffer(&self.device, shadow_framebuffer);
                     destroy_color_target(&self.device, transmittance);
                     destroy_depth_target(&self.device, depth);
+                    destroy_color_target(&self.device, filtered_moments);
+                    destroy_color_target(&self.device, blurred_moments);
+                    destroy_color_target(&self.device, moments);
                     return Err(error);
                 }
             };
 
             build.cascades.push(ShadowCascade {
+                moments,
+                blurred_moments,
+                filtered_moments,
                 depth,
                 transmittance,
-                depth_state: ResourceState::Undefined,
+                raw_moment_state: ResourceState::Undefined,
+                blur_moment_state: ResourceState::Undefined,
+                moment_state: ResourceState::Undefined,
                 transmittance_state: ResourceState::Undefined,
                 shadow_framebuffer,
+                blur_h_framebuffer,
+                blur_v_framebuffer,
                 translucent_framebuffer,
                 extent,
             });
@@ -505,10 +708,24 @@ impl VulkanDevice {
         let shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT] = build
             .cascades
             .iter()
-            .map(|cascade| cascade.depth.view)
+            .map(|cascade| cascade.filtered_moments.view)
             .collect::<Vec<_>>()
             .try_into()
             .unwrap_or_else(|_| panic!("all shadow cascade views must exist"));
+        let blur_h_source_views: [vk::ImageView; SHADOW_CASCADE_COUNT] = build
+            .cascades
+            .iter()
+            .map(|cascade| cascade.moments.view)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap_or_else(|_| panic!("all raw shadow cascade views must exist"));
+        let blur_v_source_views: [vk::ImageView; SHADOW_CASCADE_COUNT] = build
+            .cascades
+            .iter()
+            .map(|cascade| cascade.blurred_moments.view)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap_or_else(|_| panic!("all blurred shadow cascade views must exist"));
         let translucent_views: [vk::ImageView; SHADOW_CASCADE_COUNT] = build
             .cascades
             .iter()
@@ -521,6 +738,17 @@ impl VulkanDevice {
             &self.device,
             shadow_views,
             translucent_views,
+        )?);
+        build.translucent_pass_resources = Some(self.meshes.create_pass_resources(
+            &self.device,
+            blur_h_source_views,
+            translucent_views,
+        )?);
+        build.blur_pipeline = Some(ShadowMomentBlurPipeline::create(
+            &self.device,
+            blur_render_pass,
+            blur_h_source_views,
+            blur_v_source_views,
         )?);
         build.shadow_pipeline = Some(
             self.meshes
@@ -732,10 +960,7 @@ impl VulkanDevice {
             .destroy_pipeline_set(&self.device, swapchain.transparent_mesh_pipeline);
         destroy_render_pass(&self.device, swapchain.post_render_pass);
         destroy_render_pass(&self.device, swapchain.scene_render_pass);
-        destroy_depth_target(&self.device, swapchain.scene_depth);
-        destroy_color_target(&self.device, swapchain.scene_transparent_normal_roughness);
-        destroy_color_target(&self.device, swapchain.scene_normal_roughness);
-        destroy_color_target(&self.device, swapchain.scene_color);
+        swapchain.scene.destroy(&self.device);
         self.destroy_image_views(swapchain.image_views);
         self.destroy_swapchain_handle(swapchain.handle);
     }
@@ -894,22 +1119,38 @@ impl VulkanSwapchain {
         image_index: u32,
         shadows: Option<&ShadowResources>,
     ) -> Result<FrameGraphInitialStates, VulkanError> {
-        let shadow_depth_states = shadows.map_or(
+        let shadow_moment_states = shadows.map_or(
             [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-            ShadowResources::depth_states,
+            ShadowResources::moment_states,
+        );
+        let shadow_raw_moment_states = shadows.map_or(
+            [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+            ShadowResources::raw_moment_states,
+        );
+        let shadow_blur_moment_states = shadows.map_or(
+            [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+            ShadowResources::blur_moment_states,
         );
         let translucent_shadow_states = shadows.map_or(
             [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
             ShadowResources::transmittance_states,
         );
+        let (
+            scene_color_state,
+            scene_normal_roughness_state,
+            scene_transparent_normal_roughness_state,
+            scene_depth_state,
+        ) = self.scene.graph_states();
         Ok(FrameGraphInitialStates::new(
             self.image_state(image_index)?,
-            shadow_depth_states,
+            shadow_raw_moment_states,
+            shadow_blur_moment_states,
+            shadow_moment_states,
             translucent_shadow_states,
-            self.scene_color_state,
-            self.scene_normal_roughness_state,
-            self.scene_transparent_normal_roughness_state,
-            self.scene_depth_state,
+            scene_color_state,
+            scene_normal_roughness_state,
+            scene_transparent_normal_roughness_state,
+            scene_depth_state,
         ))
     }
 
@@ -922,18 +1163,7 @@ impl VulkanSwapchain {
         if let Some(state) = plan.final_state_for(GraphResource::SwapchainImage) {
             *self.image_state_mut(image_index)? = state;
         }
-        if let Some(state) = plan.final_state_for(GraphResource::SceneColor) {
-            self.scene_color_state = state;
-        }
-        if let Some(state) = plan.final_state_for(GraphResource::SceneNormalRoughness) {
-            self.scene_normal_roughness_state = state;
-        }
-        if let Some(state) = plan.final_state_for(GraphResource::SceneTransparentNormalRoughness) {
-            self.scene_transparent_normal_roughness_state = state;
-        }
-        if let Some(state) = plan.final_state_for(GraphResource::SceneDepth) {
-            self.scene_depth_state = state;
-        }
+        self.scene.apply_graph_final_states(plan);
         Ok(())
     }
 
@@ -943,32 +1173,45 @@ impl VulkanSwapchain {
         resource: GraphResource,
         image_index: u32,
     ) -> Result<(vk::Image, vk::ImageAspectFlags), VulkanError> {
+        if resource.is_shadow_resource() {
+            return Err(VulkanError::GraphCompile(format!(
+                "shadow graph resource {} is not owned by the swapchain",
+                resource.name()
+            )));
+        }
+        if let Some(image) = self.scene.graph_image(resource) {
+            return Ok(image);
+        }
+
         match resource {
             GraphResource::SwapchainImage => Ok((
                 self.image_for_index(image_index)?,
                 vk::ImageAspectFlags::COLOR,
             )),
-            GraphResource::SceneColor => Ok((self.scene_color.image, vk::ImageAspectFlags::COLOR)),
-            GraphResource::SceneNormalRoughness => Ok((
-                self.scene_normal_roughness.image,
-                vk::ImageAspectFlags::COLOR,
-            )),
-            GraphResource::SceneTransparentNormalRoughness => Ok((
-                self.scene_transparent_normal_roughness.image,
-                vk::ImageAspectFlags::COLOR,
-            )),
-            GraphResource::SceneDepth => Ok((self.scene_depth.image, vk::ImageAspectFlags::DEPTH)),
-            GraphResource::ShadowCascade0
+            GraphResource::SceneColor
+            | GraphResource::SceneNormalRoughness
+            | GraphResource::SceneTransparentNormalRoughness
+            | GraphResource::SceneDepth => {
+                unreachable!("scene resources return early above")
+            }
+            GraphResource::ShadowMomentRaw0
+            | GraphResource::ShadowMomentRaw1
+            | GraphResource::ShadowMomentRaw2
+            | GraphResource::ShadowMomentRaw3
+            | GraphResource::ShadowMomentBlur0
+            | GraphResource::ShadowMomentBlur1
+            | GraphResource::ShadowMomentBlur2
+            | GraphResource::ShadowMomentBlur3
+            | GraphResource::ShadowCascade0
             | GraphResource::ShadowCascade1
             | GraphResource::ShadowCascade2
             | GraphResource::ShadowCascade3
             | GraphResource::TranslucentShadow0
             | GraphResource::TranslucentShadow1
             | GraphResource::TranslucentShadow2
-            | GraphResource::TranslucentShadow3 => Err(VulkanError::GraphCompile(format!(
-                "shadow graph resource {} is not owned by the swapchain",
-                resource.name()
-            ))),
+            | GraphResource::TranslucentShadow3 => {
+                unreachable!("shadow resources return early above")
+            }
         }
     }
 
@@ -1008,6 +1251,11 @@ impl ShadowResources {
         self.shadow_render_pass
     }
 
+    /// Returns the render pass that writes one separable moment blur target.
+    pub(super) fn blur_render_pass(&self) -> vk::RenderPass {
+        self.blur_render_pass
+    }
+
     /// Returns the render pass that writes one translucent cascade transmittance target.
     pub(super) fn translucent_render_pass(&self) -> vk::RenderPass {
         self.translucent_render_pass
@@ -1018,6 +1266,11 @@ impl ShadowResources {
         self.shadow_pipeline
     }
 
+    /// Returns the fullscreen separable blur pipeline for shadow moments.
+    pub(super) fn blur_pipeline(&self) -> &ShadowMomentBlurPipeline {
+        &self.blur_pipeline
+    }
+
     /// Returns the translucent shadow mesh pipelines shared by all cascades.
     pub(super) fn translucent_pipeline(&self) -> MeshPipelineSet {
         self.translucent_pipeline
@@ -1026,6 +1279,11 @@ impl ShadowResources {
     /// Returns descriptors used by scene mesh shaders to sample every shadow cascade.
     pub(super) fn mesh_pass_resources(&self) -> &MeshPassResources {
         &self.mesh_pass_resources
+    }
+
+    /// Returns descriptors used by translucent shadow shaders to test unfiltered opaque depth.
+    pub(super) fn translucent_pass_resources(&self) -> &MeshPassResources {
+        &self.translucent_pass_resources
     }
 
     /// Returns the fixed render extent for one cascade index.
@@ -1045,6 +1303,22 @@ impl ShadowResources {
         Ok(self.cascade(cascade_index)?.shadow_framebuffer)
     }
 
+    /// Returns the framebuffer that receives horizontal moment blur for one cascade.
+    pub(super) fn blur_h_framebuffer(
+        &self,
+        cascade_index: usize,
+    ) -> Result<vk::Framebuffer, VulkanError> {
+        Ok(self.cascade(cascade_index)?.blur_h_framebuffer)
+    }
+
+    /// Returns the framebuffer that receives the filtered moment map for one cascade.
+    pub(super) fn blur_v_framebuffer(
+        &self,
+        cascade_index: usize,
+    ) -> Result<vk::Framebuffer, VulkanError> {
+        Ok(self.cascade(cascade_index)?.blur_v_framebuffer)
+    }
+
     /// Returns the framebuffer used to render one translucent shadow cascade.
     pub(super) fn translucent_framebuffer(
         &self,
@@ -1053,9 +1327,19 @@ impl ShadowResources {
         Ok(self.cascade(cascade_index)?.translucent_framebuffer)
     }
 
-    /// Returns tracked depth layouts for graph compilation.
-    fn depth_states(&self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
-        std::array::from_fn(|index| self.cascades[index].depth_state)
+    /// Returns tracked raw moment-map layouts for graph compilation.
+    fn raw_moment_states(&self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
+        std::array::from_fn(|index| self.cascades[index].raw_moment_state)
+    }
+
+    /// Returns tracked horizontal blur scratch layouts for graph compilation.
+    fn blur_moment_states(&self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
+        std::array::from_fn(|index| self.cascades[index].blur_moment_state)
+    }
+
+    /// Returns tracked moment-map layouts for graph compilation.
+    fn moment_states(&self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
+        std::array::from_fn(|index| self.cascades[index].moment_state)
     }
 
     /// Returns tracked translucent transmittance layouts for graph compilation.
@@ -1068,9 +1352,19 @@ impl ShadowResources {
         &mut self,
         plan: &crate::renderer::graph::FrameGraphPlan,
     ) {
+        for (cascade, resource) in self.cascades.iter_mut().zip(SHADOW_MOMENT_RAW_RESOURCES) {
+            if let Some(state) = plan.final_state_for(resource) {
+                cascade.raw_moment_state = state;
+            }
+        }
+        for (cascade, resource) in self.cascades.iter_mut().zip(SHADOW_MOMENT_BLUR_RESOURCES) {
+            if let Some(state) = plan.final_state_for(resource) {
+                cascade.blur_moment_state = state;
+            }
+        }
         for (cascade, resource) in self.cascades.iter_mut().zip(SHADOW_CASCADE_RESOURCES) {
             if let Some(state) = plan.final_state_for(resource) {
-                cascade.depth_state = state;
+                cascade.moment_state = state;
             }
         }
         for (cascade, resource) in self.cascades.iter_mut().zip(TRANSLUCENT_SHADOW_RESOURCES) {
@@ -1085,14 +1379,36 @@ impl ShadowResources {
         &self,
         resource: GraphResource,
     ) -> Option<(vk::Image, vk::ImageAspectFlags)> {
-        SHADOW_CASCADE_RESOURCES
+        SHADOW_MOMENT_RAW_RESOURCES
             .iter()
             .position(|candidate| *candidate == resource)
             .map(|index| {
                 (
-                    self.cascades[index].depth.image,
-                    vk::ImageAspectFlags::DEPTH,
+                    self.cascades[index].moments.image,
+                    vk::ImageAspectFlags::COLOR,
                 )
+            })
+            .or_else(|| {
+                SHADOW_MOMENT_BLUR_RESOURCES
+                    .iter()
+                    .position(|candidate| *candidate == resource)
+                    .map(|index| {
+                        (
+                            self.cascades[index].blurred_moments.image,
+                            vk::ImageAspectFlags::COLOR,
+                        )
+                    })
+            })
+            .or_else(|| {
+                SHADOW_CASCADE_RESOURCES
+                    .iter()
+                    .position(|candidate| *candidate == resource)
+                    .map(|index| {
+                        (
+                            self.cascades[index].filtered_moments.image,
+                            vk::ImageAspectFlags::COLOR,
+                        )
+                    })
             })
             .or_else(|| {
                 TRANSLUCENT_SHADOW_RESOURCES
@@ -1109,13 +1425,16 @@ impl ShadowResources {
 
     /// Releases fixed shadow framebuffers, descriptors, pipelines, render passes, and targets.
     fn destroy(self, device: &Device, meshes: &VulkanMeshStore) {
+        self.translucent_pass_resources.destroy(device);
         self.mesh_pass_resources.destroy(device);
         meshes.destroy_pipeline_set(device, self.translucent_pipeline);
+        self.blur_pipeline.destroy(device);
         meshes.destroy_pipeline_set(device, self.shadow_pipeline);
         for cascade in self.cascades {
             destroy_shadow_cascade(device, cascade);
         }
         destroy_render_pass(device, self.translucent_render_pass);
+        destroy_render_pass(device, self.blur_render_pass);
         destroy_render_pass(device, self.shadow_render_pass);
     }
 
@@ -1140,7 +1459,7 @@ impl ShadowSamplerFallback {
     pub(super) fn destroy(self, device: &Device) {
         self.mesh_pass_resources.destroy(device);
         destroy_color_target(device, self.transmittance);
-        destroy_depth_target(device, self.depth);
+        destroy_color_target(device, self.moments);
     }
 }
 
@@ -1372,561 +1691,6 @@ fn create_swapchain_image_view(
     unsafe { device.create_image_view(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
-/// Destroys one swapchain image view.
-fn destroy_image_view(device: &Device, image_view: vk::ImageView) {
-    if image_view == vk::ImageView::null() {
-        return;
-    }
-
-    // Safety: the image view was created by this device and is destroyed exactly once.
-    unsafe {
-        device.destroy_image_view(image_view, None);
-    }
-}
-
-/// Creates the color/depth render pass used by the graph scene pass.
-fn create_scene_render_pass(
-    device: &Device,
-    color_format: vk::Format,
-    normal_roughness_format: vk::Format,
-    transparent_normal_roughness_format: vk::Format,
-    depth_format: vk::Format,
-) -> Result<vk::RenderPass, VulkanError> {
-    let color_attachment = vk::AttachmentDescription::default()
-        .format(color_format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let normal_roughness_attachment = vk::AttachmentDescription::default()
-        .format(normal_roughness_format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let transparent_normal_roughness_attachment = vk::AttachmentDescription::default()
-        .format(transparent_normal_roughness_format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let depth_attachment = vk::AttachmentDescription::default()
-        .format(depth_format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    let color_attachment_ref = vk::AttachmentReference::default()
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let normal_roughness_attachment_ref = vk::AttachmentReference::default()
-        .attachment(1)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let transparent_normal_roughness_attachment_ref = vk::AttachmentReference::default()
-        .attachment(2)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let depth_attachment_ref = vk::AttachmentReference::default()
-        .attachment(3)
-        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    let color_attachment_refs = [
-        color_attachment_ref,
-        normal_roughness_attachment_ref,
-        transparent_normal_roughness_attachment_ref,
-    ];
-    let subpass = vk::SubpassDescription::default()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachment_refs)
-        .depth_stencil_attachment(&depth_attachment_ref);
-    let attachments = [
-        color_attachment,
-        normal_roughness_attachment,
-        transparent_normal_roughness_attachment,
-        depth_attachment,
-    ];
-    let subpasses = [subpass];
-    let create_info = vk::RenderPassCreateInfo::default()
-        .attachments(&attachments)
-        .subpasses(&subpasses);
-
-    // Safety: all slices in `create_info` live for the duration of the call, and graph barriers
-    // transition the swapchain image into and out of the color attachment layout.
-    unsafe { device.create_render_pass(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Creates the depth-only render pass used to populate the graph shadow map.
-fn create_shadow_render_pass(
-    device: &Device,
-    depth_format: vk::Format,
-) -> Result<vk::RenderPass, VulkanError> {
-    let depth_attachment = vk::AttachmentDescription::default()
-        .format(depth_format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    let depth_attachment_ref = vk::AttachmentReference::default()
-        .attachment(0)
-        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    let subpass = vk::SubpassDescription::default()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .depth_stencil_attachment(&depth_attachment_ref);
-    let attachments = [depth_attachment];
-    let subpasses = [subpass];
-    let create_info = vk::RenderPassCreateInfo::default()
-        .attachments(&attachments)
-        .subpasses(&subpasses);
-
-    // Safety: all create-info slices live for this call and graph barriers control depth layout.
-    unsafe { device.create_render_pass(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Creates the color-only pass that accumulates transparent shadow transmittance per cascade.
-fn create_translucent_shadow_render_pass(
-    device: &Device,
-    color_format: vk::Format,
-) -> Result<vk::RenderPass, VulkanError> {
-    let color_attachment = vk::AttachmentDescription::default()
-        .format(color_format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let color_attachment_ref = vk::AttachmentReference::default()
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let color_attachment_refs = [color_attachment_ref];
-    let subpass = vk::SubpassDescription::default()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachment_refs);
-    let attachments = [color_attachment];
-    let subpasses = [subpass];
-    let create_info = vk::RenderPassCreateInfo::default()
-        .attachments(&attachments)
-        .subpasses(&subpasses);
-
-    // Safety: graph barriers place the transmittance target in color attachment layout.
-    unsafe { device.create_render_pass(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Creates the color-only render pass that writes a post result into the swapchain image.
-fn create_post_render_pass(
-    device: &Device,
-    format: vk::Format,
-) -> Result<vk::RenderPass, VulkanError> {
-    let color_attachment = vk::AttachmentDescription::default()
-        .format(format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let color_attachment_ref = vk::AttachmentReference::default()
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let color_attachment_refs = [color_attachment_ref];
-    let subpass = vk::SubpassDescription::default()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachment_refs);
-    let attachments = [color_attachment];
-    let subpasses = [subpass];
-    let create_info = vk::RenderPassCreateInfo::default()
-        .attachments(&attachments)
-        .subpasses(&subpasses);
-
-    // Safety: all create-info slices are local and graph barriers handle image layout changes.
-    unsafe { device.create_render_pass(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Destroys one swapchain render pass after its framebuffers are gone.
-fn destroy_render_pass(device: &Device, render_pass: vk::RenderPass) {
-    if render_pass == vk::RenderPass::null() {
-        return;
-    }
-
-    // Safety: the render pass was created by this device and is destroyed after its framebuffers.
-    unsafe {
-        device.destroy_render_pass(render_pass, None);
-    }
-}
-
-/// Creates the scene framebuffer that binds scene color and scene depth views.
-fn create_scene_framebuffer(
-    device: &Device,
-    render_pass: vk::RenderPass,
-    color_view: vk::ImageView,
-    normal_roughness_view: vk::ImageView,
-    transparent_normal_roughness_view: vk::ImageView,
-    depth_view: vk::ImageView,
-    extent: NonZeroExtent,
-) -> Result<vk::Framebuffer, VulkanError> {
-    let attachments = [
-        color_view,
-        normal_roughness_view,
-        transparent_normal_roughness_view,
-        depth_view,
-    ];
-    let create_info = vk::FramebufferCreateInfo::default()
-        .render_pass(render_pass)
-        .attachments(&attachments)
-        .width(extent.width())
-        .height(extent.height())
-        .layers(1);
-
-    // Safety: both image views match the render pass attachments and outlive the framebuffer.
-    unsafe { device.create_framebuffer(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Creates the shadow framebuffer that binds only the shadow-map depth view.
-fn create_depth_framebuffer(
-    device: &Device,
-    render_pass: vk::RenderPass,
-    depth_view: vk::ImageView,
-    extent: NonZeroExtent,
-) -> Result<vk::Framebuffer, VulkanError> {
-    let attachments = [depth_view];
-    let create_info = vk::FramebufferCreateInfo::default()
-        .render_pass(render_pass)
-        .attachments(&attachments)
-        .width(extent.width())
-        .height(extent.height())
-        .layers(1);
-
-    // Safety: the depth image view matches the depth-only render pass attachment.
-    unsafe { device.create_framebuffer(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Creates a framebuffer for one translucent shadow cascade transmittance target.
-fn create_translucent_shadow_framebuffer(
-    device: &Device,
-    render_pass: vk::RenderPass,
-    color_view: vk::ImageView,
-    extent: NonZeroExtent,
-) -> Result<vk::Framebuffer, VulkanError> {
-    let attachments = [color_view];
-    let create_info = vk::FramebufferCreateInfo::default()
-        .render_pass(render_pass)
-        .attachments(&attachments)
-        .width(extent.width())
-        .height(extent.height())
-        .layers(1);
-
-    // Safety: the image view belongs to the cascade and matches the render pass attachment.
-    unsafe { device.create_framebuffer(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Creates one post framebuffer for a swapchain image view.
-fn create_post_framebuffer(
-    device: &Device,
-    render_pass: vk::RenderPass,
-    image_view: vk::ImageView,
-    extent: NonZeroExtent,
-) -> Result<vk::Framebuffer, VulkanError> {
-    let attachments = [image_view];
-    let create_info = vk::FramebufferCreateInfo::default()
-        .render_pass(render_pass)
-        .attachments(&attachments)
-        .width(extent.width())
-        .height(extent.height())
-        .layers(1);
-
-    // Safety: the image view matches the color-only post render pass.
-    unsafe { device.create_framebuffer(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Destroys one framebuffer created for a swapchain image view.
-fn destroy_framebuffer(device: &Device, framebuffer: vk::Framebuffer) {
-    if framebuffer == vk::Framebuffer::null() {
-        return;
-    }
-
-    // Safety: the framebuffer was created by this device and is destroyed exactly once.
-    unsafe {
-        device.destroy_framebuffer(framebuffer, None);
-    }
-}
-
-/// Clears 1x1 fallback shadow images to full light and makes them shader-readable.
-fn initialize_shadow_sampler_fallback_images(
-    device: &Device,
-    queue_family_index: u32,
-    queue: vk::Queue,
-    depth_image: vk::Image,
-    transmittance_image: vk::Image,
-) -> Result<(), VulkanError> {
-    submit_immediate_commands(device, queue_family_index, queue, |command_buffer| {
-        transition_image(
-            device,
-            command_buffer,
-            depth_image,
-            vk::ImageAspectFlags::DEPTH,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_WRITE,
-        );
-        transition_image(
-            device,
-            command_buffer,
-            transmittance_image,
-            vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_WRITE,
-        );
-        clear_shadow_fallback_images(device, command_buffer, depth_image, transmittance_image);
-        transition_image(
-            device,
-            command_buffer,
-            depth_image,
-            vk::ImageAspectFlags::DEPTH,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-        );
-        transition_image(
-            device,
-            command_buffer,
-            transmittance_image,
-            vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-        );
-    })
-}
-
-/// Writes full-light values into dummy shadow maps in transfer-destination layout.
-fn clear_shadow_fallback_images(
-    device: &Device,
-    command_buffer: vk::CommandBuffer,
-    depth_image: vk::Image,
-    transmittance_image: vk::Image,
-) {
-    let depth = vk::ClearDepthStencilValue {
-        depth: 1.0,
-        stencil: 0,
-    };
-    let depth_range = [image_subresource_range(vk::ImageAspectFlags::DEPTH)];
-    let color = vk::ClearColorValue {
-        float32: [1.0, 1.0, 1.0, 1.0],
-    };
-    let color_range = [image_subresource_range(vk::ImageAspectFlags::COLOR)];
-
-    // Safety: both images are in TRANSFER_DST_OPTIMAL and were created with TRANSFER_DST usage.
-    unsafe {
-        device.cmd_clear_depth_stencil_image(
-            command_buffer,
-            depth_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &depth,
-            &depth_range,
-        );
-        device.cmd_clear_color_image(
-            command_buffer,
-            transmittance_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &color,
-            &color_range,
-        );
-    }
-}
-
-/// Returns one full image range for setup-time clears.
-fn image_subresource_range(aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::default()
-        .aspect_mask(aspect)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1)
-}
-
-/// Creates a graph-owned color target image, memory allocation, and view.
-fn create_color_target(
-    device: &Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    extent: NonZeroExtent,
-    format: vk::Format,
-    usage: vk::ImageUsageFlags,
-) -> Result<ColorTarget, VulkanError> {
-    let create_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(vk::Extent3D {
-            width: extent.width(),
-            height: extent.height(),
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED);
-
-    // Safety: image create info contains only local values and no custom allocator is used.
-    let image = unsafe { device.create_image(&create_info, None) }.map_err(VulkanError::Vk)?;
-    let memory = match allocate_image_memory(device, memory_properties, image) {
-        Ok(memory) => memory,
-        Err(error) => {
-            destroy_image(device, image);
-            return Err(error);
-        }
-    };
-    // Safety: the allocation satisfies the requirements returned for this image.
-    if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
-        free_memory(device, memory);
-        destroy_image(device, image);
-        return Err(VulkanError::Vk(error));
-    }
-    let view = match create_color_image_view(device, image, format) {
-        Ok(view) => view,
-        Err(error) => {
-            free_memory(device, memory);
-            destroy_image(device, image);
-            return Err(error);
-        }
-    };
-
-    tracing::trace!(
-        width = extent.width(),
-        height = extent.height(),
-        format = ?format,
-        usage = ?usage,
-        "created Vulkan color target"
-    );
-    Ok(ColorTarget {
-        image,
-        memory,
-        view,
-        format,
-    })
-}
-
-/// Creates a 2D color view for a graph-owned color target.
-fn create_color_image_view(
-    device: &Device,
-    image: vk::Image,
-    format: vk::Format,
-) -> Result<vk::ImageView, VulkanError> {
-    let subresource_range = vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1);
-    let create_info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(format)
-        .subresource_range(subresource_range);
-
-    // Safety: the image is a 2D color image created by this device.
-    unsafe { device.create_image_view(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Destroys a graph-owned color target after the device is idle.
-fn destroy_color_target(device: &Device, color: ColorTarget) {
-    destroy_image_view(device, color.view);
-    free_memory(device, color.memory);
-    destroy_image(device, color.image);
-}
-
-/// Creates the depth image, memory, and view shared by the graph scene pass.
-fn create_depth_target(
-    device: &Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    extent: NonZeroExtent,
-    format: vk::Format,
-    usage: vk::ImageUsageFlags,
-) -> Result<DepthTarget, VulkanError> {
-    let create_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(vk::Extent3D {
-            width: extent.width(),
-            height: extent.height(),
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED);
-
-    // Safety: image create info contains only local values and no custom allocator is used.
-    let image = unsafe { device.create_image(&create_info, None) }.map_err(VulkanError::Vk)?;
-    let memory = match allocate_image_memory(device, memory_properties, image) {
-        Ok(memory) => memory,
-        Err(error) => {
-            destroy_image(device, image);
-            return Err(error);
-        }
-    };
-    // Safety: the allocation satisfies the memory requirements returned for this image.
-    if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
-        free_memory(device, memory);
-        destroy_image(device, image);
-        return Err(VulkanError::Vk(error));
-    }
-    let view = match create_depth_image_view(device, image, format) {
-        Ok(view) => view,
-        Err(error) => {
-            free_memory(device, memory);
-            destroy_image(device, image);
-            return Err(error);
-        }
-    };
-
-    tracing::trace!(
-        width = extent.width(),
-        height = extent.height(),
-        format = ?format,
-        usage = ?usage,
-        "created Vulkan depth target"
-    );
-    Ok(DepthTarget {
-        image,
-        memory,
-        view,
-        format,
-    })
-}
-
 fn shadow_cascade_extent(cascade_index: usize) -> NonZeroExtent {
     let size = shadow_cascade_size(cascade_index);
     NonZeroExtent::new(size, size).expect("shadow map extent must be non-zero")
@@ -1935,81 +1699,12 @@ fn shadow_cascade_extent(cascade_index: usize) -> NonZeroExtent {
 /// Destroys one fixed shadow cascade after frame work has completed.
 fn destroy_shadow_cascade(device: &Device, cascade: ShadowCascade) {
     destroy_framebuffer(device, cascade.translucent_framebuffer);
+    destroy_framebuffer(device, cascade.blur_v_framebuffer);
+    destroy_framebuffer(device, cascade.blur_h_framebuffer);
     destroy_framebuffer(device, cascade.shadow_framebuffer);
     destroy_color_target(device, cascade.transmittance);
     destroy_depth_target(device, cascade.depth);
-}
-
-/// Allocates device-local memory compatible with a depth image.
-fn allocate_image_memory(
-    device: &Device,
-    memory_properties: &vk::PhysicalDeviceMemoryProperties,
-    image: vk::Image,
-) -> Result<vk::DeviceMemory, VulkanError> {
-    // Safety: the image was created by this device and is alive for the requirement query.
-    let requirements = unsafe { device.get_image_memory_requirements(image) };
-    let memory_type_index = find_memory_type(
-        memory_properties,
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-    let allocate_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type_index);
-
-    // Safety: the memory type index was selected from this physical device's properties.
-    unsafe { device.allocate_memory(&allocate_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Creates the view used by the depth attachment.
-fn create_depth_image_view(
-    device: &Device,
-    image: vk::Image,
-    format: vk::Format,
-) -> Result<vk::ImageView, VulkanError> {
-    let subresource_range = vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::DEPTH)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1);
-    let create_info = vk::ImageViewCreateInfo::default()
-        .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
-        .format(format)
-        .subresource_range(subresource_range);
-
-    // Safety: the image is a depth image created by this device and the view is 2D depth-only.
-    unsafe { device.create_image_view(&create_info, None) }.map_err(VulkanError::Vk)
-}
-
-/// Destroys a depth target after all framebuffers that reference it are gone.
-fn destroy_depth_target(device: &Device, depth: DepthTarget) {
-    destroy_image_view(device, depth.view);
-    free_memory(device, depth.memory);
-    destroy_image(device, depth.image);
-}
-
-/// Destroys one raw image handle.
-fn destroy_image(device: &Device, image: vk::Image) {
-    if image == vk::Image::null() {
-        return;
-    }
-
-    // Safety: the image was created by this device and is destroyed after GPU idle.
-    unsafe {
-        device.destroy_image(image, None);
-    }
-}
-
-/// Frees one image memory allocation.
-fn free_memory(device: &Device, memory: vk::DeviceMemory) {
-    if memory == vk::DeviceMemory::null() {
-        return;
-    }
-
-    // Safety: the allocation belongs to this device and is no longer bound to live work.
-    unsafe {
-        device.free_memory(memory, None);
-    }
+    destroy_color_target(device, cascade.filtered_moments);
+    destroy_color_target(device, cascade.blurred_moments);
+    destroy_color_target(device, cascade.moments);
 }

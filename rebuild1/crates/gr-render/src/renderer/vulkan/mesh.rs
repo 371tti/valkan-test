@@ -6,16 +6,17 @@ use std::{
 };
 
 use ash::{Device, Instance, util, vk};
-use meshopt::SimplifyOptions;
 
 use crate::{
     import::ImportedMesh,
-    math::{dot3, normalize_or, sub3},
+    math::{dot3, identity_mat4, normalize_or, sub3},
     protocol::{
         AssetHandle, CameraSnapshot, MeshHandle, RenderItemPacket, RenderOptimizationSettings,
         SceneBounds,
     },
     renderer::{
+        DEFAULT_AMBIENT_COLOR, DEFAULT_DIRECTIONAL_LIGHT_COLOR, DEFAULT_DIRECTIONAL_LIGHT_DIR,
+        DEFAULT_SHADOW_CASCADE_METRICS, DEFAULT_SHADOW_CASCADE_SPLITS,
         assets::{MeshGeometry, MeshVertex},
         graph::SHADOW_CASCADE_COUNT,
         pipeline::shader_interface,
@@ -28,14 +29,11 @@ use super::{
     buffer::{
         GpuBuffer, create_buffer_with_data, destroy_buffers, memory_properties, write_buffer_value,
     },
+    lod::unique_lod_indices,
     material::VulkanMaterialStore,
 };
 
 const SHADER_ENTRY: &CStr = c"main";
-const MEDIUM_LOD_RATIO: f32 = 0.72;
-const LOW_LOD_RATIO: f32 = 0.45;
-const MEDIUM_LOD_ERROR: f32 = 0.015;
-const LOW_LOD_ERROR: f32 = 0.04;
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const SCENE_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh_scene.frag.spv"));
@@ -51,10 +49,9 @@ const SHADOW_TRANSLUCENT_TEXTURED_FRAGMENT_SHADER: &[u8] = include_bytes!(concat
     env!("OUT_DIR"),
     "/shadow_translucent_textured.frag.spv"
 ));
-const DEFAULT_AMBIENT_COLOR: [f32; 4] = [0.014, 0.017, 0.024, 0.55];
 const MESH_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
-const SHADOW_DEPTH_BIAS_CONSTANT: f32 = 1.25;
-const SHADOW_DEPTH_BIAS_SLOPE: f32 = 1.75;
+const SHADOW_DEPTH_BIAS_CONSTANT: f32 = 0.35;
+const SHADOW_DEPTH_BIAS_SLOPE: f32 = 0.65;
 
 pub(super) struct VulkanMeshStore {
     meshes: BTreeMap<MeshHandle, VulkanMesh>,
@@ -310,7 +307,7 @@ impl VulkanMeshStore {
         Ok(pipelines)
     }
 
-    /// Creates depth-only mesh pipelines compatible with the shadow graph pass.
+    /// Creates moment-shadow mesh pipelines compatible with the shadow graph pass.
     pub(super) fn create_shadow_pipeline_set(
         &self,
         device: &Device,
@@ -639,7 +636,7 @@ impl MeshPassResources {
         shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
         translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     ) -> Result<Self, VulkanError> {
-        let shadow_sampler = create_pass_sampler(device, vk::Filter::NEAREST)?;
+        let shadow_sampler = create_pass_sampler(device, vk::Filter::LINEAR)?;
         let transmittance_sampler = match create_pass_sampler(device, vk::Filter::LINEAR) {
             Ok(sampler) => sampler,
             Err(error) => {
@@ -831,6 +828,11 @@ fn shadow_cascade_contains_bounds(
         sub3(shadow_cull.camera.target, shadow_cull.camera.eye),
         [0.0, 0.0, -1.0],
     );
+    let light_dir = normalize_or(DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
+    if dot3(forward, light_dir).abs() > 0.82 {
+        return true;
+    }
+
     let to_center = sub3(bounds.center(), shadow_cull.camera.eye);
     let depth = dot3(to_center, forward);
     let radius = bounds.radius();
@@ -884,91 +886,6 @@ fn upload_lod_buffers(
     }
 
     Ok(uploaded)
-}
-
-/// Builds LOD index streams and removes duplicates that would waste GPU memory.
-fn unique_lod_indices(vertices: &[MeshVertex], indices: &[u32]) -> Vec<(MeshLodLevel, Vec<u32>)> {
-    let mut lods = Vec::with_capacity(3);
-    push_unique_lod(
-        &mut lods,
-        MeshLodLevel::Full,
-        optimized_index_order(indices, vertices.len()),
-    );
-    push_unique_lod(
-        &mut lods,
-        MeshLodLevel::Medium,
-        simplified_lod_indices(vertices, indices, MEDIUM_LOD_RATIO, MEDIUM_LOD_ERROR),
-    );
-    push_unique_lod(
-        &mut lods,
-        MeshLodLevel::Low,
-        simplified_lod_indices(vertices, indices, LOW_LOD_RATIO, LOW_LOD_ERROR),
-    );
-    lods
-}
-
-/// Keeps one LOD stream only when it is not identical to the previous uploaded stream.
-fn push_unique_lod(
-    lods: &mut Vec<(MeshLodLevel, Vec<u32>)>,
-    level: MeshLodLevel,
-    indices: Vec<u32>,
-) {
-    if lods
-        .last()
-        .is_some_and(|(_, previous)| previous == &indices)
-    {
-        return;
-    }
-    lods.push((level, indices));
-}
-
-/// Simplifies one triangle-list index stream while preserving borders and triangle validity.
-fn simplified_lod_indices(
-    vertices: &[MeshVertex],
-    indices: &[u32],
-    ratio: f32,
-    target_error: f32,
-) -> Vec<u32> {
-    if vertices.len() < 3 || indices.len() < 6 {
-        return optimized_index_order(indices, vertices.len());
-    }
-
-    let target_count = lod_target_index_count(indices.len(), ratio);
-    if target_count >= indices.len() {
-        return optimized_index_order(indices, vertices.len());
-    }
-
-    let simplified = meshopt::simplify_decoder(
-        indices,
-        vertices,
-        target_count,
-        target_error,
-        SimplifyOptions::LockBorder,
-        None,
-    );
-    let aligned = triangle_aligned_indices(simplified, indices);
-    optimized_index_order(&aligned, vertices.len())
-}
-
-/// Returns a triangle-aligned target count for meshoptimizer simplification.
-fn lod_target_index_count(index_count: usize, ratio: f32) -> usize {
-    let target = (index_count as f32 * ratio.clamp(0.05, 1.0)).round() as usize;
-    (target / 3).max(1) * 3
-}
-
-/// Drops any incomplete trailing triangle and falls back when simplification produced no draw.
-fn triangle_aligned_indices(mut indices: Vec<u32>, fallback: &[u32]) -> Vec<u32> {
-    indices.truncate(indices.len() / 3 * 3);
-    if indices.len() < 3 {
-        fallback.to_vec()
-    } else {
-        indices
-    }
-}
-
-/// Reorders an index stream for the GPU vertex cache without changing mesh topology.
-fn optimized_index_order(indices: &[u32], vertex_count: usize) -> Vec<u32> {
-    meshopt::optimize_vertex_cache(indices, vertex_count)
 }
 
 #[repr(C)]
@@ -1246,25 +1163,25 @@ fn update_pass_descriptor_set(
 
 /// Returns a stable initial uniform before the first extracted frame writes camera data.
 fn identity_frame_uniform() -> MeshFrameUniform {
+    let light_dir = normalize_or(DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
+
     MeshFrameUniform {
         view_proj: identity_mat4(),
         view: identity_mat4(),
         shadow_view_proj: [identity_mat4(); SHADOW_CASCADE_COUNT],
-        shadow_cascade_splits: [20.0, 52.0, 128.0, 320.0],
-        shadow_cascade_texel_world: [1.0, 1.0, 1.0, 1.0],
-        shadow_cascade_depth_span: [1.0, 1.0, 1.0, 1.0],
+        shadow_cascade_splits: DEFAULT_SHADOW_CASCADE_SPLITS,
+        shadow_cascade_texel_world: DEFAULT_SHADOW_CASCADE_METRICS,
+        shadow_cascade_depth_span: DEFAULT_SHADOW_CASCADE_METRICS,
         camera_pos: [0.0, 0.0, 0.0, 1.0],
-        light_dir: [0.3577709, -0.8944272, 0.26832816, 0.0],
-        light_color: [3.00, 2.65, 2.15, 0.0],
+        light_dir: [light_dir[0], light_dir[1], light_dir[2], 0.0],
+        light_color: [
+            DEFAULT_DIRECTIONAL_LIGHT_COLOR[0],
+            DEFAULT_DIRECTIONAL_LIGHT_COLOR[1],
+            DEFAULT_DIRECTIONAL_LIGHT_COLOR[2],
+            0.0,
+        ],
         ambient_color: DEFAULT_AMBIENT_COLOR,
     }
-}
-
-/// Returns an identity matrix for mesh uniforms before the first frame writes a camera.
-fn identity_mat4() -> [f32; 16] {
-    [
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ]
 }
 
 #[derive(Clone, Copy)]
@@ -1276,12 +1193,11 @@ enum MeshPipelineTarget {
 }
 
 impl MeshPipelineTarget {
-    /// Returns whether the target writes a color attachment.
+    /// Returns how many color attachments the target writes.
     fn color_attachment_count(self) -> usize {
         match self {
             Self::SceneOpaque | Self::SceneTransparent => 3,
-            Self::TranslucentShadow => 1,
-            Self::OpaqueShadow => 0,
+            Self::OpaqueShadow | Self::TranslucentShadow => 1,
         }
     }
 
@@ -1332,6 +1248,9 @@ impl MeshPipelineTarget {
                     .color_write_mask(vk::ColorComponentFlags::empty()),
                 vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask),
             ],
+            Self::OpaqueShadow => {
+                vec![vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask)]
+            }
             Self::TranslucentShadow => vec![
                 vk::PipelineColorBlendAttachmentState::default()
                     .blend_enable(true)
@@ -1343,7 +1262,6 @@ impl MeshPipelineTarget {
                     .alpha_blend_op(vk::BlendOp::MIN)
                     .color_write_mask(write_mask),
             ],
-            Self::OpaqueShadow => Vec::new(),
         }
     }
 }
@@ -1672,47 +1590,6 @@ mod tests {
     #[test]
     fn mesh_front_face_matches_imported_winding() {
         assert_eq!(MESH_FRONT_FACE, vk::FrontFace::COUNTER_CLOCKWISE);
-    }
-
-    // Verifies that generated LOD targets remain triangle-aligned and conservative.
-    #[test]
-    fn lod_target_counts_keep_triangle_groups() {
-        let medium = lod_target_index_count(101, MEDIUM_LOD_RATIO);
-        let low = lod_target_index_count(101, LOW_LOD_RATIO);
-
-        assert_eq!(medium % 3, 0);
-        assert_eq!(low % 3, 0);
-        assert!(medium < 101);
-        assert!(low < medium);
-    }
-
-    // Verifies that tiny meshes never disappear when simplification cannot safely reduce them.
-    #[test]
-    fn tiny_lod_keeps_drawable_indices() {
-        let vertices = [
-            MeshVertex::new([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0], [1.0; 4]),
-            MeshVertex::new([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0], [1.0; 4]),
-            MeshVertex::new([0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0], [1.0; 4]),
-        ];
-        let indices = [0, 1, 2];
-        let lod = simplified_lod_indices(&vertices, &indices, LOW_LOD_RATIO, LOW_LOD_ERROR);
-
-        assert_eq!(lod.len(), 3);
-    }
-
-    // Verifies that duplicate LOD buffers are skipped for meshes that cannot simplify safely.
-    #[test]
-    fn unique_lods_skip_duplicate_tiny_mesh_buffers() {
-        let vertices = [
-            MeshVertex::new([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0], [1.0; 4]),
-            MeshVertex::new([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0], [1.0; 4]),
-            MeshVertex::new([0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0], [1.0; 4]),
-        ];
-        let indices = [0, 1, 2];
-        let lods = unique_lod_indices(&vertices, &indices);
-
-        assert_eq!(lods.len(), 1);
-        assert_eq!(lods[0].0, MeshLodLevel::Full);
     }
 
     // Verifies that distant shadow cascades draw cheaper geometry than the near cascade.

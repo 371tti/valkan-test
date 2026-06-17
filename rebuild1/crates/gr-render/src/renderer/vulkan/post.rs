@@ -15,6 +15,10 @@ use super::VulkanError;
 const SHADER_ENTRY: &CStr = c"main";
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.vert.spv"));
 const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.frag.spv"));
+const POST_SCENE_COLOR_BINDING: u32 = 0;
+const POST_SCENE_DEPTH_BINDING: u32 = 1;
+const POST_SCENE_NORMAL_ROUGHNESS_BINDING: u32 = 2;
+const POST_SCENE_TRANSPARENT_NORMAL_ROUGHNESS_BINDING: u32 = 3;
 
 pub(super) struct PostPipeline {
     pipeline: vk::Pipeline,
@@ -164,6 +168,90 @@ struct PostPushConstants {
     enabled: f32,
 }
 
+impl PostPushConstants {
+    /// Packs camera, look, and renderer quality state into the fragment push-constant layout.
+    fn new(
+        camera_effects: CameraEffects,
+        camera: CameraSnapshot,
+        extent: vk::Extent2D,
+        quality: RenderQualitySettings,
+    ) -> Self {
+        let white_balance = camera_effects.white_balance();
+        let ssao = quality.ssao();
+        let ssr = quality.ssr();
+        let anti_aliasing = quality.anti_aliasing();
+        let shadow_softening = quality.shadow_softening();
+        let post = quality.post();
+
+        Self {
+            white_balance: [white_balance[0], white_balance[1], white_balance[2], 1.0],
+            camera: Self::camera_params(camera, extent),
+            depth: Self::depth_params(camera),
+            ssao: [
+                ssao.intensity(),
+                ssao.radius(),
+                ssao.bias(),
+                ssao.sample_count() as f32,
+            ],
+            ssr: [
+                ssr.intensity(),
+                ssr.max_steps() as f32,
+                ssr.max_distance(),
+                ssr.thickness(),
+            ],
+            aa: Self::aa_params(extent, anti_aliasing),
+            shadow: Self::shadow_params(shadow_softening),
+            exposure: camera_effects.exposure().value(),
+            contrast: (camera_effects.contrast() * post.contrast()).clamp(0.25, 4.0),
+            saturation: (camera_effects.saturation() * post.saturation()).clamp(0.0, 4.0),
+            enabled: if camera_effects.enabled() { 1.0 } else { 0.0 },
+        }
+    }
+
+    /// Packs perspective coefficients reused by view reconstruction and SSR reprojection.
+    fn camera_params(camera: CameraSnapshot, extent: vk::Extent2D) -> [f32; 4] {
+        let aspect = (extent.width as f32 / extent.height.max(1) as f32).max(0.0001);
+        let tan_half_fov = (camera.fov_y_radians * 0.5).tan();
+        let tan_half_fov = if tan_half_fov.is_finite() && tan_half_fov > 0.0001 {
+            tan_half_fov
+        } else {
+            0.57735026
+        };
+        let f = 1.0 / tan_half_fov;
+        let focal_x = f / aspect;
+        let focal_y = -f;
+
+        [focal_x, focal_y, 1.0 / focal_x, 1.0 / focal_y]
+    }
+
+    /// Packs reusable perspective depth constants for post-pass reconstruction.
+    fn depth_params(camera: CameraSnapshot) -> [f32; 4] {
+        let near = camera.near.max(0.0001);
+        let far = camera.far.max(near + 0.001);
+        [near, far, near * far, far - near]
+    }
+
+    /// Packs texel size and FXAA thresholds used by the post fragment shader.
+    fn aa_params(extent: vk::Extent2D, anti_aliasing: AntiAliasingQualitySettings) -> [f32; 4] {
+        [
+            1.0 / extent.width.max(1) as f32,
+            1.0 / extent.height.max(1) as f32,
+            anti_aliasing.edge_threshold(),
+            anti_aliasing.blend(),
+        ]
+    }
+
+    /// Packs bounded shadow cleanup controls used by the post fragment shader.
+    fn shadow_params(shadow_softening: ShadowSofteningQualitySettings) -> [f32; 4] {
+        [
+            shadow_softening.intensity(),
+            shadow_softening.radius_pixels(),
+            shadow_softening.depth_sensitivity(),
+            shadow_softening.max_luma_delta(),
+        ]
+    }
+}
+
 impl PostPipeline {
     /// Creates the post pipeline that samples scene color and writes to the swapchain pass.
     pub(super) fn create(
@@ -231,42 +319,14 @@ impl PostPipeline {
             .offset(vk::Offset2D { x: 0, y: 0 })
             .extent(extent)];
         let descriptor_sets = [self.descriptor_set];
-        let white_balance = camera_effects.white_balance();
-        let ssao = quality.ssao();
-        let ssr = quality.ssr();
-        let anti_aliasing = quality.anti_aliasing();
-        let shadow_softening = quality.shadow_softening();
-        let post = quality.post();
-        let push = PostPushConstants {
-            white_balance: [white_balance[0], white_balance[1], white_balance[2], 1.0],
-            camera: post_camera_params(camera, extent),
-            depth: post_depth_params(camera),
-            ssao: [
-                ssao.intensity(),
-                ssao.radius(),
-                ssao.bias(),
-                ssao.sample_count() as f32,
-            ],
-            ssr: [
-                ssr.intensity(),
-                ssr.max_steps() as f32,
-                ssr.max_distance(),
-                ssr.thickness(),
-            ],
-            aa: post_aa_params(extent, anti_aliasing),
-            shadow: post_shadow_params(shadow_softening),
-            exposure: camera_effects.exposure().value(),
-            contrast: (camera_effects.contrast() * post.contrast()).clamp(0.25, 4.0),
-            saturation: (camera_effects.saturation() * post.saturation()).clamp(0.0, 4.0),
-            enabled: if camera_effects.enabled() { 1.0 } else { 0.0 },
-        };
+        let push = PostPushConstants::new(camera_effects, camera, extent, quality);
         let push_bytes = push_constant_bytes(&push);
 
         tracing::trace!(
             width = extent.width,
             height = extent.height,
             exposure = push.exposure,
-            white_balance = ?white_balance,
+            white_balance = ?push.white_balance,
             contrast = push.contrast,
             saturation = push.saturation,
             enabled = camera_effects.enabled(),
@@ -324,10 +384,10 @@ impl PostPipeline {
 /// Creates the descriptor set layout used by the post shader's scene textures.
 fn create_pass_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, VulkanError> {
     let bindings = [
-        post_sampler_binding(0),
-        post_sampler_binding(1),
-        post_sampler_binding(2),
-        post_sampler_binding(3),
+        post_sampler_binding(POST_SCENE_COLOR_BINDING),
+        post_sampler_binding(POST_SCENE_DEPTH_BINDING),
+        post_sampler_binding(POST_SCENE_NORMAL_ROUGHNESS_BINDING),
+        post_sampler_binding(POST_SCENE_TRANSPARENT_NORMAL_ROUGHNESS_BINDING),
     ];
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
@@ -441,22 +501,22 @@ fn update_descriptor_set(
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
-            .dst_binding(0)
+            .dst_binding(POST_SCENE_COLOR_BINDING)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&color_info),
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
-            .dst_binding(1)
+            .dst_binding(POST_SCENE_DEPTH_BINDING)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&depth_info),
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
-            .dst_binding(2)
+            .dst_binding(POST_SCENE_NORMAL_ROUGHNESS_BINDING)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&normal_roughness_info),
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
-            .dst_binding(3)
+            .dst_binding(POST_SCENE_TRANSPARENT_NORMAL_ROUGHNESS_BINDING)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&transparent_normal_roughness_info),
     ];
@@ -485,53 +545,6 @@ fn take_created<T>(value: &mut Option<T>, label: &'static str) -> T {
     value
         .take()
         .unwrap_or_else(|| panic!("{label} was not created"))
-}
-
-/// Packs perspective coefficients used by the post shader's view-space math.
-///
-/// The shader reconstructs and reprojects SSR rays from these signed coefficients, so the
-/// Vulkan Y flip in `CameraSnapshot::view_projection` must be preserved here. The inverse
-/// coefficients are precomputed here because view reconstruction runs for every post pixel.
-fn post_camera_params(camera: CameraSnapshot, extent: vk::Extent2D) -> [f32; 4] {
-    let aspect = (extent.width as f32 / extent.height.max(1) as f32).max(0.0001);
-    let tan_half_fov = (camera.fov_y_radians * 0.5).tan();
-    let tan_half_fov = if tan_half_fov.is_finite() && tan_half_fov > 0.0001 {
-        tan_half_fov
-    } else {
-        0.57735026
-    };
-    let f = 1.0 / tan_half_fov;
-    let focal_x = f / aspect;
-    let focal_y = -f;
-
-    [focal_x, focal_y, 1.0 / focal_x, 1.0 / focal_y]
-}
-
-/// Packs depth constants that are reused by every post-process depth reconstruction.
-fn post_depth_params(camera: CameraSnapshot) -> [f32; 4] {
-    let near = camera.near.max(0.0001);
-    let far = camera.far.max(near + 0.001);
-    [near, far, near * far, far - near]
-}
-
-/// Packs high-quality post-process AA texel size and edge resolve settings.
-fn post_aa_params(extent: vk::Extent2D, anti_aliasing: AntiAliasingQualitySettings) -> [f32; 4] {
-    [
-        1.0 / extent.width.max(1) as f32,
-        1.0 / extent.height.max(1) as f32,
-        anti_aliasing.edge_threshold(),
-        anti_aliasing.blend(),
-    ]
-}
-
-/// Packs post-process shadow cleanup parameters for the fragment shader.
-fn post_shadow_params(shadow_softening: ShadowSofteningQualitySettings) -> [f32; 4] {
-    [
-        shadow_softening.intensity(),
-        shadow_softening.radius_pixels(),
-        shadow_softening.depth_sensitivity(),
-        shadow_softening.max_luma_delta(),
-    ]
 }
 
 /// Creates the full-screen post graphics pipeline.

@@ -2,7 +2,7 @@
 #define REBUILD1_POST_FXAA_GLSL
 
 float depth_edge_from_depths(float center_depth, float center_z, float sample_depth) {
-    if (center_depth >= 0.9999 && sample_depth >= 0.9999) {
+    if (is_background_depth(center_depth) && is_background_depth(sample_depth)) {
         return 0.0;
     }
 
@@ -18,7 +18,7 @@ float normal_edge_from_depth(
     float sample_depth,
     vec2 sample_uv
 ) {
-    if (center_depth >= 0.9999 || sample_depth >= 0.9999) {
+    if (is_background_depth(center_depth) || is_background_depth(sample_depth)) {
         return 0.0;
     }
 
@@ -34,7 +34,7 @@ vec3 high_quality_fxaa_scene_color(
     SurfaceMaterial center_material,
     bool center_material_valid
 ) {
-    if (params.aa.w <= 0.0) {
+    if (!post_aa_enabled()) {
         return center;
     }
 

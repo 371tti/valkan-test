@@ -1,20 +1,24 @@
 #ifndef REBUILD1_POST_COMMON_GLSL
 #define REBUILD1_POST_COMMON_GLSL
 
-float saturate(float value) {
-    return clamp(value, 0.0, 1.0);
+#include "common_math.glsl"
+
+const float POST_BACKGROUND_DEPTH = 0.9999;
+
+vec2 clamp_screen_uv(vec2 uv) {
+    return clamp(uv, vec2(0.0), vec2(1.0));
 }
 
-vec3 saturate(vec3 value) {
-    return clamp(value, vec3(0.0), vec3(1.0));
+vec3 sample_scene_color(vec2 uv) {
+    return texture(scene_color, clamp_screen_uv(uv)).rgb;
 }
 
-float rcp_safe(float value, float floor_value) {
-    return 1.0 / max(value, floor_value);
+float depth_at(vec2 uv) {
+    return texture(scene_depth, clamp_screen_uv(uv)).r;
 }
 
-vec3 normalize_fast(vec3 value) {
-    return value * inversesqrt(max(dot(value, value), 0.000001));
+bool is_background_depth(float depth) {
+    return depth >= POST_BACKGROUND_DEPTH;
 }
 
 vec3 filmic_tonemap(vec3 color) {
@@ -23,6 +27,8 @@ vec3 filmic_tonemap(vec3 color) {
     const float c = 2.43;
     const float d = 0.59;
     const float e = 0.14;
+
+    color = max(color, vec3(0.0));
 
     vec3 numerator = color * (a * color + b);
     vec3 denominator = color * (c * color + d) + e;
@@ -35,7 +41,10 @@ vec3 apply_camera_effects(vec3 color) {
         return max(color, vec3(0.0));
     }
 
-    color = max(color, vec3(0.0)) * params.exposure * params.white_balance.rgb;
+    color = max(color, vec3(0.0));
+    color *= params.exposure;
+    color *= params.white_balance.rgb;
+
     color = filmic_tonemap(color);
 
     float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
@@ -48,7 +57,10 @@ vec3 apply_camera_effects(vec3 color) {
 }
 
 float linear_depth(float depth) {
-    return params.depth.z * rcp_safe(params.depth.y - depth * params.depth.w, 0.0001);
+    return params.depth.z * rcp_safe(
+        params.depth.y - depth * params.depth.w,
+        0.0001
+    );
 }
 
 vec3 view_position(vec2 uv, float depth) {
@@ -64,6 +76,7 @@ vec3 view_position(vec2 uv, float depth) {
 
 vec2 project_view_position(vec3 position) {
     float inv_depth = rcp_safe(-position.z, 0.0001);
+
     vec2 ndc = vec2(
         position.x * params.camera.x * inv_depth,
         position.y * params.camera.y * inv_depth
@@ -77,13 +90,37 @@ float screen_edge_fade(vec2 uv) {
     return smoothstep(0.02, 0.18, min(edge.x, edge.y));
 }
 
-float depth_at(vec2 uv) {
-    return texture(scene_depth, uv).r;
+bool post_ssao_enabled() {
+    return params.ssao.x > 0.0;
+}
+
+bool post_ssr_enabled() {
+    return params.ssr.x > 0.0 && params.ssr.y >= 1.0;
+}
+
+bool post_aa_enabled() {
+    return params.aa.w > 0.0;
+}
+
+bool post_shadow_softening_enabled() {
+    return params.shadow.x > 0.0 && params.shadow.y > 0.0;
+}
+
+bool post_requires_surface_material() {
+    return post_ssao_enabled() ||
+        post_ssr_enabled() ||
+        post_shadow_softening_enabled();
 }
 
 float depth_at_ssr(vec2 uv) {
     vec2 texel = params.aa.xy;
+
     float center = depth_at(uv);
+
+    if (is_background_depth(center)) {
+        return center;
+    }
+
     float left = depth_at(uv + vec2(-texel.x, 0.0));
     float right = depth_at(uv + vec2(texel.x, 0.0));
     float up = depth_at(uv + vec2(0.0, -texel.y));
@@ -91,26 +128,24 @@ float depth_at_ssr(vec2 uv) {
 
     float min_depth = min(center, min(min(left, right), min(up, down)));
     float max_depth = max(center, max(max(left, right), max(up, down)));
-    float stable = (center * 2.0 + left + right + up + down) * 0.16666667;
-    float edge = smoothstep(0.0004, 0.0045, max_depth - min_depth);
+
+    float stable = (
+        center * 2.0 +
+        left +
+        right +
+        up +
+        down
+    ) * 0.16666667;
+
+    float depth_range = max_depth - min_depth;
+
+    float edge = smoothstep(
+        0.0004,
+        0.0045,
+        depth_range
+    );
 
     return mix(stable, center, edge);
-}
-
-float luminance_of(vec3 color) {
-    return dot(color, vec3(0.2126, 0.7152, 0.0722));
-}
-
-float perceptual_luma(vec3 color) {
-    float luma = luminance_of(max(color, vec3(0.0)));
-    return luma * rcp_safe(1.0 + luma, 0.0001);
-}
-
-vec2 sign_not_zero(vec2 value) {
-    return vec2(
-        value.x >= 0.0 ? 1.0 : -1.0,
-        value.y >= 0.0 ? 1.0 : -1.0
-    );
 }
 
 vec3 oct_decode(vec2 encoded) {
@@ -133,7 +168,17 @@ struct SurfaceMaterial {
 };
 
 SurfaceMaterial empty_surface_material(float depth) {
-    return SurfaceMaterial(vec3(0.0, 0.0, 1.0), depth, 1.0, 0.0, 0.0);
+    return SurfaceMaterial(
+        vec3(0.0, 0.0, 1.0),
+        depth,
+        1.0,
+        0.0,
+        0.0
+    );
+}
+
+bool surface_material_is_background(SurfaceMaterial material) {
+    return is_background_depth(material.source_depth);
 }
 
 SurfaceMaterial opaque_surface_material(vec4 packed, float depth) {
@@ -148,9 +193,10 @@ SurfaceMaterial opaque_surface_material(vec4 packed, float depth) {
 
 SurfaceMaterial transparent_surface_material(vec4 packed) {
     float roughness = clamp(packed.z, 0.04, 1.0);
+
     return SurfaceMaterial(
         oct_decode(packed.xy),
-        clamp(packed.w - 1.0, 0.0, 0.9999),
+        clamp(packed.w - 1.0, 0.0, POST_BACKGROUND_DEPTH),
         roughness,
         max(0.08, (1.0 - roughness) * 0.28),
         0.25
@@ -158,21 +204,30 @@ SurfaceMaterial transparent_surface_material(vec4 packed) {
 }
 
 SurfaceMaterial surface_material(vec2 uv) {
+    uv = clamp_screen_uv(uv);
+
     float opaque_depth = depth_at(uv);
     vec4 transparent = texture(scene_transparent_normal_roughness, uv);
+
     bool has_transparent = transparent.w > 1.0;
 
-    if (opaque_depth >= 0.9999) {
+    if (is_background_depth(opaque_depth)) {
         if (has_transparent) {
             return transparent_surface_material(transparent);
         }
+
         return empty_surface_material(opaque_depth);
     }
 
     vec4 opaque = texture(scene_normal_roughness, uv);
 
     if (has_transparent) {
-        float transparent_depth = clamp(transparent.w - 1.0, 0.0, 0.9999);
+        float transparent_depth = clamp(
+            transparent.w - 1.0,
+            0.0,
+            POST_BACKGROUND_DEPTH
+        );
+
         if (transparent_depth <= opaque_depth + 0.00001) {
             return transparent_surface_material(transparent);
         }
@@ -181,99 +236,60 @@ SurfaceMaterial surface_material(vec2 uv) {
     return opaque_surface_material(opaque, opaque_depth);
 }
 
-const float SHADOW_BLUR_KERNEL_5[5] = float[5](
-    0.06136,
-    0.24477,
-    0.38774,
-    0.24477,
-    0.06136
+SurfaceMaterial load_feature_surface_material(vec2 uv, out bool valid) {
+    valid = post_requires_surface_material();
+
+    return valid
+        ? surface_material(uv)
+        : empty_surface_material(POST_BACKGROUND_DEPTH);
+}
+
+// =========================================================
+// Conservative post shadow edge smoothing
+//
+// This is not a real shadow blur.
+// It only performs a small axis-aligned luma stabilization pass.
+// Large circular kernels are intentionally avoided because they create
+// round blotches when applied to final scene_color.
+// =========================================================
+
+const int SHADOW_SOFTEN_TAP_COUNT = 4;
+
+const vec2 SHADOW_SOFTEN_OFFSETS[4] = vec2[4](
+    vec2( 1.0,  0.0),
+    vec2(-1.0,  0.0),
+    vec2( 0.0,  1.0),
+    vec2( 0.0, -1.0)
 );
 
-float shadow_soften_weight(
-    float kernel_weight,
-    SurfaceMaterial center,
-    SurfaceMaterial sample_material,
+float shadow_depth_weight(
     float center_view_depth,
     float sample_view_depth,
-    float depth_reject_scale
+    float reject_scale
 ) {
     float depth_delta = abs(sample_view_depth - center_view_depth);
-    float depth_weight = exp2(-depth_delta * depth_reject_scale);
-
-    float normal_match = dot(center.normal, sample_material.normal);
-    float normal_weight = smoothstep(0.72, 0.98, normal_match);
-
-    return kernel_weight * depth_weight * normal_weight;
+    float w = rcp_safe(1.0 + depth_delta * reject_scale, 0.0001);
+    return w * w;
 }
 
-vec3 shadow_softened_scene_color(vec2 uv, vec3 color, SurfaceMaterial material) {
-    if (params.shadow.x <= 0.0 || material.source_depth >= 0.9999) {
-        return color;
-    }
-
-    float center_luma = perceptual_luma(color);
-    float center_view_depth = linear_depth(material.source_depth);
-    float depth_scale = max(center_view_depth * 0.010, 0.015);
-    float depth_reject_scale = params.shadow.z * rcp_safe(depth_scale, 0.0001);
-    float radius = max(params.shadow.y, 0.5);
-    vec2 texel_radius = params.aa.xy * radius;
-    int half_width = radius < 1.5 ? 1 : 2;
-
-    float luma_sum = center_luma * SHADOW_BLUR_KERNEL_5[2] * SHADOW_BLUR_KERNEL_5[2];
-    float weight_sum = SHADOW_BLUR_KERNEL_5[2] * SHADOW_BLUR_KERNEL_5[2];
-
-    for (int y = -2; y <= 2; y++) {
-        for (int x = -2; x <= 2; x++) {
-            if (x == 0 && y == 0) {
-                continue;
-            }
-
-            if (abs(x) > half_width || abs(y) > half_width) {
-                continue;
-            }
-
-            vec2 offset = vec2(float(x), float(y));
-            float kernel_weight =
-                SHADOW_BLUR_KERNEL_5[x + 2] *
-                SHADOW_BLUR_KERNEL_5[y + 2];
-            vec2 sample_uv = clamp(uv + offset * texel_radius, vec2(0.0), vec2(1.0));
-            SurfaceMaterial sample_material = surface_material(sample_uv);
-
-            if (sample_material.source_depth >= 0.9999) {
-                continue;
-            }
-
-            vec3 sample_color = texture(scene_color, sample_uv).rgb;
-            float sample_luma = perceptual_luma(sample_color);
-            float sample_view_depth = linear_depth(sample_material.source_depth);
-            float weight = shadow_soften_weight(
-                kernel_weight,
-                material,
-                sample_material,
-                center_view_depth,
-                sample_view_depth,
-                depth_reject_scale
-            );
-
-            luma_sum += sample_luma * weight;
-            weight_sum += weight;
-        }
-    }
-
-    float filtered_luma = luma_sum * rcp_safe(weight_sum, 0.0001);
-    float max_luma_delta = max(params.shadow.w, 0.005);
-    float luma_delta = clamp(
-        filtered_luma - center_luma,
-        -max_luma_delta,
-        max_luma_delta
+float shadow_normal_weight(vec3 center_normal, vec3 sample_normal) {
+    return smoothstep(
+        0.84,
+        0.995,
+        dot(center_normal, sample_normal)
     );
-    float luma_signal = smoothstep(0.001, max_luma_delta * 0.35, abs(luma_delta));
-    float target_luma = max(center_luma + luma_delta, 0.0);
-    float luma_ratio = target_luma * rcp_safe(center_luma, 0.0001);
-    vec3 adjusted = color * clamp(luma_ratio, 0.45, 1.85);
-    float blend = clamp(params.shadow.x, 0.0, 1.0) * luma_signal;
-
-    return mix(color, adjusted, blend);
 }
 
+float shadow_luma_edge_signal(float min_luma, float max_luma, float limit) {
+    float range = max_luma - min_luma;
+
+    return smoothstep(
+        max(0.001, limit * 0.08),
+        max(0.003, limit * 0.65),
+        range
+    );
+}
+vec3 shadow_softened_scene_color(vec2 uv, vec3 color, SurfaceMaterial material) {
+    return color;
+}
 #endif
