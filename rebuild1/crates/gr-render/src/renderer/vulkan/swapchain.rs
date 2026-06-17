@@ -705,50 +705,28 @@ impl VulkanDevice {
             });
         }
 
-        let shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT] = build
-            .cascades
-            .iter()
-            .map(|cascade| cascade.filtered_moments.view)
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap_or_else(|_| panic!("all shadow cascade views must exist"));
-        let blur_h_source_views: [vk::ImageView; SHADOW_CASCADE_COUNT] = build
-            .cascades
-            .iter()
-            .map(|cascade| cascade.moments.view)
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap_or_else(|_| panic!("all raw shadow cascade views must exist"));
-        let blur_v_source_views: [vk::ImageView; SHADOW_CASCADE_COUNT] = build
-            .cascades
-            .iter()
-            .map(|cascade| cascade.blurred_moments.view)
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap_or_else(|_| panic!("all blurred shadow cascade views must exist"));
-        let translucent_views: [vk::ImageView; SHADOW_CASCADE_COUNT] = build
-            .cascades
-            .iter()
-            .map(|cascade| cascade.transmittance.view)
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap_or_else(|_| panic!("all translucent shadow views must exist"));
+        let filtered_views =
+            cascade_views(&build.cascades, |cascade| cascade.filtered_moments.view);
+        let raw_views = cascade_views(&build.cascades, |cascade| cascade.moments.view);
+        let blur_tmp_views = cascade_views(&build.cascades, |cascade| cascade.blurred_moments.view);
+        let translucent_views =
+            cascade_views(&build.cascades, |cascade| cascade.transmittance.view);
 
         build.mesh_pass_resources = Some(self.meshes.create_pass_resources(
             &self.device,
-            shadow_views,
+            filtered_views,
             translucent_views,
         )?);
         build.translucent_pass_resources = Some(self.meshes.create_pass_resources(
             &self.device,
-            blur_h_source_views,
+            raw_views,
             translucent_views,
         )?);
         build.blur_pipeline = Some(ShadowMomentBlurPipeline::create(
             &self.device,
             blur_render_pass,
-            blur_h_source_views,
-            blur_v_source_views,
+            raw_views,
+            blur_tmp_views,
         )?);
         build.shadow_pipeline = Some(
             self.meshes
@@ -1694,6 +1672,19 @@ fn create_swapchain_image_view(
 fn shadow_cascade_extent(cascade_index: usize) -> NonZeroExtent {
     let size = shadow_cascade_size(cascade_index);
     NonZeroExtent::new(size, size).expect("shadow map extent must be non-zero")
+}
+
+/// Extracts one image view per cascade without repeating Vec conversion boilerplate.
+fn cascade_views<F>(cascades: &[ShadowCascade], select: F) -> [vk::ImageView; SHADOW_CASCADE_COUNT]
+where
+    F: Fn(&ShadowCascade) -> vk::ImageView,
+{
+    assert_eq!(
+        cascades.len(),
+        SHADOW_CASCADE_COUNT,
+        "all shadow cascades must exist before creating descriptors"
+    );
+    std::array::from_fn(|index| select(&cascades[index]))
 }
 
 /// Destroys one fixed shadow cascade after frame work has completed.

@@ -757,7 +757,7 @@ impl FrameGraphPlan {
         refresh_shadows: bool,
     ) -> Result<Self, GraphCompileError> {
         let mut builder = FrameGraphBuilder::new();
-        if shadow_casters {
+        if shadow_casters && refresh_shadows {
             for (resource, state) in SHADOW_MOMENT_RAW_RESOURCES
                 .into_iter()
                 .zip(initial.shadow_moment_raw())
@@ -778,6 +778,8 @@ impl FrameGraphPlan {
                     ResourceState::ShaderRead,
                 ));
             }
+        }
+        if shadow_casters {
             for (resource, state) in SHADOW_CASCADE_RESOURCES
                 .into_iter()
                 .zip(initial.shadow_cascades())
@@ -1569,6 +1571,11 @@ mod tests {
         assert_eq!(
             graph.final_state_for(GraphResource::ShadowCascade0),
             Some(ResourceState::ShaderRead)
+        );
+        assert_eq!(graph.final_state_for(GraphResource::ShadowMomentRaw0), None);
+        assert_eq!(
+            graph.final_state_for(GraphResource::ShadowMomentBlur0),
+            None
         );
         assert_eq!(
             graph.final_state_for(GraphResource::TranslucentShadow0),
