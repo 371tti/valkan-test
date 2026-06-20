@@ -8,8 +8,6 @@ layout(location = 4) in vec4 frag_tangent;
 layout(location = 5) in vec4 frag_shadow_pos[4];
 layout(location = 9) in vec3 frag_world_pos;
 layout(location = 0) out vec4 out_color;
-layout(location = 1) out vec4 out_normal_roughness;
-layout(location = 2) out vec4 out_transparent_normal_roughness;
 
 layout(set = 0, binding = 0) uniform FrameCamera {
     mat4 view_proj;
@@ -174,7 +172,6 @@ void main() {
     float roughness;
     read_pbr(metallic, roughness);
     vec3 normal = surface_normal();
-    vec4 material_meta = pack_view_normal_material(normal, roughness, metallic, base_color.rgb);
     out_color = vec4(
         shade_pbr(
             base_color.rgb,
@@ -187,11 +184,4 @@ void main() {
         ),
         base_color.a
     );
-    if (material.flags.x == 2) {
-        out_normal_roughness = vec4(0.0);
-        out_transparent_normal_roughness = vec4(material_meta.xyz, 1.0 + gl_FragCoord.z);
-    } else {
-        out_normal_roughness = material_meta;
-        out_transparent_normal_roughness = vec4(0.0);
-    }
 }

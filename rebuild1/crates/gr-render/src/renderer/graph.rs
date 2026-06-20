@@ -757,7 +757,7 @@ impl FrameGraphPlan {
         refresh_shadows: bool,
     ) -> Result<Self, GraphCompileError> {
         let mut builder = FrameGraphBuilder::new();
-        if shadow_casters && refresh_shadows {
+        if shadow_casters {
             for (resource, state) in SHADOW_MOMENT_RAW_RESOURCES
                 .into_iter()
                 .zip(initial.shadow_moment_raw())
@@ -768,6 +768,8 @@ impl FrameGraphPlan {
                     ResourceState::ShaderRead,
                 ));
             }
+        }
+        if shadow_casters && refresh_shadows {
             for (resource, state) in SHADOW_MOMENT_BLUR_RESOURCES
                 .into_iter()
                 .zip(initial.shadow_moment_blur())
@@ -885,6 +887,9 @@ impl FrameGraphPlan {
 
         let mut scene_pass = GraphPass::new(SCENE_PASS);
         if shadow_casters {
+            for resource in SHADOW_MOMENT_RAW_RESOURCES {
+                scene_pass = scene_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
+            }
             for resource in SHADOW_CASCADE_RESOURCES {
                 scene_pass = scene_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
             }
@@ -1539,7 +1544,7 @@ mod tests {
         );
     }
 
-    // Verifies that cached shadow maps stay readable while expensive shadow write passes are omitted.
+    // Verifies that cached raw/filtered shadow maps stay readable while writes are omitted.
     #[test]
     fn standard_frame_graph_reuses_cached_shadow_maps() {
         let graph = FrameGraphPlan::standard_frame_with_shadow_refresh(
@@ -1572,7 +1577,10 @@ mod tests {
             graph.final_state_for(GraphResource::ShadowCascade0),
             Some(ResourceState::ShaderRead)
         );
-        assert_eq!(graph.final_state_for(GraphResource::ShadowMomentRaw0), None);
+        assert_eq!(
+            graph.final_state_for(GraphResource::ShadowMomentRaw0),
+            Some(ResourceState::ShaderRead)
+        );
         assert_eq!(
             graph.final_state_for(GraphResource::ShadowMomentBlur0),
             None

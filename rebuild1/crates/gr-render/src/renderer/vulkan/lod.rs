@@ -2,10 +2,10 @@ use meshopt::SimplifyOptions;
 
 use crate::renderer::{assets::MeshVertex, visibility::MeshLodLevel};
 
-const MEDIUM_LOD_RATIO: f32 = 0.72;
-const LOW_LOD_RATIO: f32 = 0.45;
-const MEDIUM_LOD_ERROR: f32 = 0.015;
-const LOW_LOD_ERROR: f32 = 0.04;
+const MEDIUM_LOD_RATIO: f32 = 0.60;
+const LOW_LOD_RATIO: f32 = 0.30;
+const MEDIUM_LOD_ERROR: f32 = 0.025;
+const LOW_LOD_ERROR: f32 = 0.075;
 
 /// Builds full, medium, and low LOD index streams and removes duplicates.
 ///
@@ -111,6 +111,8 @@ mod tests {
         assert_eq!(low % 3, 0);
         assert!(medium < 101);
         assert!(low < medium);
+        assert_eq!(lod_target_index_count(300, MEDIUM_LOD_RATIO), 180);
+        assert_eq!(lod_target_index_count(300, LOW_LOD_RATIO), 90);
     }
 
     // Verifies that tiny meshes never disappear when simplification cannot safely reduce them.

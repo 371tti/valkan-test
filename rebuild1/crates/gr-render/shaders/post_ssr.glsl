@@ -3,10 +3,261 @@
 
 #include "common_math.glsl"
 
+const int SSR_MAX_DDA_STEPS = 64;
+const int SSR_REFINE_STEPS = 4;
+
+struct SsrDdaRay {
+    vec3 origin;
+    vec3 q;
+    vec3 dq;
+    float k;
+    float dk;
+    vec2 pixel;
+    vec2 dp;
+    float major_length;
+    float stride;
+    bool permute;
+};
+
+struct SsrDdaSample {
+    vec2 uv;
+    vec2 pixel;
+    vec3 q;
+    float k;
+    vec3 position;
+    float ray_view_depth;
+};
+
 struct SsrHit {
     vec2 uv;
+    vec3 position;
     float distance;
+    float delta;
+    float thickness;
 };
+
+bool ssr_uv_is_valid(vec2 uv) {
+    return !(
+        uv.x <= 0.0 || uv.x >= 1.0 ||
+        uv.y <= 0.0 || uv.y >= 1.0
+    );
+}
+
+float ssr_hit_slack(float thickness) {
+    return max(thickness * 0.42, params.ssr.w * 0.28);
+}
+
+vec2 ssr_screen_size() {
+    return vec2(1.0) / max(params.aa.xy, vec2(0.000001));
+}
+
+vec3 ssr_q(vec3 position) {
+    return position * rcp_safe(-position.z, 0.0001);
+}
+
+float ssr_k(vec3 position) {
+    return rcp_safe(-position.z, 0.0001);
+}
+
+float distance_squared(vec2 a, vec2 b) {
+    vec2 delta = a - b;
+    return dot(delta, delta);
+}
+
+void swap_if_greater(inout float a, inout float b) {
+    if (a > b) {
+        float temp = a;
+        a = b;
+        b = temp;
+    }
+}
+
+vec3 ssr_position_from_qk(vec3 q, float k) {
+    return q * rcp_safe(k, 0.000001);
+}
+
+SsrDdaSample ssr_dda_sample(
+    vec2 pixel,
+    vec3 q,
+    float k,
+    bool permute
+) {
+    SsrDdaSample dda_sample;
+    dda_sample.pixel = permute ? pixel.yx : pixel;
+    dda_sample.uv = dda_sample.pixel / ssr_screen_size();
+    dda_sample.q = q;
+    dda_sample.k = k;
+    dda_sample.position = ssr_position_from_qk(q, k);
+    dda_sample.ray_view_depth = -dda_sample.position.z;
+
+    return dda_sample;
+}
+
+SsrDdaSample ssr_interpolate_segment(
+    vec2 pixel0,
+    vec2 pixel1,
+    vec3 q0,
+    vec3 q1,
+    float k0,
+    float k1,
+    bool permute,
+    float t
+) {
+    return ssr_dda_sample(
+        mix(pixel0, pixel1, t),
+        mix(q0, q1, t),
+        mix(k0, k1, t),
+        permute
+    );
+}
+
+float ssr_depth_delta(
+    float hit_depth,
+    float ray_view_depth,
+    out float thickness
+) {
+    if (is_background_depth(hit_depth)) {
+        thickness = 0.0;
+        return -100000.0;
+    }
+
+    float surface_view_depth = linear_depth(hit_depth);
+    float base = max(params.ssr.w, 0.01);
+
+    thickness =
+        base +
+        surface_view_depth * 0.0015 +
+        max(ray_view_depth - surface_view_depth, 0.0) * 0.012;
+
+    thickness = min(thickness, max(base * 2.15, 0.13));
+
+    return ray_view_depth - surface_view_depth;
+}
+
+bool ssr_segment_depth_hit(
+    float hit_depth,
+    float ray_min_view_depth,
+    float ray_max_view_depth,
+    out float delta,
+    out float thickness
+) {
+    if (is_background_depth(hit_depth)) {
+        delta = -100000.0;
+        thickness = 0.0;
+        return false;
+    }
+
+    float surface_view_depth = linear_depth(hit_depth);
+    float base = max(params.ssr.w, 0.01);
+    float ray_span = max(ray_max_view_depth - ray_min_view_depth, 0.0);
+
+    thickness =
+        base +
+        surface_view_depth * 0.0015 +
+        max(ray_max_view_depth - surface_view_depth, 0.0) * 0.010 +
+        ray_span * 0.18;
+
+    thickness = min(thickness, max(base * 2.35, 0.15));
+
+    float front_delta = ray_min_view_depth - surface_view_depth;
+    float back_delta = ray_max_view_depth - surface_view_depth;
+    float slack = ssr_hit_slack(thickness);
+
+    delta = abs(front_delta) < abs(back_delta)
+        ? front_delta
+        : back_delta;
+
+    return back_delta >= -slack && front_delta <= thickness * 1.08;
+}
+
+SsrHit refined_ssr_hit(
+    SsrDdaRay ray,
+    vec2 low_pixel,
+    vec2 high_pixel,
+    vec3 low_q,
+    vec3 high_q,
+    float low_k,
+    float high_k
+) {
+    float low = 0.0;
+    float high = 1.0;
+    float best_delta = -100000.0;
+    float best_thickness = max(params.ssr.w, 0.01);
+
+    for (int i = 0; i < SSR_REFINE_STEPS; i++) {
+        float mid = (low + high) * 0.5;
+        SsrDdaSample mid_sample = ssr_interpolate_segment(
+            low_pixel,
+            high_pixel,
+            low_q,
+            high_q,
+            low_k,
+            high_k,
+            ray.permute,
+            mid
+        );
+
+        if (!ssr_uv_is_valid(mid_sample.uv)) {
+            high = mid;
+            continue;
+        }
+
+        if (mid_sample.position.z >= -params.depth.x) {
+            high = mid;
+            continue;
+        }
+
+        float hit_depth = depth_at_ssr_trace(mid_sample.uv);
+        float thickness;
+        float delta = ssr_depth_delta(
+            hit_depth,
+            mid_sample.ray_view_depth,
+            thickness
+        );
+
+        best_delta = delta;
+        best_thickness = thickness;
+
+        if (delta >= -ssr_hit_slack(thickness)) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+
+    SsrDdaSample hit_sample = ssr_interpolate_segment(
+        low_pixel,
+        high_pixel,
+        low_q,
+        high_q,
+        low_k,
+        high_k,
+        ray.permute,
+        high
+    );
+
+    SsrHit hit;
+    hit.uv = hit_sample.uv;
+    hit.position = hit_sample.position;
+    hit.distance = length(hit.position - ray.origin);
+
+    float hit_depth = ssr_uv_is_valid(hit.uv)
+        ? depth_at_ssr_trace(hit.uv)
+        : POST_BACKGROUND_DEPTH;
+
+    hit.delta = ssr_depth_delta(
+        hit_depth,
+        hit_sample.ray_view_depth,
+        hit.thickness
+    );
+
+    if (is_background_depth(hit_depth)) {
+        hit.delta = best_delta;
+        hit.thickness = best_thickness;
+    }
+
+    return hit;
+}
 
 vec3 ssr_reflection_color(
     vec2 uv,
@@ -14,107 +265,153 @@ vec3 ssr_reflection_color(
     float roughness,
     float distance_blur
 ) {
-    vec3 center = texture(scene_color, uv).rgb;
-    float blur = max(smoothstep(0.18, 0.82, roughness), distance_blur);
+    vec3 center = sample_scene_color(uv);
+    float blur = max(smoothstep(0.42, 0.88, roughness), distance_blur);
 
-    if (blur <= 0.001) {
+    if (blur <= 0.04) {
         return center;
     }
 
-    float dir_len2 = dot(ray_screen_dir, ray_screen_dir);
-
-    vec2 axis = dir_len2 > 0.00000001
-        ? ray_screen_dir * inversesqrt(dir_len2)
+    vec2 axis = dot(ray_screen_dir, ray_screen_dir) > 0.00000001
+        ? normalize2_fast(ray_screen_dir)
         : vec2(1.0, 0.0);
 
-    vec2 tangent = vec2(-axis.y, axis.x);
+    vec2 radius = params.aa.xy * mix(0.85, 4.25, blur * blur);
 
-    vec2 radius = params.aa.xy * mix(0.75, 7.5, blur * blur);
-    vec2 along = axis * radius;
-    vec2 across = tangent * radius * 0.62;
-
-    vec3 glossy = center * 0.42;
-    glossy += texture(scene_color, clamp(uv + along, vec2(0.0), vec2(1.0))).rgb * 0.16;
-    glossy += texture(scene_color, clamp(uv - along, vec2(0.0), vec2(1.0))).rgb * 0.16;
-    glossy += texture(scene_color, clamp(uv + across, vec2(0.0), vec2(1.0))).rgb * 0.13;
-    glossy += texture(scene_color, clamp(uv - across, vec2(0.0), vec2(1.0))).rgb * 0.13;
+    vec3 glossy = center * 0.56;
+    glossy += sample_scene_color(uv + axis * radius) * 0.22;
+    glossy += sample_scene_color(uv - axis * radius) * 0.22;
 
     return mix(center, glossy, blur);
 }
 
-float ssr_depth_delta(float hit_depth, vec3 ray_position, out float thickness) {
-    if (is_background_depth(hit_depth)) {
-        thickness = 0.0;
-        return -100000.0;
-    }
+float ssr_material_weight(
+    SurfaceMaterial material,
+    float ndotv,
+    float view_distance
+) {
+    float smoothness = 1.0 - material.roughness;
+    float fresnel = pow5(1.0 - ndotv);
+    float smooth_weight = smoothstep(0.20, 0.82, smoothness);
+    float grazing_weight = smoothstep(0.08, 0.88, fresnel);
+    float distance_weight = smoothstep(1.2, 12.0, view_distance);
 
-    float ray_view_depth = -ray_position.z;
-    float surface_view_depth = linear_depth(hit_depth);
+    float base =
+        material.reflectance *
+        mix(0.35, 1.10, smooth_weight) *
+        mix(0.45, 1.0, distance_weight);
 
-    float base = max(params.ssr.w, 0.01);
+    float transparent_boost =
+        material.transparent_weight *
+        mix(0.04, 0.22, smooth_weight) *
+        mix(0.70, 1.20, grazing_weight);
 
-    thickness =
-        base +
-        surface_view_depth * 0.0025 +
-        max(ray_view_depth - surface_view_depth, 0.0) * 0.025;
+    float grazing_boost =
+        grazing_weight *
+        smooth_weight *
+        mix(0.06, 0.20, material.transparent_weight);
 
-    thickness = min(thickness, max(base * 2.5, 0.16));
-
-    return ray_view_depth - surface_view_depth;
+    return base + transparent_boost + grazing_boost;
 }
 
-SsrHit refined_ssr_hit(
-    vec3 ray_origin,
+bool build_ssr_dda_ray(
+    vec3 origin,
     vec3 ray_dir,
-    float low_distance,
-    float high_distance,
-    float base_thickness,
-    float water_weight
+    float view_distance,
+    float max_distance,
+    int max_steps,
+    out SsrDdaRay ray
 ) {
-    float low = max(low_distance, 0.0);
-    float high = max(high_distance, low + 0.0001);
+    float clip_distance = max_distance;
 
-    for (int i = 0; i < 6; i++) {
-        float mid = (low + high) * 0.5;
-        vec3 mid_position = ray_origin + ray_dir * mid;
-
-        if (mid_position.z >= -params.depth.x) {
-            high = mid;
-            continue;
-        }
-
-        vec2 mid_uv = project_view_position(mid_position);
-
-        if (
-            any(lessThan(mid_uv, vec2(0.0))) ||
-            any(greaterThan(mid_uv, vec2(1.0)))
-        ) {
-            high = mid;
-            continue;
-        }
-
-        float hit_depth = depth_at_ssr(mid_uv);
-        float thickness;
-        float delta = ssr_depth_delta(hit_depth, mid_position, thickness);
-
-        float negative_slack = mix(
-            base_thickness * 0.30,
-            thickness * 0.36,
-            water_weight
-        );
-
-        if (delta >= -negative_slack) {
-            high = mid;
-        } else {
-            low = mid;
-        }
+    if (ray_dir.z < -0.0001) {
+        clip_distance =
+            (params.depth.y - view_distance - 0.002) *
+            rcp_safe(-ray_dir.z, 0.0001);
+    } else if (ray_dir.z > 0.0001) {
+        clip_distance =
+            (view_distance - params.depth.x - 0.002) *
+            rcp_safe(ray_dir.z, 0.0001);
     }
 
-    SsrHit hit;
-    hit.distance = high;
-    hit.uv = project_view_position(ray_origin + ray_dir * high);
+    if (clip_distance <= 0.0) {
+        return false;
+    }
 
-    return hit;
+    float end_distance = min(max_distance, clip_distance);
+    float min_distance = max(0.12, view_distance * 0.006);
+
+    if (end_distance <= min_distance + 0.01) {
+        return false;
+    }
+
+    vec3 start_position = origin + ray_dir * min_distance;
+    vec3 end_position = origin + ray_dir * end_distance;
+
+    if (
+        start_position.z >= -params.depth.x ||
+        end_position.z >= -params.depth.x
+    ) {
+        return false;
+    }
+
+    vec2 screen_size = ssr_screen_size();
+    vec2 start_uv = project_view_position(start_position);
+    vec2 end_uv = project_view_position(end_position);
+
+    if (!ssr_uv_is_valid(start_uv) && !ssr_uv_is_valid(end_uv)) {
+        return false;
+    }
+
+    vec2 start_pixel = start_uv * screen_size;
+    vec2 end_pixel = end_uv * screen_size;
+
+    if (distance_squared(start_pixel, end_pixel) < 0.0001) {
+        end_pixel += vec2(0.01, 0.01);
+    }
+
+    vec3 start_q = ssr_q(start_position);
+    vec3 end_q = ssr_q(end_position);
+    float start_k = ssr_k(start_position);
+    float end_k = ssr_k(end_position);
+    vec2 pixel_delta = end_pixel - start_pixel;
+    bool permute = false;
+
+    if (abs(pixel_delta.x) < abs(pixel_delta.y)) {
+        permute = true;
+        pixel_delta = pixel_delta.yx;
+        start_pixel = start_pixel.yx;
+        end_pixel = end_pixel.yx;
+    }
+
+    float major_length = abs(pixel_delta.x);
+
+    if (major_length <= 1.0) {
+        return false;
+    }
+
+    float stride = max(1.0, ceil(major_length / float(max_steps)));
+    float step_dir = pixel_delta.x < 0.0 ? -1.0 : 1.0;
+    float inv_dx = rcp_safe(abs(pixel_delta.x), 0.0001);
+
+    vec3 dq = (end_q - start_q) * inv_dx * stride;
+    float dk = (end_k - start_k) * inv_dx * stride;
+    vec2 dp = vec2(step_dir, pixel_delta.y * inv_dx) * stride;
+
+    ray = SsrDdaRay(
+        origin,
+        start_q,
+        dq,
+        start_k,
+        dk,
+        start_pixel,
+        dp,
+        major_length,
+        stride,
+        permute
+    );
+
+    return true;
 }
 
 vec4 screen_space_reflection(vec2 uv, SurfaceMaterial material, float ao) {
@@ -128,315 +425,226 @@ vec4 screen_space_reflection(vec2 uv, SurfaceMaterial material, float ao) {
 
     float smoothness = 1.0 - material.roughness;
 
-    vec3 origin = view_position(uv, material.source_depth);
-    vec3 view_ray = normalize_fast(origin);
+    if (smoothness <= 0.055 && material.transparent_weight <= 0.0) {
+        return vec4(0.0);
+    }
 
+    vec3 origin = view_position(uv, material.source_depth);
+    float view_distance = -origin.z;
+    vec3 view_ray = normalize_fast(origin);
     float ndotv = saturate(dot(material.normal, -view_ray));
 
     if (ndotv <= 0.0001) {
         return vec4(0.0);
     }
 
-    float fresnel = pow5(1.0 - ndotv);
-    float smooth_weight = smoothstep(0.02, 0.86, smoothness);
-    float reflectance = max(material.reflectance, 0.08 + 0.28 * smooth_weight);
-
-    float view_distance = -origin.z;
-
-    float distant_grazing =
-        smoothstep(8.0, 80.0, view_distance) *
-        smoothstep(0.55, 0.98, 1.0 - ndotv);
-
-    float near_reflection_fade = smoothstep(2.5, 18.0, view_distance);
-
-    float raw_grazing_reflection =
-        smoothstep(0.10, 0.92, fresnel) *
-        mix(0.35, 1.0, near_reflection_fade);
-
-    float grazing_reflection = max(raw_grazing_reflection, distant_grazing);
-
-    float rough_noise_fade = mix(
-        1.0 - smoothstep(0.38, 0.86, material.roughness) * 0.90,
-        1.0,
-        grazing_reflection * 0.65
+    float material_weight = ssr_material_weight(
+        material,
+        ndotv,
+        view_distance
     );
 
-    float material_weight =
-        mix(
-            reflectance * mix(0.18, 1.28, smooth_weight),
-            1.0,
-            grazing_reflection
-        ) *
-        mix(0.32, 1.0, near_reflection_fade) *
-        rough_noise_fade;
-
-    if (material_weight <= 0.001) {
+    if (material_weight <= 0.002) {
         return vec4(0.0);
     }
 
     vec3 ray_dir = normalize_fast(reflect(view_ray, material.normal));
 
-    int max_steps = int(clamp(params.ssr.y, 1.0, 96.0));
-    float inv_steps = rcp_safe(float(max_steps), 1.0);
-
-    float water_weight =
-        smoothstep(0.72, 0.98, smoothness) *
-        smoothstep(0.08, 0.74, 1.0 - ndotv) *
-        smoothstep(4.0, 24.0, view_distance);
-
-    float max_distance = max(params.ssr.z, 0.1) * mix(1.0, 1.45, water_weight);
-    float base_thickness = max(params.ssr.w, 0.01);
-    float min_distance = max(0.08, -origin.z * 0.003);
-
+    int max_steps = int(clamp(params.ssr.y, 1.0, float(SSR_MAX_DDA_STEPS)));
+    float max_distance = max(params.ssr.z, 0.25);
     vec3 ray_origin =
         origin +
-        material.normal * max(0.015, -origin.z * 0.0015);
+        material.normal * max(0.010, view_distance * 0.0012);
 
-    float previous_distance = min_distance;
-    float previous_delta = -100000.0;
-    vec2 previous_uv = uv;
-    bool previous_has_depth = false;
+    SsrDdaRay ray;
 
+    if (
+        !build_ssr_dda_ray(
+            ray_origin,
+            ray_dir,
+            view_distance,
+            max_distance,
+            max_steps,
+            ray
+        )
+    ) {
+        return vec4(0.0);
+    }
+
+    int step_count = int(
+        clamp(
+            ceil(ray.major_length * rcp_safe(ray.stride, 1.0)),
+            1.0,
+            float(max_steps)
+        )
+    );
+
+    vec2 dda_pixel = ray.pixel;
+    vec3 dda_q = ray.q;
+    float dda_k = ray.k;
     float origin_edge_fade = screen_edge_fade(uv);
     float pixel_scale = rcp_safe(length(params.aa.xy), 0.000001);
 
-    for (int i = 0; i < 96; i++) {
-        if (i >= max_steps) {
+    for (int i = 0; i < SSR_MAX_DDA_STEPS; i++) {
+        if (i >= step_count) {
             break;
         }
 
-        float step_t = (float(i) + 1.0) * inv_steps;
-
-        float step_curve = mix(
-            step_t * step_t,
-            step_t,
-            mix(0.70, 1.0, water_weight)
+        vec2 low_pixel = dda_pixel;
+        vec3 low_q = dda_q;
+        float low_k = dda_k;
+        SsrDdaSample low_sample = ssr_dda_sample(
+            low_pixel,
+            low_q,
+            low_k,
+            ray.permute
         );
 
-        float ray_distance = mix(min_distance, max_distance, step_curve);
-        vec3 ray_position = ray_origin + ray_dir * ray_distance;
+        dda_pixel += ray.dp;
+        dda_q += ray.dq;
+        dda_k += ray.dk;
 
-        if (ray_position.z >= -params.depth.x) {
+        SsrDdaSample current_sample = ssr_dda_sample(
+            dda_pixel,
+            dda_q,
+            dda_k,
+            ray.permute
+        );
+        vec2 hit_uv = current_sample.uv;
+
+        if (!ssr_uv_is_valid(hit_uv)) {
             break;
         }
 
-        vec2 hit_uv = project_view_position(ray_position);
-
-        if (
-            any(lessThan(hit_uv, vec2(0.0))) ||
-            any(greaterThan(hit_uv, vec2(1.0)))
-        ) {
+        if (current_sample.position.z >= -params.depth.x) {
             break;
         }
 
-        float hit_depth = depth_at_ssr(hit_uv);
-
-        if (is_background_depth(hit_depth)) {
-            continue;
-        }
+        float hit_depth = depth_at_ssr_trace(hit_uv);
 
         float thickness;
-        float depth_delta = ssr_depth_delta(hit_depth, ray_position, thickness);
+        float depth_delta;
+        float ray_min_view_depth = low_sample.ray_view_depth;
+        float ray_max_view_depth = current_sample.ray_view_depth;
 
-        float negative_slack = mix(
-            base_thickness * 0.30,
-            thickness * 0.36,
-            water_weight
+        swap_if_greater(ray_min_view_depth, ray_max_view_depth);
+
+        bool candidate_hit = ssr_segment_depth_hit(
+            hit_depth,
+            ray_min_view_depth,
+            ray_max_view_depth,
+            depth_delta,
+            thickness
         );
 
-        bool crossed_surface = previous_has_depth
-            ? previous_delta < -negative_slack && depth_delta >= -negative_slack
-            : depth_delta >= -negative_slack;
-
-        bool near_surface =
-            abs(depth_delta) <= thickness * mix(0.75, 1.15, water_weight);
-
-        bool within_surface =
-            depth_delta < thickness &&
-            depth_delta > -thickness * mix(1.60, 2.20, water_weight);
-
-        bool candidate_surface =
-            (crossed_surface && within_surface) ||
-            (previous_has_depth && near_surface && previous_delta < thickness);
-
-        if (candidate_surface) {
-            float refine_low = previous_has_depth ? previous_distance : min_distance;
-
+        if (candidate_hit) {
             SsrHit refined = refined_ssr_hit(
-                ray_origin,
-                ray_dir,
-                refine_low,
-                ray_distance,
-                base_thickness,
-                water_weight
+                ray,
+                low_pixel,
+                dda_pixel,
+                low_q,
+                dda_q,
+                low_k,
+                dda_k
             );
 
-            vec2 refined_uv = refined.uv;
-            float refined_distance = refined.distance;
-            vec3 refined_position = ray_origin + ray_dir * refined_distance;
+            if (!ssr_uv_is_valid(refined.uv)) {
+                continue;
+            }
 
             if (
-                any(lessThan(refined_uv, vec2(0.0))) ||
-                any(greaterThan(refined_uv, vec2(1.0)))
+                refined.delta < -ssr_hit_slack(refined.thickness) * 1.35 ||
+                refined.delta > refined.thickness * 1.15
             ) {
-                previous_distance = ray_distance;
-                previous_delta = depth_delta;
-                previous_uv = hit_uv;
-                previous_has_depth = true;
                 continue;
             }
 
-            float refined_hit_depth = depth_at_ssr(refined_uv);
+            SurfaceMaterial hit_material = surface_material(refined.uv);
 
-            if (is_background_depth(refined_hit_depth)) {
-                previous_distance = ray_distance;
-                previous_delta = depth_delta;
-                previous_uv = hit_uv;
-                previous_has_depth = true;
+            if (surface_material_is_background(hit_material)) {
                 continue;
             }
 
-            float refined_thickness;
-            float refined_delta = ssr_depth_delta(
-                refined_hit_depth,
-                refined_position,
-                refined_thickness
-            );
-
-            float refined_negative_slack = mix(
-                base_thickness * 0.30,
-                refined_thickness * 0.36,
-                water_weight
-            );
-
-            bool refined_valid =
-                refined_delta >= -refined_negative_slack * 1.75 &&
-                refined_delta <= refined_thickness * 1.20;
-
-            if (!refined_valid) {
-                previous_distance = refined_distance;
-                previous_delta = -100000.0;
-                previous_uv = refined_uv;
-                previous_has_depth = true;
-                continue;
-            }
-
-            SurfaceMaterial hit_material = surface_material(refined_uv);
-
-            float pixel_span = length((refined_uv - uv) * pixel_scale);
-
-            float close_self_fade = smoothstep(2.0, 10.0, pixel_span);
-            float water_self_fade = smoothstep(0.45, 3.0, pixel_span);
-            float self_fade = mix(close_self_fade, water_self_fade, water_weight);
-
+            vec2 ray_screen_dir = refined.uv - uv;
+            float pixel_span = length(ray_screen_dir * pixel_scale);
             float same_normal = dot(hit_material.normal, material.normal);
+            float same_depth =
+                abs(linear_depth(hit_material.source_depth) - view_distance);
 
             bool likely_same_surface =
-                same_normal > 0.94 &&
-                pixel_span < mix(42.0, 12.0, water_weight);
+                same_normal > mix(0.965, 0.925, material.transparent_weight) &&
+                (
+                    pixel_span < mix(18.0, 7.0, material.transparent_weight) ||
+                    same_depth < max(0.12, view_distance * 0.010)
+                );
 
-            bool too_close_self_hit =
-                self_fade <= 0.025;
-
-            if (likely_same_surface || too_close_self_hit) {
-                previous_distance = refined_distance;
-                previous_delta = -100000.0;
-                previous_uv = refined_uv;
-                previous_has_depth = true;
+            if (likely_same_surface) {
                 continue;
             }
 
-            float normal_fade =
-                saturate(dot(hit_material.normal, -ray_dir) * 0.5 + 0.5);
+            float hit_facing = saturate(dot(hit_material.normal, -ray_dir));
 
-            float normal_distance_fade =
+            if (hit_facing <= 0.035) {
+                continue;
+            }
+
+            float distance_fade =
                 1.0 - smoothstep(
-                    max_distance * 0.62,
+                    max_distance * 0.72,
                     max_distance,
-                    refined_distance
+                    refined.distance
                 );
 
-            float water_distance_fade =
-                1.0 - smoothstep(
-                    max_distance * 0.90,
-                    max_distance,
-                    refined_distance
-                );
-
-            float distance_fade = mix(
-                normal_distance_fade,
-                water_distance_fade,
-                water_weight
-            );
-
+            float edge_fade = origin_edge_fade * screen_edge_fade(refined.uv);
             float hit_fade =
                 1.0 - smoothstep(
-                    refined_thickness * 0.45,
-                    refined_thickness * 1.15,
-                    abs(refined_delta)
+                    refined.thickness * 0.45,
+                    refined.thickness * 1.18,
+                    abs(refined.delta)
                 );
-
-            float visibility = mix(0.62, 1.0, ao);
+            float self_fade = smoothstep(
+                mix(2.5, 0.85, material.transparent_weight),
+                mix(12.0, 4.0, material.transparent_weight),
+                pixel_span
+            );
+            float roughness_fade =
+                1.0 - smoothstep(0.62, 0.94, material.roughness) * 0.72;
+            float visibility = mix(0.68, 1.0, ao);
 
             float candidate_weight =
                 params.ssr.x *
                 material_weight *
-                origin_edge_fade *
-                screen_edge_fade(refined_uv) *
                 distance_fade *
+                edge_fade *
                 hit_fade *
-                visibility *
-                normal_fade *
-                self_fade;
+                hit_facing *
+                self_fade *
+                roughness_fade *
+                visibility;
 
-            if (candidate_weight <= 0.003) {
-                previous_distance = refined_distance;
-                previous_delta = -100000.0;
-                previous_uv = refined_uv;
-                previous_has_depth = true;
+            if (candidate_weight <= 0.0025) {
                 continue;
             }
 
-            vec2 ray_screen_dir = refined_uv - uv;
-
-            float far_water =
-                water_weight *
-                smoothstep(
-                    max_distance * 0.25,
-                    max_distance * 0.90,
-                    refined_distance
-                );
-
-            float rough_material_blur =
-                smoothstep(0.45, 0.85, material.roughness) *
-                (1.0 - grazing_reflection * 0.45);
-
-            float distance_blur = max(
-                far_water * 0.85,
-                rough_material_blur * 0.75
-            );
+            float distance_blur =
+                smoothstep(max_distance * 0.34, max_distance, refined.distance) *
+                smoothstep(0.38, 0.82, material.roughness);
 
             vec3 hit_color = ssr_reflection_color(
-                refined_uv,
+                refined.uv,
                 ray_screen_dir,
                 material.roughness,
                 distance_blur
             );
 
             float highlight_lift =
-                1.0 + saturate(luminance_of(hit_color) - 0.6) * 0.42;
+                1.0 + saturate(luminance_of(hit_color) - 0.7) * 0.24;
 
-            float stability_fade = mix(1.0, 0.76, far_water);
-
-            float weight = candidate_weight * stability_fade;
-
-            return vec4(hit_color * highlight_lift, saturate(weight * 2.15));
+            return vec4(
+                hit_color * highlight_lift,
+                saturate(candidate_weight * 1.65)
+            );
         }
-
-        previous_distance = ray_distance;
-        previous_delta = depth_delta;
-        previous_uv = hit_uv;
-        previous_has_depth = true;
     }
 
     return vec4(0.0);
@@ -451,12 +659,12 @@ vec3 apply_screen_space_reflection(vec3 color, vec4 reflection) {
     float base_luma = luminance_of(color);
 
     vec3 glossy = mix(
-        max(color, reflection.rgb * 1.08),
-        reflection.rgb + color * 0.16,
-        smoothstep(base_luma, base_luma + 1.4, reflected_luma)
+        max(color, reflection.rgb * 1.04),
+        reflection.rgb + color * 0.12,
+        smoothstep(base_luma, base_luma + 1.2, reflected_luma)
     );
 
-    vec3 sheen = reflection.rgb * reflection.a * 0.18;
+    vec3 sheen = reflection.rgb * reflection.a * 0.10;
 
     return mix(color, glossy, reflection.a) + sheen;
 }

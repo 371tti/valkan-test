@@ -572,6 +572,7 @@ fn record_graph_command_buffer(
 struct FrameFeatureFlags {
     has_shadow_casters: bool,
     has_translucent_shadow_casters: bool,
+    has_transparent_scene_items: bool,
 }
 
 struct FrameRecordState {
@@ -597,12 +598,17 @@ fn frame_feature_flags(
             continue;
         }
         let casts_shadow = item.flags.casts_shadow;
+        let is_transparent = materials.is_transparent(item.material);
         let casts_translucent_shadow =
             casts_shadow && materials.casts_translucent_shadow(item.material);
+        flags.has_transparent_scene_items |= is_transparent;
         flags.has_translucent_shadow_casters |= casts_translucent_shadow;
         flags.has_shadow_casters |= casts_translucent_shadow
             || (casts_shadow && materials.casts_opaque_shadow(item.material));
-        if flags.has_shadow_casters && flags.has_translucent_shadow_casters {
+        if flags.has_shadow_casters
+            && flags.has_translucent_shadow_casters
+            && flags.has_transparent_scene_items
+        {
             break;
         }
     }
@@ -676,6 +682,7 @@ fn record_graph_pass(
             materials,
             meshes,
             snapshot,
+            state,
         ),
         "post" => record_post_pass(device, frame, swapchain, snapshot, state),
         "framebuffer_readback" => record_framebuffer_readback_pass(
@@ -739,6 +746,13 @@ fn required_shadow_resources<'a>(
     })
 }
 
+/// Returns whether post effects will sample scene normal/roughness metadata this frame.
+fn scene_material_metadata_required(quality: RenderQualitySettings) -> bool {
+    quality.ssao().intensity() > 0.0
+        || quality.ssr().intensity() > 0.0
+        || quality.anti_aliasing().blend() > 0.0
+}
+
 /// Records one graph-owned image barrier outside pass recording.
 fn record_graph_barrier(
     device: &Device,
@@ -790,6 +804,7 @@ fn record_scene_pass(
     materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
     snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
 ) -> Result<(), VulkanError> {
     let clear_values = scene_clear_values(pass)?;
     let render_area = vk::Rect2D::default()
@@ -812,6 +827,17 @@ fn record_scene_pass(
         let camera = active_camera(snapshot);
         let mesh_options =
             MeshDrawOptions::scene(swapchain.extent_2d(), camera, snapshot.optimization);
+        let metadata_required = scene_material_metadata_required(state.quality);
+        let opaque_pipeline = if metadata_required {
+            swapchain.mesh_pipeline()
+        } else {
+            swapchain.mesh_fast_pipeline()
+        };
+        let transparent_pipeline = if metadata_required {
+            swapchain.transparent_mesh_pipeline()
+        } else {
+            swapchain.transparent_mesh_fast_pipeline()
+        };
         let mut opaque_count = 0_usize;
         let mut transparent_count = 0_usize;
         for item in &snapshot.render_items {
@@ -821,7 +847,7 @@ fn record_scene_pass(
             if meshes.bind_and_draw(
                 device,
                 frame.command_buffer,
-                swapchain.mesh_pipeline(),
+                opaque_pipeline,
                 materials,
                 Some(pass_resources),
                 frame.slot_index,
@@ -838,7 +864,7 @@ fn record_scene_pass(
             if meshes.bind_and_draw(
                 device,
                 frame.command_buffer,
-                swapchain.transparent_mesh_pipeline(),
+                transparent_pipeline,
                 materials,
                 Some(pass_resources),
                 frame.slot_index,
@@ -851,6 +877,7 @@ fn record_scene_pass(
         tracing::trace!(
             opaque_count,
             transparent_count,
+            metadata_required,
             "recorded scene mesh draw groups"
         );
         device.cmd_end_render_pass(frame.command_buffer);
@@ -1054,6 +1081,7 @@ fn record_post_pass(
             snapshot.camera_effects,
             active_camera(snapshot),
             state.quality,
+            state.features.has_transparent_scene_items,
         );
         device.cmd_end_render_pass(frame.command_buffer);
     }

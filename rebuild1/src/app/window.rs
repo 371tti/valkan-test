@@ -12,9 +12,9 @@ use gr_render::{
     protocol::{
         FrameId, FrameSnapshot, FrameSnapshotBuilder, FramebufferReadbackOptions, LightPacket,
         LoadedAsset, MessageEnvelope, NativeSurfaceHandle, NonZeroExtent, RenderItemPacket,
-        RendererCommand, RendererEndpoint, RendererEvent, SceneHandle, SnapshotError,
-        SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, ViewId, ViewPacket,
-        Win32SurfaceHandle, WindowId,
+        RenderQualitySettings, RendererCommand, RendererEndpoint, RendererEvent, SceneHandle,
+        SnapshotError, SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, ViewId,
+        ViewPacket, Win32SurfaceHandle, WindowId,
     },
     renderer::{RendererError, RendererThread, VulkanRendererBackend, spawn_renderer_thread},
 };
@@ -54,6 +54,7 @@ const WINDOW_MAX_FPS_ENV: &str = "REBUILD1_MAX_FPS";
 const DEFAULT_WINDOW_MAX_FPS: u32 = 120;
 const MIN_WINDOW_MAX_FPS: u32 = 15;
 const MAX_WINDOW_MAX_FPS: u32 = 240;
+const INITIAL_WINDOW_QUALITY: WindowQualityPreset = WindowQualityPreset::Performance;
 
 #[derive(Debug, Error)]
 pub enum WindowedRunError {
@@ -260,6 +261,7 @@ struct WindowedApp {
     camera: FreeCamera,
     camera_effects: CameraEffectController,
     latest_framebuffer_metering: Option<CameraMetering>,
+    quality_preset: WindowQualityPreset,
     light_intensity: f32,
     light_brighter: bool,
     light_darker: bool,
@@ -281,6 +283,52 @@ enum WindowUserEvent {
 struct WindowEventPump {
     running: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowQualityPreset {
+    Performance,
+    Interactive,
+    Balanced,
+    HighQuality,
+}
+
+impl WindowQualityPreset {
+    fn from_key(physical_key: PhysicalKey) -> Option<Self> {
+        match physical_key {
+            PhysicalKey::Code(KeyCode::Digit1) | PhysicalKey::Code(KeyCode::Numpad1) => {
+                Some(Self::Performance)
+            }
+            PhysicalKey::Code(KeyCode::Digit2) | PhysicalKey::Code(KeyCode::Numpad2) => {
+                Some(Self::Interactive)
+            }
+            PhysicalKey::Code(KeyCode::Digit3) | PhysicalKey::Code(KeyCode::Numpad3) => {
+                Some(Self::Balanced)
+            }
+            PhysicalKey::Code(KeyCode::Digit4) | PhysicalKey::Code(KeyCode::Numpad4) => {
+                Some(Self::HighQuality)
+            }
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Performance => "performance",
+            Self::Interactive => "interactive",
+            Self::Balanced => "balanced",
+            Self::HighQuality => "high_quality",
+        }
+    }
+
+    fn settings(self) -> RenderQualitySettings {
+        match self {
+            Self::Performance => RenderQualitySettings::performance(),
+            Self::Interactive => RenderQualitySettings::interactive(),
+            Self::Balanced => RenderQualitySettings::balanced(),
+            Self::HighQuality => RenderQualitySettings::high_quality(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +381,7 @@ impl WindowedApp {
             camera: FreeCamera::default(),
             camera_effects: CameraEffectController::default(),
             latest_framebuffer_metering: None,
+            quality_preset: INITIAL_WINDOW_QUALITY,
             light_intensity: DEFAULT_WINDOW_LIGHT_INTENSITY,
             light_brighter: false,
             light_darker: false,
@@ -377,6 +426,7 @@ impl WindowedApp {
             self.set_mouse_captured(true);
         }
         self.configure_framebuffer_readback()?;
+        self.configure_quality_preset(self.quality_preset)?;
         self.configure_current_surface()?;
         self.send_initial_asset_load()?;
 
@@ -387,6 +437,21 @@ impl WindowedApp {
     fn configure_framebuffer_readback(&self) -> Result<(), WindowedRunError> {
         self.send_command(RendererCommand::SetFramebufferReadback {
             options: FramebufferReadbackOptions::camera_metering(),
+        })?;
+        Ok(())
+    }
+
+    /// Sends the current window-selected renderer quality profile.
+    fn configure_quality_preset(
+        &self,
+        preset: WindowQualityPreset,
+    ) -> Result<(), WindowedRunError> {
+        tracing::info!(
+            quality = preset.label(),
+            "sending window renderer quality preset"
+        );
+        self.send_command(RendererCommand::SetQualitySettings {
+            settings: preset.settings(),
         })?;
         Ok(())
     }
@@ -1023,18 +1088,29 @@ impl WindowedApp {
         window.set_cursor_visible(!captured);
     }
 
-    /// Converts a winit keyboard input into one light or camera state update.
-    fn handle_keyboard(&mut self, physical_key: PhysicalKey, state: ElementState) {
+    /// Converts a winit keyboard input into one quality, light, or camera state update.
+    fn handle_keyboard(
+        &mut self,
+        physical_key: PhysicalKey,
+        state: ElementState,
+    ) -> Result<(), TransportError> {
         let pressed = state == ElementState::Pressed;
+
+        if pressed {
+            if let Some(preset) = WindowQualityPreset::from_key(physical_key) {
+                self.set_quality_preset(preset)?;
+                return Ok(());
+            }
+        }
 
         match physical_key {
             PhysicalKey::Code(KeyCode::ArrowUp) => {
                 self.light_brighter = pressed;
-                return;
+                return Ok(());
             }
             PhysicalKey::Code(KeyCode::ArrowDown) => {
                 self.light_darker = pressed;
-                return;
+                return Ok(());
             }
             _ => {}
         }
@@ -1044,6 +1120,39 @@ impl WindowedApp {
         }
 
         self.camera.set_key(camera_key(physical_key), pressed);
+        Ok(())
+    }
+
+    /// Sends a renderer quality update selected by a number key.
+    fn set_quality_preset(&mut self, preset: WindowQualityPreset) -> Result<(), TransportError> {
+        if self.quality_preset == preset {
+            tracing::trace!(
+                quality = preset.label(),
+                "window renderer quality preset unchanged"
+            );
+            return Ok(());
+        }
+
+        match self.send_command(RendererCommand::SetQualitySettings {
+            settings: preset.settings(),
+        }) {
+            Ok(()) => {
+                self.quality_preset = preset;
+                tracing::info!(
+                    quality = preset.label(),
+                    "updated window renderer quality preset"
+                );
+                Ok(())
+            }
+            Err(TransportError::Full) => {
+                tracing::trace!(
+                    quality = preset.label(),
+                    "quality preset update skipped because command channel is full"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Converts raw captured mouse movement into camera look deltas.
@@ -1227,7 +1336,9 @@ impl ApplicationHandler<WindowUserEvent> for WindowedApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                self.handle_keyboard(event.physical_key, event.state);
+                if let Err(error) = self.handle_keyboard(event.physical_key, event.state) {
+                    self.fail_and_exit(error.into(), event_loop);
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -1295,6 +1406,55 @@ mod tests {
     use super::*;
 
     use gr_render::protocol::renderer_transport;
+
+    #[test]
+    fn number_keys_select_window_quality_presets() {
+        assert_eq!(
+            WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Digit1)),
+            Some(WindowQualityPreset::Performance)
+        );
+        assert_eq!(
+            WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Numpad1)),
+            Some(WindowQualityPreset::Performance)
+        );
+        assert_eq!(
+            WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Digit2)),
+            Some(WindowQualityPreset::Interactive)
+        );
+        assert_eq!(
+            WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Digit3)),
+            Some(WindowQualityPreset::Balanced)
+        );
+        assert_eq!(
+            WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Digit4)),
+            Some(WindowQualityPreset::HighQuality)
+        );
+        assert_eq!(
+            WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Digit5)),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pressed_number_key_sends_quality_command() {
+        let config = WindowConfig::default();
+        let (endpoint, mut inbox) = renderer_transport(2);
+        let mut app = WindowedApp::new(endpoint, config);
+
+        app.handle_keyboard(PhysicalKey::Code(KeyCode::Digit2), ElementState::Pressed)
+            .expect("quality key should send renderer command");
+
+        let command = inbox
+            .recv_command()
+            .await
+            .expect("quality command should be received");
+
+        assert!(matches!(
+            command.payload,
+            RendererCommand::SetQualitySettings { settings }
+                if settings == RenderQualitySettings::interactive()
+        ));
+    }
 
     // Verifies that window shutdown does not use tokio's blocking send inside a runtime.
     #[tokio::test(flavor = "current_thread")]

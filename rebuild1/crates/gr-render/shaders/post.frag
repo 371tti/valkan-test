@@ -17,6 +17,7 @@ layout(push_constant) uniform PostParams {
     vec4 ssr;
     vec4 aa;
     vec4 shadow;
+    vec4 features;
     float exposure;
     float contrast;
     float saturation;

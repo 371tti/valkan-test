@@ -296,8 +296,8 @@ impl RenderOptimizationSettings {
         Self {
             frustum_culling: true,
             distance_lod: true,
-            high_detail_screen_radius_px: 72.0,
-            medium_detail_screen_radius_px: 16.0,
+            high_detail_screen_radius_px: 128.0,
+            medium_detail_screen_radius_px: 36.0,
         }
     }
 
@@ -559,5 +559,16 @@ mod tests {
         assert!(RenderOptimizationSettings::new(true, true, 96.0, 28.0).is_some());
         assert!(RenderOptimizationSettings::new(true, true, 20.0, 40.0).is_none());
         assert!(RenderOptimizationSettings::new(true, true, f32::NAN, 20.0).is_none());
+    }
+
+    // Verifies that the default snapshot policy keeps LOD active with meaningful cutoffs.
+    #[test]
+    fn balanced_optimization_enables_aggressive_distance_lod() {
+        let optimization = RenderOptimizationSettings::balanced();
+
+        assert!(optimization.frustum_culling());
+        assert!(optimization.distance_lod());
+        assert_eq!(optimization.high_detail_screen_radius_px(), 128.0);
+        assert_eq!(optimization.medium_detail_screen_radius_px(), 36.0);
     }
 }

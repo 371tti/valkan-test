@@ -162,6 +162,7 @@ struct PostPushConstants {
     ssr: [f32; 4],
     aa: [f32; 4],
     shadow: [f32; 4],
+    features: [f32; 4],
     exposure: f32,
     contrast: f32,
     saturation: f32,
@@ -175,6 +176,7 @@ impl PostPushConstants {
         camera: CameraSnapshot,
         extent: vk::Extent2D,
         quality: RenderQualitySettings,
+        has_transparent_scene_items: bool,
     ) -> Self {
         let white_balance = camera_effects.white_balance();
         let ssao = quality.ssao();
@@ -201,6 +203,16 @@ impl PostPushConstants {
             ],
             aa: Self::aa_params(extent, anti_aliasing),
             shadow: Self::shadow_params(shadow_softening),
+            features: [
+                if has_transparent_scene_items {
+                    1.0
+                } else {
+                    0.0
+                },
+                0.0,
+                0.0,
+                0.0,
+            ],
             exposure: camera_effects.exposure().value(),
             contrast: (camera_effects.contrast() * post.contrast()).clamp(0.25, 4.0),
             saturation: (camera_effects.saturation() * post.saturation()).clamp(0.0, 4.0),
@@ -307,6 +319,7 @@ impl PostPipeline {
         camera_effects: CameraEffects,
         camera: CameraSnapshot,
         quality: RenderQualitySettings,
+        has_transparent_scene_items: bool,
     ) {
         let viewports = [vk::Viewport::default()
             .x(0.0)
@@ -319,7 +332,13 @@ impl PostPipeline {
             .offset(vk::Offset2D { x: 0, y: 0 })
             .extent(extent)];
         let descriptor_sets = [self.descriptor_set];
-        let push = PostPushConstants::new(camera_effects, camera, extent, quality);
+        let push = PostPushConstants::new(
+            camera_effects,
+            camera,
+            extent,
+            quality,
+            has_transparent_scene_items,
+        );
         let push_bytes = push_constant_bytes(&push);
 
         tracing::trace!(
@@ -337,6 +356,7 @@ impl PostPipeline {
             aa_blend = push.aa[3],
             shadow_softening = push.shadow[0],
             shadow_softening_radius = push.shadow[1],
+            has_transparent_scene_items,
             "recording Vulkan post pass"
         );
 

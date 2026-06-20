@@ -97,7 +97,7 @@ impl RenderQualitySettings {
     /// Returns the expensive profile used when visual inspection matters more than frame time.
     pub fn high_quality() -> Self {
         Self::from_parts(
-            SsaoQualitySettings::balanced(),
+            SsaoQualitySettings::high_quality(),
             SsrQualitySettings::high_quality(),
             AntiAliasingQualitySettings::high_quality(),
             ShadowSofteningQualitySettings::high_quality(),
@@ -189,17 +189,17 @@ impl ShadowSofteningQualitySettings {
 
     /// Returns a light cleanup profile for normal camera movement.
     pub fn interactive() -> Self {
-        Self::new(0.42, 3.25, 3.1, 0.095)
+        Self::new(0.28, 2.50, 3.6, 0.070)
     }
 
     /// Returns the default cleanup profile for balanced soft-shadow quality.
     pub fn balanced() -> Self {
-        Self::new(0.64, 5.75, 2.45, 0.160)
+        Self::new(0.66, 5.75, 2.45, 0.160)
     }
 
     /// Returns the stronger cleanup profile for visual inspection.
     pub fn high_quality() -> Self {
-        Self::new(0.78, 8.50, 2.05, 0.220)
+        Self::new(0.92, 10.50, 1.85, 0.240)
     }
 
     /// Returns the final blend strength of the shadow cleanup.
@@ -232,16 +232,16 @@ pub struct SsrQualitySettings {
 }
 
 impl SsrQualitySettings {
-    /// Creates bounded SSR controls for the post pass ray marcher.
+    /// Creates bounded SSR controls for the post-pass DDA tracer.
     ///
-    /// `intensity` is the final blend cap, `max_steps` bounds shader work,
+    /// `intensity` is the final blend cap, `max_steps` bounds DDA work,
     /// `max_distance` limits view-space ray length, and `thickness` controls
     /// depth-hit tolerance.
     pub fn new(intensity: f32, max_steps: u32, max_distance: f32, thickness: f32) -> Self {
         Self {
             intensity: finite_clamp(intensity, 0.0, 1.0, 0.0),
-            max_steps: max_steps.clamp(1, 96),
-            max_distance: finite_clamp(max_distance, 0.25, 160.0, 64.0),
+            max_steps: max_steps.clamp(1, 64),
+            max_distance: finite_clamp(max_distance, 0.25, 96.0, 42.0),
             thickness: finite_clamp(thickness, 0.01, 1.0, 0.14),
         }
     }
@@ -253,27 +253,27 @@ impl SsrQualitySettings {
 
     /// Returns a visible SSR profile that stays responsive during camera movement.
     pub fn interactive() -> Self {
-        Self::new(0.60, 40, 42.0, 0.22)
+        Self::new(0.34, 16, 22.0, 0.17)
     }
 
     /// Returns the default cinematic SSR profile used by normal windowed rendering.
     pub fn balanced() -> Self {
-        Self::new(0.82, 72, 72.0, 0.18)
+        Self::new(0.72, 40, 56.0, 0.13)
     }
 
     /// Returns the inspection SSR profile with longer rays and cleaner hit refinement.
     pub fn high_quality() -> Self {
-        Self::new(0.94, 96, 104.0, 0.16)
+        Self::new(0.95, 64, 90.0, 0.11)
     }
 
     /// Returns the strongest built-in SSR profile for still screenshots and visual checks.
     pub fn ultra() -> Self {
-        Self::new(1.0, 96, 140.0, 0.15)
+        Self::new(1.0, 64, 96.0, 0.10)
     }
 
     /// Returns an intentionally exaggerated SSR profile for diagnosing reflective materials.
     pub fn debug_strong() -> Self {
-        Self::new(1.0, 96, 160.0, 0.30)
+        Self::new(1.0, 64, 96.0, 0.22)
     }
 
     /// Returns the final reflection blend cap.
@@ -281,7 +281,7 @@ impl SsrQualitySettings {
         self.intensity
     }
 
-    /// Returns the maximum number of ray steps evaluated per reflective pixel.
+    /// Returns the maximum number of DDA steps evaluated per reflective pixel.
     pub fn max_steps(self) -> u32 {
         self.max_steps
     }
@@ -323,17 +323,17 @@ impl SsaoQualitySettings {
 
     /// Returns an SSAO profile for normal interactive camera movement.
     pub fn interactive() -> Self {
-        Self::new(0.16, 0.50, 0.032, 2)
+        Self::new(0.20, 0.52, 0.032, 2)
     }
 
     /// Returns an SSAO profile that adds contact depth without crushing shaded surfaces.
     pub fn balanced() -> Self {
-        Self::new(0.34, 0.65, 0.030, 4)
+        Self::new(0.42, 0.70, 0.030, 4)
     }
 
     /// Returns the old inspection-quality SSAO profile.
     pub fn high_quality() -> Self {
-        Self::new(0.48, 0.75, 0.028, 6)
+        Self::new(0.58, 0.85, 0.026, 8)
     }
 
     /// Returns the global SSAO darkening strength.
@@ -379,12 +379,12 @@ impl AntiAliasingQualitySettings {
 
     /// Returns a post AA profile for normal interactive camera movement.
     pub fn interactive() -> Self {
-        Self::new(0.030, 0.62)
+        Self::new(0.034, 0.45)
     }
 
     /// Returns a balanced post AA profile with lower edge-search cost than inspection mode.
     pub fn balanced() -> Self {
-        Self::new(0.016, 0.90)
+        Self::new(0.018, 0.78)
     }
 
     /// Returns the high-quality edge resolve profile.
@@ -477,7 +477,7 @@ mod tests {
         let settings = SsrQualitySettings::new(5.0, 128, f32::INFINITY, -1.0);
 
         assert_eq!(settings.intensity(), 1.0);
-        assert_eq!(settings.max_steps(), 96);
+        assert_eq!(settings.max_steps(), 64);
         assert!(settings.max_distance().is_finite());
         assert_eq!(settings.thickness(), 0.01);
     }
@@ -512,5 +512,25 @@ mod tests {
                 .intensity()
                 > 0.0
         );
+    }
+
+    #[test]
+    fn visual_quality_profiles_have_clear_cost_steps() {
+        let interactive = RenderQualitySettings::interactive();
+        let balanced = RenderQualitySettings::balanced();
+        let high = RenderQualitySettings::high_quality();
+
+        assert!(interactive.ssr().intensity() < balanced.ssr().intensity());
+        assert!(balanced.ssr().intensity() < high.ssr().intensity());
+        assert!(interactive.ssr().max_steps() < balanced.ssr().max_steps());
+        assert!(balanced.ssr().max_steps() < high.ssr().max_steps());
+
+        assert!(interactive.ssao().intensity() < balanced.ssao().intensity());
+        assert!(balanced.ssao().intensity() < high.ssao().intensity());
+        assert!(interactive.ssao().sample_count() < balanced.ssao().sample_count());
+        assert!(balanced.ssao().sample_count() < high.ssao().sample_count());
+
+        assert!(interactive.anti_aliasing().blend() < balanced.anti_aliasing().blend());
+        assert!(balanced.anti_aliasing().blend() < high.anti_aliasing().blend());
     }
 }

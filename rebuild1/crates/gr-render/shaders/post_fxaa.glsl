@@ -89,35 +89,39 @@ vec3 high_quality_fxaa_scene_color(
             max(depth_edge_w, depth_edge_e)
         );
 
-        float normal_edge_n = normal_edge_from_depth(
-            material.normal,
-            material.source_depth,
-            depth_n,
-            uv_n
-        );
-        float normal_edge_s = normal_edge_from_depth(
-            material.normal,
-            material.source_depth,
-            depth_s,
-            uv_s
-        );
-        float normal_edge_w = normal_edge_from_depth(
-            material.normal,
-            material.source_depth,
-            depth_w,
-            uv_w
-        );
-        float normal_edge_e = normal_edge_from_depth(
-            material.normal,
-            material.source_depth,
-            depth_e,
-            uv_e
-        );
+        float normal_signal = 0.0;
 
-        float normal_signal = max(
-            max(normal_edge_n, normal_edge_s),
-            max(normal_edge_w, normal_edge_e)
-        );
+        if (depth_signal < 1.0) {
+            float normal_edge_n = normal_edge_from_depth(
+                material.normal,
+                material.source_depth,
+                depth_n,
+                uv_n
+            );
+            float normal_edge_s = normal_edge_from_depth(
+                material.normal,
+                material.source_depth,
+                depth_s,
+                uv_s
+            );
+            float normal_edge_w = normal_edge_from_depth(
+                material.normal,
+                material.source_depth,
+                depth_w,
+                uv_w
+            );
+            float normal_edge_e = normal_edge_from_depth(
+                material.normal,
+                material.source_depth,
+                depth_e,
+                uv_e
+            );
+
+            normal_signal = max(
+                max(normal_edge_n, normal_edge_s),
+                max(normal_edge_w, normal_edge_e)
+            );
+        }
 
         edge_signal = max(edge_signal, max(depth_signal, normal_signal) * 0.50);
     }

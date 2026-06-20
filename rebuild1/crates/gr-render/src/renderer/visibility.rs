@@ -211,6 +211,44 @@ mod tests {
         );
     }
 
+    // Verifies that large on-screen meshes keep the full index stream.
+    #[test]
+    fn near_large_sphere_uses_full_lod() {
+        let decision = classify_mesh(
+            camera(),
+            16.0 / 9.0,
+            720,
+            Some(bounds([0.0, 0.0, -3.0], 1.0)),
+            RenderOptimizationSettings::balanced(),
+        );
+
+        assert_eq!(
+            decision,
+            MeshVisibility::Visible {
+                lod: MeshLodLevel::Full
+            }
+        );
+    }
+
+    // Verifies that mid-sized meshes drop to the medium generated index stream.
+    #[test]
+    fn mid_screen_sphere_uses_medium_lod() {
+        let decision = classify_mesh(
+            camera(),
+            16.0 / 9.0,
+            720,
+            Some(bounds([0.0, 0.0, -8.0], 1.0)),
+            RenderOptimizationSettings::balanced(),
+        );
+
+        assert_eq!(
+            decision,
+            MeshVisibility::Visible {
+                lod: MeshLodLevel::Medium
+            }
+        );
+    }
+
     // Verifies that explicit full-detail policy keeps bounds visible at full geometry detail.
     #[test]
     fn disabled_policy_keeps_full_lod() {

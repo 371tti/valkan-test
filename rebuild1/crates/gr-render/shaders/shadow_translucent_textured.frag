@@ -32,8 +32,8 @@ bool has_base_color_texture() {
     return (material.flags.y & TEX_BASE_COLOR) != 0u;
 }
 
-ivec2 shadow_texel_coord(ivec2 size) {
-    return clamp(ivec2(gl_FragCoord.xy), ivec2(0), size - ivec2(1));
+ivec2 shadow_texel_coord() {
+    return ivec2(gl_FragCoord.xy);
 }
 
 float opaque_depth_for_cascade(uint index) {
@@ -42,7 +42,7 @@ float opaque_depth_for_cascade(uint index) {
     if (index == 0u) {
         return texelFetch(
             shadow_cascade_0,
-            shadow_texel_coord(textureSize(shadow_cascade_0, 0)),
+            shadow_texel_coord(),
             0
         ).r;
     }
@@ -50,7 +50,7 @@ float opaque_depth_for_cascade(uint index) {
     if (index == 1u) {
         return texelFetch(
             shadow_cascade_1,
-            shadow_texel_coord(textureSize(shadow_cascade_1, 0)),
+            shadow_texel_coord(),
             0
         ).r;
     }
@@ -58,14 +58,14 @@ float opaque_depth_for_cascade(uint index) {
     if (index == 2u) {
         return texelFetch(
             shadow_cascade_2,
-            shadow_texel_coord(textureSize(shadow_cascade_2, 0)),
+            shadow_texel_coord(),
             0
         ).r;
     }
 
     return texelFetch(
         shadow_cascade_3,
-        shadow_texel_coord(textureSize(shadow_cascade_3, 0)),
+        shadow_texel_coord(),
         0
     ).r;
 }

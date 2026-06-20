@@ -37,8 +37,14 @@ const SHADER_ENTRY: &CStr = c"main";
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const SCENE_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh_scene.frag.spv"));
+const SCENE_FAST_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh_scene_fast.frag.spv"));
 const SCENE_TEXTURED_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh_scene_textured.frag.spv"));
+const SCENE_TEXTURED_FAST_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/mesh_scene_textured_fast.frag.spv"
+));
 const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 const SHADOW_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
 const SHADOW_TEXTURED_FRAGMENT_SHADER: &[u8] =
@@ -289,6 +295,24 @@ impl VulkanMeshStore {
         Ok(pipelines)
     }
 
+    /// Creates opaque scene-pass mesh pipelines for frames that do not need material metadata.
+    pub(super) fn create_scene_fast_pipeline_set(
+        &self,
+        device: &Device,
+        render_pass: vk::RenderPass,
+    ) -> Result<MeshPipelineSet, VulkanError> {
+        let pipelines = self.create_pipeline_set(
+            device,
+            render_pass,
+            VERTEX_SHADER,
+            SCENE_FAST_FRAGMENT_SHADER,
+            SCENE_TEXTURED_FAST_FRAGMENT_SHADER,
+            MeshPipelineTarget::SceneOpaqueFast,
+        )?;
+        tracing::info!("created Vulkan fast opaque scene mesh pipelines");
+        Ok(pipelines)
+    }
+
     /// Creates transparent scene-pass mesh pipelines that blend color without writing depth.
     pub(super) fn create_scene_transparent_pipeline_set(
         &self,
@@ -304,6 +328,24 @@ impl VulkanMeshStore {
             MeshPipelineTarget::SceneTransparent,
         )?;
         tracing::info!("created Vulkan transparent scene mesh pipelines");
+        Ok(pipelines)
+    }
+
+    /// Creates transparent scene-pass mesh pipelines for frames that do not need material metadata.
+    pub(super) fn create_scene_transparent_fast_pipeline_set(
+        &self,
+        device: &Device,
+        render_pass: vk::RenderPass,
+    ) -> Result<MeshPipelineSet, VulkanError> {
+        let pipelines = self.create_pipeline_set(
+            device,
+            render_pass,
+            VERTEX_SHADER,
+            SCENE_FAST_FRAGMENT_SHADER,
+            SCENE_TEXTURED_FAST_FRAGMENT_SHADER,
+            MeshPipelineTarget::SceneTransparentFast,
+        )?;
+        tracing::info!("created Vulkan fast transparent scene mesh pipelines");
         Ok(pipelines)
     }
 
@@ -387,12 +429,14 @@ impl VulkanMeshStore {
         &self,
         device: &Device,
         shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+        raw_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
         translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     ) -> Result<MeshPassResources, VulkanError> {
         MeshPassResources::create(
             device,
             self.pass_set_layout,
             shadow_views,
+            raw_shadow_views,
             translucent_shadow_views,
         )
     }
@@ -634,6 +678,7 @@ impl MeshPassResources {
         device: &Device,
         pass_set_layout: vk::DescriptorSetLayout,
         shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+        raw_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
         translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     ) -> Result<Self, VulkanError> {
         let shadow_sampler = create_pass_sampler(device, vk::Filter::LINEAR)?;
@@ -669,6 +714,7 @@ impl MeshPassResources {
             shadow_sampler,
             transmittance_sampler,
             shadow_views,
+            raw_shadow_views,
             translucent_shadow_views,
         );
         tracing::info!("created Vulkan mesh pass descriptors");
@@ -1057,13 +1103,15 @@ fn create_pass_sampler(device: &Device, filter: vk::Filter) -> Result<vk::Sample
     unsafe { device.create_sampler(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
-/// Returns pass descriptor bindings in cascade order for opaque then translucent shadow maps.
-fn pass_shadow_bindings() -> [u32; SHADOW_CASCADE_COUNT * 2] {
+/// Returns pass descriptor bindings in cascade order for filtered, translucent, then raw shadows.
+fn pass_shadow_bindings() -> [u32; SHADOW_CASCADE_COUNT * 3] {
     std::array::from_fn(|index| {
         if index < SHADOW_CASCADE_COUNT {
             shader_interface::PASS_SHADOW_CASCADE_BINDINGS[index]
-        } else {
+        } else if index < SHADOW_CASCADE_COUNT * 2 {
             shader_interface::PASS_TRANSLUCENT_SHADOW_BINDINGS[index - SHADOW_CASCADE_COUNT]
+        } else {
+            shader_interface::PASS_RAW_SHADOW_CASCADE_BINDINGS[index - SHADOW_CASCADE_COUNT * 2]
         }
     })
 }
@@ -1071,13 +1119,16 @@ fn pass_shadow_bindings() -> [u32; SHADOW_CASCADE_COUNT * 2] {
 /// Returns the image views written into pass descriptors in binding order.
 fn pass_shadow_views(
     shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+    raw_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
-) -> [vk::ImageView; SHADOW_CASCADE_COUNT * 2] {
+) -> [vk::ImageView; SHADOW_CASCADE_COUNT * 3] {
     std::array::from_fn(|index| {
         if index < SHADOW_CASCADE_COUNT {
             shadow_views[index]
-        } else {
+        } else if index < SHADOW_CASCADE_COUNT * 2 {
             translucent_shadow_views[index - SHADOW_CASCADE_COUNT]
+        } else {
+            raw_shadow_views[index - SHADOW_CASCADE_COUNT * 2]
         }
     })
 }
@@ -1126,16 +1177,17 @@ fn update_pass_descriptor_set(
     shadow_sampler: vk::Sampler,
     transmittance_sampler: vk::Sampler,
     shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+    raw_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
 ) {
-    let image_infos = pass_shadow_views(shadow_views, translucent_shadow_views)
+    let image_infos = pass_shadow_views(shadow_views, raw_shadow_views, translucent_shadow_views)
         .into_iter()
         .enumerate()
         .map(|(index, view)| {
-            let sampler = if index < SHADOW_CASCADE_COUNT {
-                shadow_sampler
-            } else {
+            let sampler = if index >= SHADOW_CASCADE_COUNT && index < SHADOW_CASCADE_COUNT * 2 {
                 transmittance_sampler
+            } else {
+                shadow_sampler
             };
             vk::DescriptorImageInfo::default()
                 .sampler(sampler)
@@ -1187,7 +1239,9 @@ fn identity_frame_uniform() -> MeshFrameUniform {
 #[derive(Clone, Copy)]
 enum MeshPipelineTarget {
     SceneOpaque,
+    SceneOpaqueFast,
     SceneTransparent,
+    SceneTransparentFast,
     OpaqueShadow,
     TranslucentShadow,
 }
@@ -1196,7 +1250,10 @@ impl MeshPipelineTarget {
     /// Returns how many color attachments the target writes.
     fn color_attachment_count(self) -> usize {
         match self {
-            Self::SceneOpaque | Self::SceneTransparent => 3,
+            Self::SceneOpaque
+            | Self::SceneOpaqueFast
+            | Self::SceneTransparent
+            | Self::SceneTransparentFast => 3,
             Self::OpaqueShadow | Self::TranslucentShadow => 1,
         }
     }
@@ -1208,7 +1265,13 @@ impl MeshPipelineTarget {
 
     /// Returns whether the vertex shader consumes per-vertex normals.
     fn uses_surface_normal(self) -> bool {
-        matches!(self, Self::SceneOpaque | Self::SceneTransparent)
+        matches!(
+            self,
+            Self::SceneOpaque
+                | Self::SceneOpaqueFast
+                | Self::SceneTransparent
+                | Self::SceneTransparentFast
+        )
     }
 
     /// Returns whether fixed-function depth testing is active for this pass.
@@ -1218,7 +1281,10 @@ impl MeshPipelineTarget {
 
     /// Returns whether the pass should write depth values.
     fn writes_depth(self) -> bool {
-        matches!(self, Self::SceneOpaque | Self::OpaqueShadow)
+        matches!(
+            self,
+            Self::SceneOpaque | Self::SceneOpaqueFast | Self::OpaqueShadow
+        )
     }
 
     /// Creates the color blend state for scene color, scene metadata, or shadow transmittance.
@@ -1231,6 +1297,13 @@ impl MeshPipelineTarget {
             Self::SceneOpaque => vec![
                 vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask),
                 vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask),
+                vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::empty()),
+            ],
+            Self::SceneOpaqueFast => vec![
+                vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask),
+                vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::empty()),
                 vk::PipelineColorBlendAttachmentState::default()
                     .color_write_mask(vk::ColorComponentFlags::empty()),
             ],
@@ -1247,6 +1320,21 @@ impl MeshPipelineTarget {
                 vk::PipelineColorBlendAttachmentState::default()
                     .color_write_mask(vk::ColorComponentFlags::empty()),
                 vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask),
+            ],
+            Self::SceneTransparentFast => vec![
+                vk::PipelineColorBlendAttachmentState::default()
+                    .blend_enable(true)
+                    .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                    .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .color_blend_op(vk::BlendOp::ADD)
+                    .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .alpha_blend_op(vk::BlendOp::ADD)
+                    .color_write_mask(write_mask),
+                vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::empty()),
+                vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::empty()),
             ],
             Self::OpaqueShadow => {
                 vec![vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask)]
@@ -1649,6 +1737,42 @@ mod tests {
         assert_eq!(attachments.len(), 3);
         assert!(attachments[0].blend_enable == 0);
         assert_ne!(
+            attachments[1].color_write_mask,
+            vk::ColorComponentFlags::empty()
+        );
+        assert_eq!(
+            attachments[2].color_write_mask,
+            vk::ColorComponentFlags::empty()
+        );
+    }
+
+    #[test]
+    fn transparent_fast_scene_target_blends_color_without_material_metadata() {
+        let attachments = MeshPipelineTarget::SceneTransparentFast.color_blend_attachments();
+
+        assert!(MeshPipelineTarget::SceneTransparentFast.uses_depth_test());
+        assert!(!MeshPipelineTarget::SceneTransparentFast.writes_depth());
+        assert_eq!(attachments.len(), 3);
+        assert!(attachments[0].blend_enable != 0);
+        assert_eq!(
+            attachments[1].color_write_mask,
+            vk::ColorComponentFlags::empty()
+        );
+        assert_eq!(
+            attachments[2].color_write_mask,
+            vk::ColorComponentFlags::empty()
+        );
+    }
+
+    #[test]
+    fn opaque_fast_scene_target_writes_depth_without_material_metadata() {
+        let attachments = MeshPipelineTarget::SceneOpaqueFast.color_blend_attachments();
+
+        assert!(MeshPipelineTarget::SceneOpaqueFast.uses_depth_test());
+        assert!(MeshPipelineTarget::SceneOpaqueFast.writes_depth());
+        assert_eq!(attachments.len(), 3);
+        assert!(attachments[0].blend_enable == 0);
+        assert_eq!(
             attachments[1].color_write_mask,
             vk::ColorComponentFlags::empty()
         );

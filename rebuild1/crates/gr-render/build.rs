@@ -16,9 +16,14 @@ fn main() {
     for (source, output) in [
         ("shaders/mesh.vert", "mesh.vert.spv"),
         ("shaders/mesh_scene.frag", "mesh_scene.frag.spv"),
+        ("shaders/mesh_scene_fast.frag", "mesh_scene_fast.frag.spv"),
         (
             "shaders/mesh_scene_textured.frag",
             "mesh_scene_textured.frag.spv",
+        ),
+        (
+            "shaders/mesh_scene_textured_fast.frag",
+            "mesh_scene_textured_fast.frag.spv",
         ),
         ("shaders/shadow.vert", "shadow.vert.spv"),
         ("shaders/shadow.frag", "shadow.frag.spv"),

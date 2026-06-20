@@ -19,7 +19,7 @@ use self::assets::GpuAssetStore;
 use self::surface::SurfaceRegistry;
 pub use self::vulkan::{VulkanError, VulkanRendererBackend};
 
-const DEFAULT_SHADOW_MAP_SIZE: u32 = 2048;
+const DEFAULT_SHADOW_MAP_SIZE: u32 = 4096;
 const MIN_SHADOW_MAP_SIZE: u32 = 1024;
 const MAX_SHADOW_MAP_SIZE: u32 = 8192;
 pub(crate) const DEFAULT_DIRECTIONAL_LIGHT_DIR: [f32; 3] = [0.45, -1.0, 0.25];

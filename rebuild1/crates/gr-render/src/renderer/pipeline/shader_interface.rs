@@ -14,6 +14,7 @@ pub(crate) const MATERIAL_OCCLUSION_BINDING: u32 = 4;
 pub(crate) const MATERIAL_EMISSIVE_BINDING: u32 = 5;
 pub(crate) const PASS_SHADOW_CASCADE_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [0, 1, 2, 3];
 pub(crate) const PASS_TRANSLUCENT_SHADOW_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [4, 5, 6, 7];
+pub(crate) const PASS_RAW_SHADOW_CASCADE_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [8, 9, 10, 11];
 const PASS_SHADOW_CASCADE_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
     "shadow_cascade_0",
     "shadow_cascade_1",
@@ -25,6 +26,12 @@ const PASS_TRANSLUCENT_SHADOW_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
     "translucent_shadow_1",
     "translucent_shadow_2",
     "translucent_shadow_3",
+];
+const PASS_RAW_SHADOW_CASCADE_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
+    "raw_shadow_cascade_0",
+    "raw_shadow_cascade_1",
+    "raw_shadow_cascade_2",
+    "raw_shadow_cascade_3",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +87,10 @@ fn mesh_shader_bindings() -> Vec<ShaderBinding> {
         PASS_TRANSLUCENT_SHADOW_BINDINGS,
         PASS_TRANSLUCENT_SHADOW_NAMES,
     ));
+    bindings.extend(pass_shader_bindings(
+        PASS_RAW_SHADOW_CASCADE_BINDINGS,
+        PASS_RAW_SHADOW_CASCADE_NAMES,
+    ));
     bindings
 }
 
@@ -113,9 +124,10 @@ pub(crate) fn validate_mesh_interface() -> Result<(), &'static str> {
     if bindings.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("material texture bindings must be unique");
     }
-    let mut pass_bindings = Vec::with_capacity(SHADOW_CASCADE_COUNT * 2);
+    let mut pass_bindings = Vec::with_capacity(SHADOW_CASCADE_COUNT * 3);
     pass_bindings.extend(PASS_SHADOW_CASCADE_BINDINGS);
     pass_bindings.extend(PASS_TRANSLUCENT_SHADOW_BINDINGS);
+    pass_bindings.extend(PASS_RAW_SHADOW_CASCADE_BINDINGS);
     pass_bindings.sort_unstable();
     if pass_bindings.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("pass shadow bindings must be unique");

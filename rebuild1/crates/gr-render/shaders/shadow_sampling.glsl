@@ -13,14 +13,14 @@
 //
 // This version removes:
 //   - PCSS blocker search
-//   - variable penumbra radius
 //   - Poisson/random rotation
 //   - hard/soft visibility mixing
 //   - weak-shadow threshold hacks
 //
 // It keeps:
 //   - receiver-plane bias
-//   - prefiltered moment map sampling
+//   - prefiltered MSM moment sampling
+//   - raw moment blocker-distance estimation
 //   - 4-moment Hamburger MSM visibility
 //   - translucent shadow support
 //   - cascade blending
@@ -38,6 +38,10 @@ const float SHADOW_MSM_LIGHT_BLEED_REDUCTION = 0.22;
 const float SHADOW_MSM_MOMENT_BIAS = 0.000020;
 
 const float SHADOW_CONTACT_EPSILON = 0.000030;
+const float SHADOW_DISTANCE_GAUSSIAN_START_TEXELS = 1.50;
+const float SHADOW_DISTANCE_GAUSSIAN_FADE_TEXELS = 22.0;
+const float SHADOW_DISTANCE_GAUSSIAN_MAX_RADIUS = 0.95;
+const float SHADOW_BLOCKER_SEARCH_RADIUS = 1.0;
 
 float shadow_rcp_safe(float value, float floor_value) {
     return 1.0 / max(value, floor_value);
@@ -45,6 +49,29 @@ float shadow_rcp_safe(float value, float floor_value) {
 
 float squared(float value) {
     return value * value;
+}
+
+float shadow_texel_depth(float texel_world, float depth_span) {
+    return texel_world * shadow_rcp_safe(depth_span, 0.001);
+}
+
+ivec2 shadow_texel_coord(sampler2D moment_map, vec2 uv) {
+    ivec2 shadow_size = textureSize(moment_map, 0);
+    vec2 clamped_uv = clamp(uv, vec2(0.0), vec2(1.0));
+
+    return clamp(
+        ivec2(clamped_uv * vec2(shadow_size)),
+        ivec2(0),
+        shadow_size - ivec2(1)
+    );
+}
+
+vec4 fetch_shadow_moments(sampler2D moment_map, vec2 uv) {
+    return texelFetch(
+        moment_map,
+        shadow_texel_coord(moment_map, uv),
+        0
+    );
 }
 
 bool shadow_uv_is_inside(vec2 uv) {
@@ -104,8 +131,81 @@ float moment_min_variance(
     float texel_world,
     float depth_span
 ) {
-    float normalized_texel = texel_world * shadow_rcp_safe(depth_span, 0.001);
+    float normalized_texel = shadow_texel_depth(texel_world, depth_span);
     float footprint_variance = squared(normalized_texel * 1.05);
+    float grazing_variance = (1.0 - clamp(ndotl, 0.0, 1.0)) * 0.000012;
+
+    return clamp(
+        SHADOW_MSM_MIN_VARIANCE + footprint_variance + grazing_variance,
+        SHADOW_MSM_MIN_VARIANCE,
+        SHADOW_MSM_MAX_VARIANCE
+    );
+}
+
+float distance_gaussian_radius(
+    float receiver_depth,
+    float caster_depth,
+    float texel_world,
+    float depth_span
+) {
+    float separation = max(receiver_depth - caster_depth, 0.0);
+    float texel_depth = shadow_texel_depth(texel_world, depth_span);
+    float separation_texels =
+        separation *
+        shadow_rcp_safe(texel_depth, SHADOW_CONTACT_EPSILON);
+    float radius = smoothstep(
+        SHADOW_DISTANCE_GAUSSIAN_START_TEXELS,
+        SHADOW_DISTANCE_GAUSSIAN_FADE_TEXELS,
+        separation_texels
+    );
+
+    return radius * SHADOW_DISTANCE_GAUSSIAN_MAX_RADIUS;
+}
+
+float closest_receiver_blocker_depth(
+    sampler2D moment_map,
+    vec2 uv,
+    float compare
+) {
+    ivec2 shadow_size = textureSize(moment_map, 0);
+    vec2 texel = vec2(
+        shadow_rcp_safe(float(shadow_size.x), 1.0),
+        shadow_rcp_safe(float(shadow_size.y), 1.0)
+    );
+    float closest_depth = 0.0;
+    float found = 0.0;
+
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            vec2 sample_uv = uv +
+                vec2(float(x), float(y)) *
+                texel *
+                SHADOW_BLOCKER_SEARCH_RADIUS;
+            float sample_depth = fetch_shadow_moments(moment_map, sample_uv).x;
+            float blocks_receiver = step(
+                sample_depth + SHADOW_CONTACT_EPSILON,
+                compare
+            );
+            closest_depth = max(
+                closest_depth,
+                sample_depth * blocks_receiver
+            );
+            found = max(found, blocks_receiver);
+        }
+    }
+
+    return mix(compare, closest_depth, found);
+}
+
+float moment_min_variance_for_radius(
+    float ndotl,
+    float texel_world,
+    float depth_span,
+    float gaussian_radius
+) {
+    float normalized_texel = shadow_texel_depth(texel_world, depth_span);
+    float footprint_radius = max(1.05, gaussian_radius * 0.85);
+    float footprint_variance = squared(normalized_texel * footprint_radius);
     float grazing_variance = (1.0 - clamp(ndotl, 0.0, 1.0)) * 0.000012;
 
     return clamp(
@@ -131,17 +231,6 @@ vec4 sanitize_shadow_moments(vec4 moments, float min_variance) {
     float m4 = max(moments.w, m2 * m2 + min_variance * min_variance);
 
     return vec4(m1, m2, m3, m4);
-}
-
-vec4 sample_shadow_moments(
-    sampler2D moment_map,
-    vec2 uv,
-    float min_variance
-) {
-    return sanitize_shadow_moments(
-        texture(moment_map, uv),
-        min_variance
-    );
 }
 
 // ---------------------------------------------------------
@@ -299,12 +388,39 @@ float msm_hamburger_visibility(
     );
 }
 
+float raw_shadow_visibility(
+    sampler2D moment_map,
+    vec2 uv,
+    float compare,
+    float min_variance
+) {
+    return msm_hamburger_visibility(
+        fetch_shadow_moments(moment_map, uv),
+        compare,
+        min_variance
+    );
+}
+
+float filtered_shadow_visibility(
+    sampler2D moment_map,
+    vec2 uv,
+    float compare,
+    float min_variance
+) {
+    return msm_hamburger_visibility(
+        texture(moment_map, uv),
+        compare,
+        min_variance
+    );
+}
+
 // ---------------------------------------------------------
 // Opaque shadow
 // ---------------------------------------------------------
 
 float opaque_shadow_factor(
-    sampler2D shadow_map,
+    sampler2D filtered_shadow_map,
+    sampler2D raw_shadow_map,
     vec4 shadow_pos,
     float ndotl,
     float texel_world,
@@ -330,22 +446,29 @@ float opaque_shadow_factor(
 
     float compare = clamp(projected.z - bias, 0.0, 1.0);
 
-    float min_variance = moment_min_variance(
-        ndotl,
+    float blocker_depth = closest_receiver_blocker_depth(
+        raw_shadow_map,
+        uv,
+        compare
+    );
+    float gaussian_radius = distance_gaussian_radius(
+        compare,
+        blocker_depth,
         texel_world,
         depth_span
     );
-
-    vec4 moments = sample_shadow_moments(
-        shadow_map,
-        uv,
-        min_variance
+    float dynamic_min_variance = moment_min_variance_for_radius(
+        ndotl,
+        texel_world,
+        depth_span,
+        gaussian_radius
     );
 
-    return msm_hamburger_visibility(
-        moments,
+    return filtered_shadow_visibility(
+        filtered_shadow_map,
+        uv,
         compare,
-        min_variance
+        dynamic_min_variance
     );
 }
 
@@ -429,16 +552,16 @@ vec3 translucent_shadow_factor(
     float receiver_is_behind_translucent_caster =
         step(center.a + bias, projected.z);
 
+    if (receiver_is_behind_translucent_caster <= 0.0) {
+        return vec3(1.0);
+    }
+
     vec3 transmittance = translucent_shadow_rgb(
         transmittance_map,
         uv
     );
 
-    return mix(
-        vec3(1.0),
-        transmittance,
-        receiver_is_behind_translucent_caster
-    );
+    return transmittance;
 }
 
 vec3 combine_shadow_layers(vec3 opaque, vec3 translucent) {
@@ -463,7 +586,8 @@ vec2 cascade_transition_bounds(float split) {
 }
 
 vec3 cascade_shadow_factor(
-    sampler2D opaque_map,
+    sampler2D filtered_opaque_map,
+    sampler2D raw_opaque_map,
     sampler2D translucent_map,
     vec4 shadow_pos,
     float ndotl,
@@ -473,7 +597,8 @@ vec3 cascade_shadow_factor(
 ) {
     vec3 opaque = vec3(
         opaque_shadow_factor(
-            opaque_map,
+            filtered_opaque_map,
+            raw_opaque_map,
             shadow_pos,
             ndotl,
             texel_world,
@@ -502,6 +627,10 @@ vec3 sample_shadow_cascade(
     sampler2D shadow_cascade_1,
     sampler2D shadow_cascade_2,
     sampler2D shadow_cascade_3,
+    sampler2D raw_shadow_cascade_0,
+    sampler2D raw_shadow_cascade_1,
+    sampler2D raw_shadow_cascade_2,
+    sampler2D raw_shadow_cascade_3,
     sampler2D translucent_shadow_0,
     sampler2D translucent_shadow_1,
     sampler2D translucent_shadow_2,
@@ -515,6 +644,7 @@ vec3 sample_shadow_cascade(
     if (index == 0) {
         return cascade_shadow_factor(
             shadow_cascade_0,
+            raw_shadow_cascade_0,
             translucent_shadow_0,
             shadow_pos[0],
             ndotl,
@@ -527,6 +657,7 @@ vec3 sample_shadow_cascade(
     if (index == 1) {
         return cascade_shadow_factor(
             shadow_cascade_1,
+            raw_shadow_cascade_1,
             translucent_shadow_1,
             shadow_pos[1],
             ndotl,
@@ -539,6 +670,7 @@ vec3 sample_shadow_cascade(
     if (index == 2) {
         return cascade_shadow_factor(
             shadow_cascade_2,
+            raw_shadow_cascade_2,
             translucent_shadow_2,
             shadow_pos[2],
             ndotl,
@@ -550,6 +682,7 @@ vec3 sample_shadow_cascade(
 
     return cascade_shadow_factor(
         shadow_cascade_3,
+        raw_shadow_cascade_3,
         translucent_shadow_3,
         shadow_pos[3],
         ndotl,
@@ -564,6 +697,10 @@ vec3 shadow_factor(
     sampler2D shadow_cascade_1,
     sampler2D shadow_cascade_2,
     sampler2D shadow_cascade_3,
+    sampler2D raw_shadow_cascade_0,
+    sampler2D raw_shadow_cascade_1,
+    sampler2D raw_shadow_cascade_2,
+    sampler2D raw_shadow_cascade_3,
     sampler2D translucent_shadow_0,
     sampler2D translucent_shadow_1,
     sampler2D translucent_shadow_2,
@@ -598,6 +735,10 @@ vec3 shadow_factor(
                 shadow_cascade_1,
                 shadow_cascade_2,
                 shadow_cascade_3,
+                raw_shadow_cascade_0,
+                raw_shadow_cascade_1,
+                raw_shadow_cascade_2,
+                raw_shadow_cascade_3,
                 translucent_shadow_0,
                 translucent_shadow_1,
                 translucent_shadow_2,
@@ -623,6 +764,10 @@ vec3 shadow_factor(
                 shadow_cascade_1,
                 shadow_cascade_2,
                 shadow_cascade_3,
+                raw_shadow_cascade_0,
+                raw_shadow_cascade_1,
+                raw_shadow_cascade_2,
+                raw_shadow_cascade_3,
                 translucent_shadow_0,
                 translucent_shadow_1,
                 translucent_shadow_2,
@@ -640,6 +785,10 @@ vec3 shadow_factor(
                 shadow_cascade_1,
                 shadow_cascade_2,
                 shadow_cascade_3,
+                raw_shadow_cascade_0,
+                raw_shadow_cascade_1,
+                raw_shadow_cascade_2,
+                raw_shadow_cascade_3,
                 translucent_shadow_0,
                 translucent_shadow_1,
                 translucent_shadow_2,
@@ -661,6 +810,10 @@ vec3 shadow_factor(
         shadow_cascade_1,
         shadow_cascade_2,
         shadow_cascade_3,
+        raw_shadow_cascade_0,
+        raw_shadow_cascade_1,
+        raw_shadow_cascade_2,
+        raw_shadow_cascade_3,
         translucent_shadow_0,
         translucent_shadow_1,
         translucent_shadow_2,

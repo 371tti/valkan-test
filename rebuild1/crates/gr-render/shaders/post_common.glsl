@@ -106,10 +106,13 @@ bool post_shadow_softening_enabled() {
     return params.shadow.x > 0.0 && params.shadow.y > 0.0;
 }
 
+bool post_transparent_metadata_enabled() {
+    return params.features.x > 0.5;
+}
+
 bool post_requires_surface_material() {
     return post_ssao_enabled() ||
-        post_ssr_enabled() ||
-        post_shadow_softening_enabled();
+        post_ssr_enabled();
 }
 
 float depth_at_ssr(vec2 uv) {
@@ -148,6 +151,10 @@ float depth_at_ssr(vec2 uv) {
     return mix(stable, center, edge);
 }
 
+float depth_at_ssr_trace(vec2 uv) {
+    return depth_at(uv);
+}
+
 vec3 oct_decode(vec2 encoded) {
     vec2 f = encoded * 2.0 - 1.0;
     vec3 normal = vec3(f, 1.0 - abs(f.x) - abs(f.y));
@@ -165,6 +172,7 @@ struct SurfaceMaterial {
     float roughness;
     float reflectance;
     float occlusion_weight;
+    float transparent_weight;
 };
 
 SurfaceMaterial empty_surface_material(float depth) {
@@ -172,6 +180,7 @@ SurfaceMaterial empty_surface_material(float depth) {
         vec3(0.0, 0.0, 1.0),
         depth,
         1.0,
+        0.0,
         0.0,
         0.0
     );
@@ -187,7 +196,8 @@ SurfaceMaterial opaque_surface_material(vec4 packed, float depth) {
         depth,
         clamp(packed.z, 0.04, 1.0),
         clamp(packed.w, 0.0, 1.0),
-        1.0
+        1.0,
+        0.0
     );
 }
 
@@ -199,7 +209,8 @@ SurfaceMaterial transparent_surface_material(vec4 packed) {
         clamp(packed.w - 1.0, 0.0, POST_BACKGROUND_DEPTH),
         roughness,
         max(0.08, (1.0 - roughness) * 0.28),
-        0.25
+        0.25,
+        1.0
     );
 }
 
@@ -207,8 +218,19 @@ SurfaceMaterial surface_material(vec2 uv) {
     uv = clamp_screen_uv(uv);
 
     float opaque_depth = depth_at(uv);
-    vec4 transparent = texture(scene_transparent_normal_roughness, uv);
 
+    if (!post_transparent_metadata_enabled()) {
+        if (is_background_depth(opaque_depth)) {
+            return empty_surface_material(opaque_depth);
+        }
+
+        return opaque_surface_material(
+            texture(scene_normal_roughness, uv),
+            opaque_depth
+        );
+    }
+
+    vec4 transparent = texture(scene_transparent_normal_roughness, uv);
     bool has_transparent = transparent.w > 1.0;
 
     if (is_background_depth(opaque_depth)) {

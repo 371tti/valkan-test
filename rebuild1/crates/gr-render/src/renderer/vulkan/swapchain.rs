@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use ash::{Device, khr, vk};
 
 use crate::protocol::NonZeroExtent;
@@ -39,9 +41,29 @@ const SCENE_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 // UNORM8 would clamp that to 1.0, so post.frag's `transparent.w > 1.0` test can never work.
 const SCENE_TRANSPARENT_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-const SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
+const DEFAULT_SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
+const FAST_SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const TRANSLUCENT_SHADOW_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const FALLBACK_SHADOW_TRANSMITTANCE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+static SHADOW_MOMENT_FORMAT: OnceLock<vk::Format> = OnceLock::new();
+
+fn shadow_moment_format() -> vk::Format {
+    *SHADOW_MOMENT_FORMAT.get_or_init(|| {
+        let fast_requested = std::env::var("REBUILD1_SHADOW_MOMENT_BITS")
+            .ok()
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "16" | "fp16" | "f16" | "fast")
+            })
+            .unwrap_or(false);
+
+        if fast_requested {
+            FAST_SHADOW_MOMENT_FORMAT
+        } else {
+            DEFAULT_SHADOW_MOMENT_FORMAT
+        }
+    })
+}
 
 pub(super) struct VulkanSwapchain {
     pub(super) handle: vk::SwapchainKHR,
@@ -57,7 +79,9 @@ pub(super) struct VulkanSwapchain {
     scene_render_pass: vk::RenderPass,
     post_render_pass: vk::RenderPass,
     mesh_pipeline: MeshPipelineSet,
+    mesh_fast_pipeline: MeshPipelineSet,
     transparent_mesh_pipeline: MeshPipelineSet,
+    transparent_mesh_fast_pipeline: MeshPipelineSet,
     post_pipeline: PostPipeline,
     scene_framebuffer: vk::Framebuffer,
     post_framebuffers: Vec<vk::Framebuffer>,
@@ -215,7 +239,9 @@ struct SwapchainBuild<'a> {
     scene_render_pass: Option<vk::RenderPass>,
     post_render_pass: Option<vk::RenderPass>,
     mesh_pipeline: Option<MeshPipelineSet>,
+    mesh_fast_pipeline: Option<MeshPipelineSet>,
     transparent_mesh_pipeline: Option<MeshPipelineSet>,
+    transparent_mesh_fast_pipeline: Option<MeshPipelineSet>,
     post_pipeline: Option<PostPipeline>,
     scene_framebuffer: Option<vk::Framebuffer>,
     post_framebuffers: Vec<vk::Framebuffer>,
@@ -248,7 +274,9 @@ impl<'a> SwapchainBuild<'a> {
             scene_render_pass: None,
             post_render_pass: None,
             mesh_pipeline: None,
+            mesh_fast_pipeline: None,
             transparent_mesh_pipeline: None,
+            transparent_mesh_fast_pipeline: None,
             post_pipeline: None,
             scene_framebuffer: None,
             post_framebuffers: Vec::new(),
@@ -281,9 +309,14 @@ impl<'a> SwapchainBuild<'a> {
             scene_render_pass: take_created(&mut self.scene_render_pass, "scene render pass"),
             post_render_pass: take_created(&mut self.post_render_pass, "post render pass"),
             mesh_pipeline: take_created(&mut self.mesh_pipeline, "mesh pipeline"),
+            mesh_fast_pipeline: take_created(&mut self.mesh_fast_pipeline, "fast mesh pipeline"),
             transparent_mesh_pipeline: take_created(
                 &mut self.transparent_mesh_pipeline,
                 "transparent mesh pipeline",
+            ),
+            transparent_mesh_fast_pipeline: take_created(
+                &mut self.transparent_mesh_fast_pipeline,
+                "fast transparent mesh pipeline",
             ),
             post_pipeline: take_created(&mut self.post_pipeline, "post pipeline"),
             scene_framebuffer: take_created(&mut self.scene_framebuffer, "scene framebuffer"),
@@ -314,7 +347,17 @@ impl Drop for SwapchainBuild<'_> {
                 .meshes
                 .destroy_pipeline_set(&self.device.device, pipeline);
         }
+        if let Some(pipeline) = self.mesh_fast_pipeline.take() {
+            self.device
+                .meshes
+                .destroy_pipeline_set(&self.device.device, pipeline);
+        }
         if let Some(pipeline) = self.transparent_mesh_pipeline.take() {
+            self.device
+                .meshes
+                .destroy_pipeline_set(&self.device.device, pipeline);
+        }
+        if let Some(pipeline) = self.transparent_mesh_fast_pipeline.take() {
             self.device
                 .meshes
                 .destroy_pipeline_set(&self.device.device, pipeline);
@@ -465,12 +508,13 @@ impl ShadowSamplerFallback {
         queue: vk::Queue,
         meshes: &VulkanMeshStore,
     ) -> Result<Self, VulkanError> {
+        let moment_format = shadow_moment_format();
         let extent = NonZeroExtent::new(1, 1).expect("fallback shadow extent must be non-zero");
         let moments = create_color_target(
             device,
             memory_properties,
             extent,
-            SHADOW_MOMENT_FORMAT,
+            moment_format,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         )?;
         let transmittance = match create_color_target(
@@ -501,15 +545,19 @@ impl ShadowSamplerFallback {
 
         let shadow_views = [moments.view; SHADOW_CASCADE_COUNT];
         let translucent_views = [transmittance.view; SHADOW_CASCADE_COUNT];
-        let mesh_pass_resources =
-            match meshes.create_pass_resources(device, shadow_views, translucent_views) {
-                Ok(resources) => resources,
-                Err(error) => {
-                    destroy_color_target(device, transmittance);
-                    destroy_color_target(device, moments);
-                    return Err(error);
-                }
-            };
+        let mesh_pass_resources = match meshes.create_pass_resources(
+            device,
+            shadow_views,
+            shadow_views,
+            translucent_views,
+        ) {
+            Ok(resources) => resources,
+            Err(error) => {
+                destroy_color_target(device, transmittance);
+                destroy_color_target(device, moments);
+                return Err(error);
+            }
+        };
 
         tracing::trace!("created tiny Vulkan shadow sampler fallback");
         Ok(ShadowSamplerFallback {
@@ -523,16 +571,14 @@ impl ShadowSamplerFallback {
 impl VulkanDevice {
     /// Creates fixed shadow resources once per logical device instead of per swapchain resize.
     pub(super) fn create_shadow_resources(&self) -> Result<ShadowResources, VulkanError> {
+        let moment_format = shadow_moment_format();
         let mut build = ShadowBuild::new(self);
         build.shadow_render_pass = Some(create_shadow_render_pass(
             &self.device,
-            SHADOW_MOMENT_FORMAT,
+            moment_format,
             DEPTH_FORMAT,
         )?);
-        build.blur_render_pass = Some(create_shadow_blur_render_pass(
-            &self.device,
-            SHADOW_MOMENT_FORMAT,
-        )?);
+        build.blur_render_pass = Some(create_shadow_blur_render_pass(&self.device, moment_format)?);
         build.translucent_render_pass = Some(create_translucent_shadow_render_pass(
             &self.device,
             TRANSLUCENT_SHADOW_FORMAT,
@@ -554,14 +600,14 @@ impl VulkanDevice {
                 &self.device,
                 &self.memory_properties,
                 extent,
-                SHADOW_MOMENT_FORMAT,
+                moment_format,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             )?;
             let blurred_moments = match create_color_target(
                 &self.device,
                 &self.memory_properties,
                 extent,
-                SHADOW_MOMENT_FORMAT,
+                moment_format,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             ) {
                 Ok(target) => target,
@@ -574,7 +620,7 @@ impl VulkanDevice {
                 &self.device,
                 &self.memory_properties,
                 extent,
-                SHADOW_MOMENT_FORMAT,
+                moment_format,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             ) {
                 Ok(target) => target,
@@ -715,10 +761,12 @@ impl VulkanDevice {
         build.mesh_pass_resources = Some(self.meshes.create_pass_resources(
             &self.device,
             filtered_views,
+            raw_views,
             translucent_views,
         )?);
         build.translucent_pass_resources = Some(self.meshes.create_pass_resources(
             &self.device,
+            raw_views,
             raw_views,
             translucent_views,
         )?);
@@ -743,6 +791,7 @@ impl VulkanDevice {
             cascade_1_size = build.cascades[1].extent.width(),
             cascade_2_size = build.cascades[2].extent.width(),
             cascade_3_size = build.cascades[3].extent.width(),
+            moment_format = ?moment_format,
             translucent_format = ?TRANSLUCENT_SHADOW_FORMAT,
             "created fixed Vulkan shadow resources"
         );
@@ -875,9 +924,17 @@ impl VulkanDevice {
             self.meshes
                 .create_scene_pipeline_set(&self.device, scene_render_pass)?,
         );
+        build.mesh_fast_pipeline = Some(
+            self.meshes
+                .create_scene_fast_pipeline_set(&self.device, scene_render_pass)?,
+        );
         build.transparent_mesh_pipeline = Some(
             self.meshes
                 .create_scene_transparent_pipeline_set(&self.device, scene_render_pass)?,
+        );
+        build.transparent_mesh_fast_pipeline = Some(
+            self.meshes
+                .create_scene_transparent_fast_pipeline_set(&self.device, scene_render_pass)?,
         );
         build.post_pipeline = Some(PostPipeline::create(
             &self.device,
@@ -935,7 +992,11 @@ impl VulkanDevice {
         self.meshes
             .destroy_pipeline_set(&self.device, swapchain.mesh_pipeline);
         self.meshes
+            .destroy_pipeline_set(&self.device, swapchain.mesh_fast_pipeline);
+        self.meshes
             .destroy_pipeline_set(&self.device, swapchain.transparent_mesh_pipeline);
+        self.meshes
+            .destroy_pipeline_set(&self.device, swapchain.transparent_mesh_fast_pipeline);
         destroy_render_pass(&self.device, swapchain.post_render_pass);
         destroy_render_pass(&self.device, swapchain.scene_render_pass);
         swapchain.scene.destroy(&self.device);
@@ -1040,9 +1101,19 @@ impl VulkanSwapchain {
         self.mesh_pipeline
     }
 
+    /// Returns the scene mesh pipeline that skips material metadata writes.
+    pub(super) fn mesh_fast_pipeline(&self) -> MeshPipelineSet {
+        self.mesh_fast_pipeline
+    }
+
     /// Returns the mesh graphics pipeline that blends transparent scene materials.
     pub(super) fn transparent_mesh_pipeline(&self) -> MeshPipelineSet {
         self.transparent_mesh_pipeline
+    }
+
+    /// Returns the transparent scene mesh pipeline that skips material metadata writes.
+    pub(super) fn transparent_mesh_fast_pipeline(&self) -> MeshPipelineSet {
+        self.transparent_mesh_fast_pipeline
     }
 
     /// Returns the post pipeline compatible with this swapchain's post pass.
