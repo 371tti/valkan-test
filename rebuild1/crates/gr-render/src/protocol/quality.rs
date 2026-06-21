@@ -4,6 +4,7 @@ pub struct RenderQualitySettings {
     ssr: SsrQualitySettings,
     anti_aliasing: AntiAliasingQualitySettings,
     shadow_softening: ShadowSofteningQualitySettings,
+    contact_shadow: ContactShadowQualitySettings,
     post: PostQualitySettings,
 }
 
@@ -14,6 +15,7 @@ impl RenderQualitySettings {
         ssr: SsrQualitySettings,
         anti_aliasing: AntiAliasingQualitySettings,
         shadow_softening: ShadowSofteningQualitySettings,
+        contact_shadow: ContactShadowQualitySettings,
         post: PostQualitySettings,
     ) -> Self {
         Self {
@@ -21,6 +23,7 @@ impl RenderQualitySettings {
             ssr,
             anti_aliasing,
             shadow_softening,
+            contact_shadow,
             post,
         }
     }
@@ -58,7 +61,32 @@ impl RenderQualitySettings {
         shadow_softening: ShadowSofteningQualitySettings,
         post: PostQualitySettings,
     ) -> Self {
-        Self::from_parts(ssao, ssr, anti_aliasing, shadow_softening, post)
+        Self::from_parts(
+            ssao,
+            ssr,
+            anti_aliasing,
+            shadow_softening,
+            ContactShadowQualitySettings::balanced(),
+            post,
+        )
+    }
+
+    /// Creates a complete renderer quality profile including screen-space contact shadows.
+    pub fn new_with_contact_shadow(
+        ssao: SsaoQualitySettings,
+        ssr: SsrQualitySettings,
+        anti_aliasing: AntiAliasingQualitySettings,
+        contact_shadow: ContactShadowQualitySettings,
+        post: PostQualitySettings,
+    ) -> Self {
+        Self::from_parts(
+            ssao,
+            ssr,
+            anti_aliasing,
+            ShadowSofteningQualitySettings::balanced(),
+            contact_shadow,
+            post,
+        )
     }
 
     /// Returns the lightest profile intended for editing and camera navigation.
@@ -68,6 +96,7 @@ impl RenderQualitySettings {
             SsrQualitySettings::disabled(),
             AntiAliasingQualitySettings::disabled(),
             ShadowSofteningQualitySettings::disabled(),
+            ContactShadowQualitySettings::disabled(),
             PostQualitySettings::natural(),
         )
     }
@@ -79,6 +108,7 @@ impl RenderQualitySettings {
             SsrQualitySettings::interactive(),
             AntiAliasingQualitySettings::interactive(),
             ShadowSofteningQualitySettings::interactive(),
+            ContactShadowQualitySettings::interactive(),
             PostQualitySettings::natural(),
         )
     }
@@ -90,6 +120,7 @@ impl RenderQualitySettings {
             SsrQualitySettings::balanced(),
             AntiAliasingQualitySettings::balanced(),
             ShadowSofteningQualitySettings::balanced(),
+            ContactShadowQualitySettings::balanced(),
             PostQualitySettings::natural(),
         )
     }
@@ -101,6 +132,7 @@ impl RenderQualitySettings {
             SsrQualitySettings::high_quality(),
             AntiAliasingQualitySettings::high_quality(),
             ShadowSofteningQualitySettings::high_quality(),
+            ContactShadowQualitySettings::high_quality(),
             PostQualitySettings::natural(),
         )
     }
@@ -117,6 +149,12 @@ impl RenderQualitySettings {
         shadow_softening: ShadowSofteningQualitySettings,
     ) -> Self {
         self.shadow_softening = shadow_softening;
+        self
+    }
+
+    /// Returns a copy with a different screen-space contact shadow profile.
+    pub fn with_contact_shadow(mut self, contact_shadow: ContactShadowQualitySettings) -> Self {
+        self.contact_shadow = contact_shadow;
         self
     }
 
@@ -138,6 +176,11 @@ impl RenderQualitySettings {
     /// Returns the post-process shadow cleanup applied before tone mapping.
     pub fn shadow_softening(self) -> ShadowSofteningQualitySettings {
         self.shadow_softening
+    }
+
+    /// Returns the screen-space contact shadow quality applied by the post pass.
+    pub fn contact_shadow(self) -> ContactShadowQualitySettings {
+        self.contact_shadow
     }
 
     /// Returns the final look multipliers applied after app-side camera effects.
@@ -220,6 +263,69 @@ impl ShadowSofteningQualitySettings {
     /// Returns the maximum local luma shift applied by the cleanup pass.
     pub fn max_luma_delta(self) -> f32 {
         self.max_luma_delta
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContactShadowQualitySettings {
+    intensity: f32,
+    max_distance: f32,
+    thickness: f32,
+    sample_count: u32,
+}
+
+impl ContactShadowQualitySettings {
+    /// Creates bounded controls for the post-pass screen-space contact shadow ray march.
+    ///
+    /// `max_distance` is measured in view-space world units, `thickness` is the
+    /// accepted depth thickness for a hit, and `sample_count` bounds fullscreen cost.
+    pub fn new(intensity: f32, max_distance: f32, thickness: f32, sample_count: u32) -> Self {
+        Self {
+            intensity: finite_clamp(intensity, 0.0, 1.0, 0.0),
+            max_distance: finite_clamp(max_distance, 0.05, 3.0, 0.85),
+            thickness: finite_clamp(thickness, 0.008, 0.35, 0.070),
+            sample_count: sample_count.clamp(1, 24),
+        }
+    }
+
+    /// Disables contact shadows so the post shader skips the ray march.
+    pub fn disabled() -> Self {
+        Self::new(0.0, 0.30, 0.070, 1)
+    }
+
+    /// Returns a short, low-cost contact shadow profile for camera movement.
+    pub fn interactive() -> Self {
+        Self::new(0.14, 0.32, 0.070, 6)
+    }
+
+    /// Returns the default contact shadow profile for practical scene grounding.
+    pub fn balanced() -> Self {
+        Self::new(0.24, 0.58, 0.060, 14)
+    }
+
+    /// Returns the inspection profile with longer rays and denser sampling.
+    pub fn high_quality() -> Self {
+        Self::new(0.34, 0.92, 0.052, 24)
+    }
+
+    /// Returns the final darkening strength.
+    pub fn intensity(self) -> f32 {
+        self.intensity
+    }
+
+    /// Returns the maximum screen-space shadow ray distance in view-space units.
+    pub fn max_distance(self) -> f32 {
+        self.max_distance
+    }
+
+    /// Returns the accepted view-depth thickness for a contact hit.
+    pub fn thickness(self) -> f32 {
+        self.thickness
+    }
+
+    /// Returns the maximum number of samples evaluated per shaded pixel.
+    pub fn sample_count(self) -> u32 {
+        self.sample_count
     }
 }
 
@@ -459,6 +565,7 @@ mod tests {
         assert!(settings.ssr().max_distance().is_finite());
         assert_eq!(settings.anti_aliasing().blend(), 1.0);
         assert!(settings.shadow_softening().radius_pixels().is_finite());
+        assert!(settings.contact_shadow().max_distance().is_finite());
         assert!(settings.post().contrast().is_finite());
     }
 
@@ -470,6 +577,7 @@ mod tests {
         assert_eq!(settings.ssr().intensity(), 0.0);
         assert_eq!(settings.anti_aliasing().blend(), 0.0);
         assert_eq!(settings.shadow_softening().intensity(), 0.0);
+        assert_eq!(settings.contact_shadow().intensity(), 0.0);
     }
 
     #[test]
@@ -493,22 +601,32 @@ mod tests {
     }
 
     #[test]
-    fn default_visual_profiles_enable_shadow_cleanup() {
+    fn contact_shadow_settings_bound_post_work() {
+        let settings = ContactShadowQualitySettings::new(5.0, f32::INFINITY, -1.0, 128);
+
+        assert_eq!(settings.intensity(), 1.0);
+        assert!(settings.max_distance().is_finite());
+        assert_eq!(settings.thickness(), 0.008);
+        assert_eq!(settings.sample_count(), 24);
+    }
+
+    #[test]
+    fn default_visual_profiles_enable_contact_shadows() {
         assert!(
             RenderQualitySettings::interactive()
-                .shadow_softening()
+                .contact_shadow()
                 .intensity()
                 > 0.0
         );
         assert!(
             RenderQualitySettings::balanced()
-                .shadow_softening()
+                .contact_shadow()
                 .intensity()
                 > 0.0
         );
         assert!(
             RenderQualitySettings::high_quality()
-                .shadow_softening()
+                .contact_shadow()
                 .intensity()
                 > 0.0
         );
@@ -532,5 +650,12 @@ mod tests {
 
         assert!(interactive.anti_aliasing().blend() < balanced.anti_aliasing().blend());
         assert!(balanced.anti_aliasing().blend() < high.anti_aliasing().blend());
+
+        assert!(interactive.contact_shadow().intensity() < balanced.contact_shadow().intensity());
+        assert!(balanced.contact_shadow().intensity() < high.contact_shadow().intensity());
+        assert!(
+            interactive.contact_shadow().sample_count() < balanced.contact_shadow().sample_count()
+        );
+        assert!(balanced.contact_shadow().sample_count() < high.contact_shadow().sample_count());
     }
 }

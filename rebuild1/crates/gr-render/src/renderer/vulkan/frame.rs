@@ -750,6 +750,7 @@ fn required_shadow_resources<'a>(
 fn scene_material_metadata_required(quality: RenderQualitySettings) -> bool {
     quality.ssao().intensity() > 0.0
         || quality.ssr().intensity() > 0.0
+        || quality.contact_shadow().intensity() > 0.0
         || quality.anti_aliasing().blend() > 0.0
 }
 
@@ -1082,6 +1083,7 @@ fn record_post_pass(
             active_camera(snapshot),
             state.quality,
             state.features.has_transparent_scene_items,
+            frame_light_intensity(snapshot),
         );
         device.cmd_end_render_pass(frame.command_buffer);
     }

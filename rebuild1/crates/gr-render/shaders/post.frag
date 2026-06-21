@@ -36,7 +36,7 @@ void main() {
     vec3 color = texture(scene_color, frag_uv).rgb;
 
     if (material_valid) {
-        color = shadow_softened_scene_color(frag_uv, color, material);
+        color = contact_shadowed_scene_color(frag_uv, color, material);
     }
 
     color = high_quality_fxaa_scene_color(
