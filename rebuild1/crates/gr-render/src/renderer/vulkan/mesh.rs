@@ -77,6 +77,24 @@ pub(super) struct MeshPipeline {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct MeshPipelineKey {
+    pub(super) uses_textures: bool,
+    pub(super) double_sided: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct MeshDrawState {
+    pipeline: vk::Pipeline,
+    frame_descriptor_set: vk::DescriptorSet,
+    material_descriptor_set: vk::DescriptorSet,
+    pass_descriptor_set: vk::DescriptorSet,
+    vertex_buffer: vk::Buffer,
+    index_buffer: vk::Buffer,
+    extent: vk::Extent2D,
+    shadow_cascade_index: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct MeshPipelineSet {
     untextured: MeshPipelineVariants,
     textured: MeshPipelineVariants,
@@ -128,35 +146,32 @@ impl ShadowCascadeCull {
 }
 
 impl MeshDrawOptions {
-    /// Creates scene-pass options that allow camera-frustum culling and screen-size LOD.
-    pub(super) fn scene(
+    /// Creates scene-pass options after the caller has already selected the visible LOD.
+    fn scene_preclassified(
         extent: vk::Extent2D,
         camera: CameraSnapshot,
         optimization: RenderOptimizationSettings,
+        forced_lod: Option<MeshLodLevel>,
     ) -> Self {
         Self {
             extent,
             camera: Some(camera),
             optimization,
-            forced_lod: None,
+            forced_lod,
             shadow_cascade_index: None,
             shadow_cull: None,
         }
     }
 
-    /// Creates shadow pass options that reduce distant cascade geometry work.
-    pub(super) fn shadow(
-        extent: vk::Extent2D,
-        cascade_index: usize,
-        shadow_cull: ShadowCascadeCull,
-    ) -> Self {
+    /// Creates shadow options after the caller has already applied cascade culling.
+    pub(super) fn shadow_preculled(extent: vk::Extent2D, cascade_index: usize) -> Self {
         Self {
             extent,
             camera: None,
             optimization: RenderOptimizationSettings::disabled(),
             forced_lod: Some(shadow_lod_for_cascade(cascade_index)),
             shadow_cascade_index: Some(cascade_index as u32),
-            shadow_cull: Some(shadow_cull),
+            shadow_cull: None,
         }
     }
 }
@@ -466,6 +481,50 @@ impl VulkanMeshStore {
         self.meshes.get(&mesh).and_then(|mesh| mesh.bounds)
     }
 
+    /// Builds scene draw options while applying camera culling and LOD before sort/bind work.
+    pub(super) fn scene_draw_options(
+        &self,
+        mesh: MeshHandle,
+        extent: vk::Extent2D,
+        camera: CameraSnapshot,
+        optimization: RenderOptimizationSettings,
+    ) -> Option<MeshDrawOptions> {
+        let forced_lod = match self.meshes.get(&mesh) {
+            Some(mesh) => {
+                let aspect = if extent.height > 0 {
+                    extent.width as f32 / extent.height as f32
+                } else {
+                    1.0
+                };
+                match classify_mesh(camera, aspect, extent.height, mesh.bounds, optimization) {
+                    MeshVisibility::Visible { lod } => Some(lod),
+                    MeshVisibility::Culled { .. } => return None,
+                }
+            }
+            None => None,
+        };
+
+        Some(MeshDrawOptions::scene_preclassified(
+            extent,
+            camera,
+            optimization,
+            forced_lod,
+        ))
+    }
+
+    /// Returns whether an uploaded mesh can affect the selected shadow cascade.
+    ///
+    /// Missing mesh handles stay accepted so `bind_and_draw` can emit the usual diagnostic path.
+    pub(super) fn accepts_shadow_cascade(
+        &self,
+        mesh: MeshHandle,
+        shadow_cull: ShadowCascadeCull,
+    ) -> bool {
+        self.meshes.get(&mesh).map_or(true, |mesh| {
+            shadow_cascade_contains_bounds(mesh.bounds, shadow_cull)
+        })
+    }
+
     /// Binds the mesh pipeline and records one indexed mesh draw if the handle is live.
     ///
     /// The returned boolean is true only when a Vulkan draw command was recorded, so pass-level
@@ -480,6 +539,8 @@ impl VulkanMeshStore {
         frame_slot: usize,
         item: &RenderItemPacket,
         options: MeshDrawOptions,
+        pipeline_key: MeshPipelineKey,
+        state: &mut MeshDrawState,
     ) -> Result<bool, VulkanError> {
         if !item.flags.visible {
             tracing::trace!(
@@ -515,81 +576,102 @@ impl VulkanMeshStore {
                 count: self.frame_descriptor_sets.len(),
             },
         )?;
-        let uses_scene_textures = if options.camera.is_some() {
-            materials.has_any_texture(item.material)
-        } else {
-            materials.has_base_color_texture(item.material)
-        };
-        let pipeline = pipeline_set.choose(
-            uses_scene_textures,
-            materials.is_double_sided(item.material),
-        );
+        let pipeline = pipeline_set.choose(pipeline_key.uses_textures, pipeline_key.double_sided);
+        let pass_descriptor_set = pass_resources
+            .map(MeshPassResources::descriptor_set)
+            .unwrap_or(vk::DescriptorSet::null());
 
-        let viewports = [vk::Viewport::default()
-            .x(0.0)
-            .y(0.0)
-            .width(options.extent.width as f32)
-            .height(options.extent.height as f32)
-            .min_depth(0.0)
-            .max_depth(1.0)];
-        let scissors = [vk::Rect2D::default()
-            .offset(vk::Offset2D { x: 0, y: 0 })
-            .extent(options.extent)];
-        let vertex_buffers = [mesh.vertex_buffer.handle()];
+        let vertex_buffer = mesh.vertex_buffer.handle();
+        let vertex_buffers = [vertex_buffer];
+        let index_buffer = lod.index_buffer.handle();
         let offsets = [0_u64];
 
         // Safety: the command buffer is recording inside a compatible render pass. The pipeline
         // was created for that pass, and mesh buffers are owned by the renderer until frame end.
         unsafe {
-            device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipeline.handle,
-            );
-            device.cmd_set_viewport(command_buffer, 0, &viewports);
-            device.cmd_set_scissor(command_buffer, 0, &scissors);
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                shader_interface::FRAME_SET,
-                &[frame_descriptor_set],
-                &[],
-            );
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                shader_interface::MATERIAL_SET,
-                &[material_descriptor_set],
-                &[],
-            );
-            if let Some(pass_resources) = pass_resources {
+            if state.pipeline != pipeline.handle {
+                device.cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.handle,
+                );
+                state.pipeline = pipeline.handle;
+            }
+            if state.extent != options.extent {
+                let viewports = [vk::Viewport::default()
+                    .x(0.0)
+                    .y(0.0)
+                    .width(options.extent.width as f32)
+                    .height(options.extent.height as f32)
+                    .min_depth(0.0)
+                    .max_depth(1.0)];
+                let scissors = [vk::Rect2D::default()
+                    .offset(vk::Offset2D { x: 0, y: 0 })
+                    .extent(options.extent)];
+                device.cmd_set_viewport(command_buffer, 0, &viewports);
+                device.cmd_set_scissor(command_buffer, 0, &scissors);
+                state.extent = options.extent;
+            }
+            if state.frame_descriptor_set != frame_descriptor_set {
+                device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    shader_interface::FRAME_SET,
+                    &[frame_descriptor_set],
+                    &[],
+                );
+                state.frame_descriptor_set = frame_descriptor_set;
+            }
+            if state.material_descriptor_set != material_descriptor_set {
+                device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    shader_interface::MATERIAL_SET,
+                    &[material_descriptor_set],
+                    &[],
+                );
+                state.material_descriptor_set = material_descriptor_set;
+            }
+            if pass_descriptor_set != vk::DescriptorSet::null()
+                && state.pass_descriptor_set != pass_descriptor_set
+            {
                 device.cmd_bind_descriptor_sets(
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
                     shader_interface::PASS_SET,
-                    &[pass_resources.descriptor_set()],
+                    &[pass_descriptor_set],
                     &[],
                 );
+                state.pass_descriptor_set = pass_descriptor_set;
             }
-            if let Some(cascade_index) = options.shadow_cascade_index {
-                device.cmd_push_constants(
+            if state.shadow_cascade_index != options.shadow_cascade_index {
+                if let Some(cascade_index) = options.shadow_cascade_index {
+                    device.cmd_push_constants(
+                        command_buffer,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        bytes_of_u32(&cascade_index),
+                    );
+                }
+                state.shadow_cascade_index = options.shadow_cascade_index;
+            }
+            if state.vertex_buffer != vertex_buffer {
+                device.cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
+                state.vertex_buffer = vertex_buffer;
+            }
+            if state.index_buffer != index_buffer {
+                device.cmd_bind_index_buffer(
                     command_buffer,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    index_buffer,
                     0,
-                    bytes_of_u32(&cascade_index),
+                    vk::IndexType::UINT32,
                 );
+                state.index_buffer = index_buffer;
             }
-            device.cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
-            device.cmd_bind_index_buffer(
-                command_buffer,
-                lod.index_buffer.handle(),
-                0,
-                vk::IndexType::UINT32,
-            );
             device.cmd_draw_indexed(command_buffer, lod.index_count, 1, 0, 0, 0);
         }
 

@@ -3,12 +3,12 @@ use std::cmp::Ordering;
 use ash::{Device, khr, vk};
 
 use crate::{
-    math::{dot3, sub3},
+    math::{dot3, normalize_or, sub3},
     protocol::{CameraSnapshot, FrameSnapshot, RenderItemPacket, RenderQualitySettings},
     renderer::graph::{
         BarrierLocation, FrameGraphPlan, GraphPass, PassOutput, ResourceBarrier, ResourceState,
-        shadow_blur_h_pass_index, shadow_blur_v_pass_index, shadow_pass_index,
-        translucent_shadow_pass_index,
+        SHADOW_CASCADE_COUNT, shadow_blur_h_pass_index, shadow_blur_v_pass_index,
+        shadow_pass_index, translucent_shadow_pass_index,
     },
 };
 
@@ -17,7 +17,8 @@ use super::{
     material::VulkanMaterialStore,
     mesh::{
         EmissiveLightUniforms, MAX_EMISSIVE_LIGHTS, MAX_LOCAL_SHADOW_CASTERS, MeshDrawOptions,
-        MeshPassResources, MeshPipelineSet, ShadowCascadeCull, VulkanMeshStore,
+        MeshDrawState, MeshPassResources, MeshPipelineKey, MeshPipelineSet, ShadowCascadeCull,
+        VulkanMeshStore,
     },
     readback::{FramebufferReadbackCopy, FramebufferReadbackSample, record_image_to_buffer},
     shadow::{
@@ -537,7 +538,19 @@ fn record_graph_command_buffer(
     // Safety: the command buffer belongs to the current frame slot and is reset before recording.
     unsafe {
         device.begin_command_buffer(frame.command_buffer, &begin_info)?;
-        let mut state = FrameRecordState::new(features, quality);
+        let record_shadow_draws = graph.passes().iter().any(|pass| {
+            shadow_pass_index(pass.name()).is_some()
+                || translucent_shadow_pass_index(pass.name()).is_some()
+        });
+        let mut state = FrameRecordState::new(
+            features,
+            quality,
+            materials,
+            meshes,
+            snapshot,
+            swapchain.extent_2d(),
+            record_shadow_draws,
+        );
         for pass in graph.passes() {
             record_barriers_for_location(
                 device,
@@ -580,19 +593,162 @@ fn record_graph_command_buffer(
 #[derive(Clone, Copy, Default)]
 struct FrameFeatureFlags {
     has_shadow_casters: bool,
+    has_opaque_shadow_casters: bool,
     has_translucent_shadow_casters: bool,
     has_transparent_scene_items: bool,
 }
 
-struct FrameRecordState {
+struct FrameRecordState<'a> {
     features: FrameFeatureFlags,
     quality: RenderQualitySettings,
+    draw_lists: FrameDrawLists<'a>,
 }
 
-impl FrameRecordState {
+impl<'a> FrameRecordState<'a> {
     /// Carries frame-wide feature flags plus stats discovered while recording graph passes.
-    fn new(features: FrameFeatureFlags, quality: RenderQualitySettings) -> Self {
-        Self { features, quality }
+    fn new(
+        features: FrameFeatureFlags,
+        quality: RenderQualitySettings,
+        materials: &VulkanMaterialStore,
+        meshes: &VulkanMeshStore,
+        snapshot: &'a FrameSnapshot,
+        extent: vk::Extent2D,
+        record_shadow_draws: bool,
+    ) -> Self {
+        Self {
+            features,
+            quality,
+            draw_lists: FrameDrawLists::new(
+                materials,
+                meshes,
+                snapshot,
+                extent,
+                features,
+                record_shadow_draws,
+            ),
+        }
+    }
+}
+
+struct SceneDrawItem<'a> {
+    item: &'a RenderItemPacket,
+    options: MeshDrawOptions,
+    pipeline_key: MeshPipelineKey,
+}
+
+struct ShadowDrawItem<'a> {
+    item: &'a RenderItemPacket,
+    pipeline_key: MeshPipelineKey,
+}
+
+struct FrameDrawLists<'a> {
+    opaque_scene: Vec<SceneDrawItem<'a>>,
+    transparent_scene: Vec<SceneDrawItem<'a>>,
+    opaque_shadow: [Vec<ShadowDrawItem<'a>>; SHADOW_CASCADE_COUNT],
+    translucent_shadow: [Vec<ShadowDrawItem<'a>>; SHADOW_CASCADE_COUNT],
+}
+
+impl<'a> FrameDrawLists<'a> {
+    /// Prepares per-frame draw lists once so graph passes do not repeat filter/sort/cull work.
+    fn new(
+        materials: &VulkanMaterialStore,
+        meshes: &VulkanMeshStore,
+        snapshot: &'a FrameSnapshot,
+        extent: vk::Extent2D,
+        features: FrameFeatureFlags,
+        record_shadow_draws: bool,
+    ) -> Self {
+        let camera = active_camera(snapshot);
+        let camera_forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
+        let mut opaque_scene = snapshot
+            .render_items
+            .iter()
+            .filter_map(|item| {
+                if materials.is_transparent(item.material) {
+                    return None;
+                }
+                let options =
+                    meshes.scene_draw_options(item.mesh, extent, camera, snapshot.optimization)?;
+                let pipeline_key = MeshPipelineKey {
+                    uses_textures: materials.has_any_texture(item.material),
+                    double_sided: materials.is_double_sided(item.material),
+                };
+
+                Some((
+                    (
+                        opaque_scene_depth_bucket(meshes, camera, camera_forward, item),
+                        pipeline_key.uses_textures,
+                        pipeline_key.double_sided,
+                        item.material.raw(),
+                        item.mesh.raw(),
+                    ),
+                    SceneDrawItem {
+                        item,
+                        options,
+                        pipeline_key,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        opaque_scene.sort_unstable_by_key(|(key, _)| *key);
+        let opaque_scene = opaque_scene
+            .into_iter()
+            .map(|(_, draw)| draw)
+            .collect::<Vec<_>>();
+        let transparent_scene = snapshot
+            .render_items
+            .iter()
+            .filter_map(|item| {
+                if !materials.is_transparent(item.material) {
+                    return None;
+                }
+                let options =
+                    meshes.scene_draw_options(item.mesh, extent, camera, snapshot.optimization)?;
+                let pipeline_key = MeshPipelineKey {
+                    uses_textures: materials.has_any_texture(item.material),
+                    double_sided: materials.is_double_sided(item.material),
+                };
+                Some(SceneDrawItem {
+                    item,
+                    options,
+                    pipeline_key,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let opaque_shadow = if record_shadow_draws && features.has_opaque_shadow_casters {
+            std::array::from_fn(|cascade_index| {
+                shadow_draw_items(
+                    materials,
+                    meshes,
+                    &snapshot.render_items,
+                    shadow_cascade_cull(camera, cascade_index),
+                    MeshDrawFilter::OpaqueShadowCasters,
+                )
+            })
+        } else {
+            std::array::from_fn(|_| Vec::new())
+        };
+        let translucent_shadow = if record_shadow_draws && features.has_translucent_shadow_casters {
+            std::array::from_fn(|cascade_index| {
+                shadow_draw_items(
+                    materials,
+                    meshes,
+                    &snapshot.render_items,
+                    shadow_cascade_cull(camera, cascade_index),
+                    MeshDrawFilter::TranslucentShadowCasters,
+                )
+            })
+        } else {
+            std::array::from_fn(|_| Vec::new())
+        };
+
+        Self {
+            opaque_scene,
+            transparent_scene,
+            opaque_shadow,
+            translucent_shadow,
+        }
     }
 }
 
@@ -608,13 +764,15 @@ fn frame_feature_flags(
         }
         let casts_shadow = item.flags.casts_shadow;
         let is_transparent = materials.is_transparent(item.material);
+        let casts_opaque_shadow = casts_shadow && materials.casts_opaque_shadow(item.material);
         let casts_translucent_shadow =
             casts_shadow && materials.casts_translucent_shadow(item.material);
         flags.has_transparent_scene_items |= is_transparent;
+        flags.has_opaque_shadow_casters |= casts_opaque_shadow;
         flags.has_translucent_shadow_casters |= casts_translucent_shadow;
-        flags.has_shadow_casters |= casts_translucent_shadow
-            || (casts_shadow && materials.casts_opaque_shadow(item.material));
+        flags.has_shadow_casters |= casts_translucent_shadow || casts_opaque_shadow;
         if flags.has_shadow_casters
+            && flags.has_opaque_shadow_casters
             && flags.has_translucent_shadow_casters
             && flags.has_transparent_scene_items
         {
@@ -636,7 +794,7 @@ fn record_graph_pass(
     meshes: &VulkanMeshStore,
     snapshot: &FrameSnapshot,
     readback: Option<FramebufferReadbackCopy>,
-    state: &mut FrameRecordState,
+    state: &mut FrameRecordState<'_>,
 ) -> Result<(), VulkanError> {
     let name = pass.name();
     if let Some(cascade_index) = shadow_pass_index(name) {
@@ -648,8 +806,7 @@ fn record_graph_pass(
             cascade_index,
             materials,
             meshes,
-            &snapshot.render_items,
-            active_camera(snapshot),
+            state.draw_lists.opaque_shadow[cascade_index].as_slice(),
         );
     }
     if let Some(cascade_index) = shadow_blur_h_pass_index(name) {
@@ -676,8 +833,7 @@ fn record_graph_pass(
             cascade_index,
             materials,
             meshes,
-            &snapshot.render_items,
-            active_camera(snapshot),
+            state.draw_lists.translucent_shadow[cascade_index].as_slice(),
         );
     }
 
@@ -690,7 +846,6 @@ fn record_graph_pass(
             pass,
             materials,
             meshes,
-            snapshot,
             state,
         ),
         "post" => record_post_pass(device, frame, swapchain, snapshot, state),
@@ -812,8 +967,7 @@ fn record_scene_pass(
     pass: &GraphPass,
     materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
-    snapshot: &FrameSnapshot,
-    state: &FrameRecordState,
+    state: &FrameRecordState<'_>,
 ) -> Result<(), VulkanError> {
     let metadata_required = scene_material_metadata_required(state.quality);
     let clear_values = scene_clear_values(pass, metadata_required)?;
@@ -844,9 +998,6 @@ fn record_scene_pass(
             &render_pass_info,
             vk::SubpassContents::INLINE,
         );
-        let camera = active_camera(snapshot);
-        let mesh_options =
-            MeshDrawOptions::scene(swapchain.extent_2d(), camera, snapshot.optimization);
         let opaque_pipeline = if metadata_required {
             swapchain.mesh_pipeline()
         } else {
@@ -859,10 +1010,8 @@ fn record_scene_pass(
         };
         let mut opaque_count = 0_usize;
         let mut transparent_count = 0_usize;
-        for item in &snapshot.render_items {
-            if materials.is_transparent(item.material) {
-                continue;
-            }
+        let mut opaque_draw_state = MeshDrawState::default();
+        for draw in &state.draw_lists.opaque_scene {
             if meshes.bind_and_draw(
                 device,
                 frame.command_buffer,
@@ -870,16 +1019,16 @@ fn record_scene_pass(
                 materials,
                 Some(pass_resources),
                 frame.slot_index,
-                item,
-                mesh_options,
+                draw.item,
+                draw.options,
+                draw.pipeline_key,
+                &mut opaque_draw_state,
             )? {
                 opaque_count += 1;
             }
         }
-        for item in &snapshot.render_items {
-            if !materials.is_transparent(item.material) {
-                continue;
-            }
+        let mut transparent_draw_state = MeshDrawState::default();
+        for draw in &state.draw_lists.transparent_scene {
             if meshes.bind_and_draw(
                 device,
                 frame.command_buffer,
@@ -887,8 +1036,10 @@ fn record_scene_pass(
                 materials,
                 Some(pass_resources),
                 frame.slot_index,
-                item,
-                mesh_options,
+                draw.item,
+                draw.options,
+                draw.pipeline_key,
+                &mut transparent_draw_state,
             )? {
                 transparent_count += 1;
             }
@@ -913,8 +1064,7 @@ fn record_shadow_pass(
     cascade_index: usize,
     materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
-    items: &[RenderItemPacket],
-    camera: CameraSnapshot,
+    items: &[ShadowDrawItem<'_>],
 ) -> Result<(), VulkanError> {
     let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0]), depth_clear_value()];
     let shadow_extent = shadows.extent_2d(cascade_index)?;
@@ -944,8 +1094,6 @@ fn record_shadow_pass(
             items,
             shadow_extent,
             cascade_index,
-            shadow_cascade_cull(camera, cascade_index),
-            MeshDrawFilter::OpaqueShadowCasters,
         )?;
         if caster_count == 0 {
             tracing::trace!(
@@ -1020,8 +1168,7 @@ fn record_translucent_shadow_pass(
     cascade_index: usize,
     materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
-    items: &[RenderItemPacket],
-    camera: CameraSnapshot,
+    items: &[ShadowDrawItem<'_>],
 ) -> Result<(), VulkanError> {
     let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0])];
     let shadow_extent = shadows.extent_2d(cascade_index)?;
@@ -1052,8 +1199,6 @@ fn record_translucent_shadow_pass(
             items,
             shadow_extent,
             cascade_index,
-            shadow_cascade_cull(camera, cascade_index),
-            MeshDrawFilter::TranslucentShadowCasters,
         )?;
         if caster_count == 0 {
             tracing::trace!(
@@ -1146,17 +1291,14 @@ fn record_mesh_draws(
     meshes: &VulkanMeshStore,
     pipeline: MeshPipelineSet,
     pass_resources: Option<&MeshPassResources>,
-    items: &[RenderItemPacket],
+    items: &[ShadowDrawItem<'_>],
     extent: vk::Extent2D,
     cascade_index: usize,
-    shadow_cull: ShadowCascadeCull,
-    filter: MeshDrawFilter,
 ) -> Result<usize, VulkanError> {
     let mut drawn = 0;
-    for item in items {
-        if !shadow_filter_accepts(filter, materials, item) {
-            continue;
-        }
+    let mut draw_state = MeshDrawState::default();
+    let draw_options = MeshDrawOptions::shadow_preculled(extent, cascade_index);
+    for draw in items {
         if meshes.bind_and_draw(
             device,
             frame.command_buffer,
@@ -1164,14 +1306,100 @@ fn record_mesh_draws(
             materials,
             pass_resources,
             frame.slot_index,
-            item,
-            MeshDrawOptions::shadow(extent, cascade_index, shadow_cull),
+            draw.item,
+            draw_options,
+            draw.pipeline_key,
+            &mut draw_state,
         )? {
             drawn += 1;
         }
     }
 
     Ok(drawn)
+}
+
+/// Builds the cascade-local shadow draw list before Vulkan command recording.
+fn shadow_draw_items<'a>(
+    materials: &VulkanMaterialStore,
+    meshes: &VulkanMeshStore,
+    items: &'a [RenderItemPacket],
+    shadow_cull: ShadowCascadeCull,
+    filter: MeshDrawFilter,
+) -> Vec<ShadowDrawItem<'a>> {
+    match filter {
+        MeshDrawFilter::OpaqueShadowCasters => {
+            let mut draw_items = items
+                .iter()
+                .filter_map(|item| {
+                    if !shadow_filter_accepts(filter, materials, item)
+                        || !meshes.accepts_shadow_cascade(item.mesh, shadow_cull)
+                    {
+                        return None;
+                    }
+                    let pipeline_key = MeshPipelineKey {
+                        uses_textures: materials.has_base_color_texture(item.material),
+                        double_sided: materials.is_double_sided(item.material),
+                    };
+
+                    Some((
+                        (
+                            pipeline_key.uses_textures,
+                            pipeline_key.double_sided,
+                            item.material.raw(),
+                            item.mesh.raw(),
+                        ),
+                        ShadowDrawItem { item, pipeline_key },
+                    ))
+                })
+                .collect::<Vec<_>>();
+            draw_items.sort_unstable_by_key(|(key, _)| *key);
+            draw_items.into_iter().map(|(_, draw)| draw).collect()
+        }
+        MeshDrawFilter::TranslucentShadowCasters => items
+            .iter()
+            .filter_map(|item| {
+                if !shadow_filter_accepts(filter, materials, item)
+                    || !meshes.accepts_shadow_cascade(item.mesh, shadow_cull)
+                {
+                    return None;
+                }
+                Some(ShadowDrawItem {
+                    item,
+                    pipeline_key: MeshPipelineKey {
+                        uses_textures: materials.has_base_color_texture(item.material),
+                        double_sided: materials.is_double_sided(item.material),
+                    },
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Returns a coarse front-to-back bucket for opaque scene draws.
+///
+/// The bucket is deliberately coarse so each bucket can still group by pipeline/material. That
+/// keeps early depth rejection useful without throwing away the state-bind wins from sorting.
+fn opaque_scene_depth_bucket(
+    meshes: &VulkanMeshStore,
+    camera: CameraSnapshot,
+    camera_forward: [f32; 3],
+    item: &RenderItemPacket,
+) -> u16 {
+    let Some(bounds) = meshes.bounds_for(item.mesh) else {
+        return u16::MAX;
+    };
+
+    let to_center = sub3(bounds.center(), camera.eye);
+    let near = camera.near.max(0.001);
+    let far = camera.far.max(near + 0.001);
+    let depth = (dot3(to_center, camera_forward) - bounds.radius()).max(near);
+    if !depth.is_finite() {
+        return u16::MAX;
+    }
+
+    let far_log = (far / near).log2().max(1.0);
+    let depth_log = (depth / near).log2().clamp(0.0, far_log);
+    ((depth_log / far_log) * 31.0) as u16
 }
 
 /// Returns whether one render item belongs in the selected shadow caster pass.

@@ -97,9 +97,9 @@ vec3 pbr_direct_unshadowed(
     vec3 f0,
     float metallic,
     float roughness,
-    float spec_boost
+    float spec_boost,
+    float ndotl
 ) {
-    float ndotl = saturate(dot(normal, light));
     if (ndotl <= 0.0001) {
         return vec3(0.0);
     }
@@ -125,7 +125,7 @@ vec3 pbr_direct_unshadowed(
 
 float local_light_visibility(
     vec3 normal,
-    vec3 to_light,
+    vec3 light,
     float light_distance,
     float light_radius
 ) {
@@ -134,7 +134,8 @@ float local_light_visibility(
         return 1.0;
     }
 
-    vec3 ray_dir = to_light * rcp_safe(light_distance, 0.0001);
+    vec3 ray_dir = light;
+    vec3 light_position = frag_world_pos + ray_dir * light_distance;
     vec3 origin = frag_world_pos + normal * max(0.025, light_distance * 0.0008);
     float visibility = 1.0;
 
@@ -146,6 +147,11 @@ float local_light_visibility(
         vec4 caster = frame_camera.local_shadow_caster_center_radius[i];
         float caster_radius = max(caster.w, 0.001);
         float caster_radius_sq = caster_radius * caster_radius;
+        float influence_radius = (light_radius + caster_radius) * 1.15;
+        vec3 light_to_caster = caster.xyz - light_position;
+        if (dot(light_to_caster, light_to_caster) > influence_radius * influence_radius) {
+            continue;
+        }
 
         vec3 receiver_to_caster = caster.xyz - frag_world_pos;
         if (dot(receiver_to_caster, receiver_to_caster) <= caster_radius_sq * 1.08) {
@@ -193,6 +199,9 @@ vec3 emissive_mesh_lighting(
 ) {
     vec3 direct = vec3(0.0);
     int light_count = int(clamp(frame_camera.emissive_light_count.x, 0.0, 4.0));
+    if (light_count <= 0) {
+        return direct;
+    }
 
     for (int i = 0; i < 4; i++) {
         if (i >= light_count) {
@@ -216,9 +225,13 @@ vec3 emissive_mesh_lighting(
         float inv_distance = inversesqrt(max(distance_sq, 0.000001));
         float light_distance = distance_sq * inv_distance;
         vec3 light = to_light * inv_distance;
+        float ndotl = dot(normal, light);
+        if (ndotl <= 0.0001) {
+            continue;
+        }
         float visibility = local_light_visibility(
             normal,
-            to_light,
+            light,
             light_distance,
             radius
         );
@@ -235,7 +248,8 @@ vec3 emissive_mesh_lighting(
             f0,
             metallic,
             roughness,
-            spec_boost
+            spec_boost,
+            ndotl
         );
     }
 

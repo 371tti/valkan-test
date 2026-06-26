@@ -861,7 +861,11 @@ float shadow_lit_contact_support(vec3 shadow) {
     return smoothstep(0.72, 0.96, shadow_max_visibility(shadow));
 }
 
-vec4 compose_shadow_result(vec3 shadow, float contact_visibility) {
+vec4 compose_shadow_result(vec3 shadow, float contact_visibility, bool contact_enabled) {
+    if (!contact_enabled) {
+        return vec4(shadow, 1.0);
+    }
+
     float contact_support = shadow_lit_contact_support(shadow);
 
     return vec4(
@@ -898,6 +902,7 @@ vec4 shadow_factor(
         cascade_splits.z,
         cascade_splits.w
     );
+    bool contact_enabled = contact_shadow.x > 0.0;
 
     for (int index = 0; index < 3; index++) {
         vec2 transition = cascade_transition_bounds(
@@ -926,7 +931,7 @@ vec4 shadow_factor(
                 ndotl
             );
             float contact_visibility = 1.0;
-            if (shadow_lit_contact_support(shadow) > 0.0) {
+            if (contact_enabled && shadow_lit_contact_support(shadow) > 0.0) {
                 contact_visibility = sample_contact_shadow_cascade(
                     index,
                     raw_shadow_cascade_0,
@@ -942,7 +947,7 @@ vec4 shadow_factor(
                 );
             }
 
-            return compose_shadow_result(shadow, contact_visibility);
+            return compose_shadow_result(shadow, contact_visibility, contact_enabled);
         }
 
         if (camera_depth <= transition.y) {
@@ -998,7 +1003,7 @@ vec4 shadow_factor(
             float lower_contact = 1.0;
             float upper_contact = 1.0;
 
-            if (shadow_lit_contact_support(blended_shadow) > 0.0) {
+            if (contact_enabled && shadow_lit_contact_support(blended_shadow) > 0.0) {
                 lower_contact = sample_contact_shadow_cascade(
                     index,
                     raw_shadow_cascade_0,
@@ -1029,7 +1034,8 @@ vec4 shadow_factor(
 
             return compose_shadow_result(
                 blended_shadow,
-                mix(lower_contact, upper_contact, t)
+                mix(lower_contact, upper_contact, t),
+                contact_enabled
             );
         }
     }
@@ -1061,7 +1067,7 @@ vec4 shadow_factor(
         ndotl
     );
     float contact_visibility = 1.0;
-    if (shadow_lit_contact_support(shadow) > 0.0) {
+    if (contact_enabled && shadow_lit_contact_support(shadow) > 0.0) {
         contact_visibility = sample_contact_shadow_cascade(
             3,
             raw_shadow_cascade_0,
@@ -1076,7 +1082,7 @@ vec4 shadow_factor(
             shadow_max_visibility(shadow)
         );
     }
-    vec4 result = compose_shadow_result(shadow, contact_visibility);
+    vec4 result = compose_shadow_result(shadow, contact_visibility, contact_enabled);
 
     if (camera_depth <= final_transition.x) {
         return result;
