@@ -32,9 +32,10 @@ vec3 high_quality_fxaa_scene_color(
     vec2 uv,
     vec3 center,
     SurfaceMaterial center_material,
-    bool center_material_valid
+    bool center_material_valid,
+    bool aa_enabled
 ) {
-    if (!post_aa_enabled()) {
+    if (!aa_enabled) {
         return center;
     }
 

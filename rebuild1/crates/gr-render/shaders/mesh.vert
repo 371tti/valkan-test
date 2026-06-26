@@ -24,6 +24,7 @@ layout(set = 0, binding = 0) uniform FrameCamera {
     vec4 light_dir;
     vec4 light_color;
     vec4 ambient_color;
+    vec4 contact_shadow;
 } frame_camera;
 
 void main() {

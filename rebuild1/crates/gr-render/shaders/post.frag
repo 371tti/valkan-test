@@ -30,25 +30,34 @@ layout(push_constant) uniform PostParams {
 #include "post_ssr.glsl"
 
 void main() {
-    bool material_valid;
-    SurfaceMaterial material = load_feature_surface_material(frag_uv, material_valid);
-
     vec3 color = texture(scene_color, frag_uv).rgb;
+    bool aa_enabled = post_aa_enabled();
+    bool ssao_enabled = post_ssao_enabled();
+    bool ssr_enabled = post_ssr_enabled();
+    bool material_required = ssao_enabled || ssr_enabled;
 
+    if (!aa_enabled && !material_required) {
+        out_color = vec4(apply_camera_effects(color), 1.0);
+        return;
+    }
+
+    bool material_valid = material_required;
+    SurfaceMaterial material = empty_surface_material(POST_BACKGROUND_DEPTH);
     if (material_valid) {
-        color = contact_shadowed_scene_color(frag_uv, color, material);
+        material = surface_material(frag_uv);
     }
 
     color = high_quality_fxaa_scene_color(
         frag_uv,
         color,
         material,
-        material_valid
+        material_valid,
+        aa_enabled
     );
 
     float ao = 1.0;
 
-    if (post_ssao_enabled()) {
+    if (ssao_enabled) {
         ao = screen_space_ao(frag_uv, material);
 
         float ao_strength = clamp(params.ssao.x, 0.0, 1.0) *
@@ -62,7 +71,7 @@ void main() {
         );
     }
 
-    if (post_ssr_enabled()) {
+    if (ssr_enabled) {
         vec4 reflection = screen_space_reflection(frag_uv, material, ao);
         color = apply_screen_space_reflection(color, reflection);
     }

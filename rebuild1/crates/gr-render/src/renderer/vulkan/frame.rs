@@ -1,6 +1,9 @@
+use std::cmp::Ordering;
+
 use ash::{Device, khr, vk};
 
 use crate::{
+    math::{dot3, sub3},
     protocol::{CameraSnapshot, FrameSnapshot, RenderItemPacket, RenderQualitySettings},
     renderer::graph::{
         BarrierLocation, FrameGraphPlan, GraphPass, PassOutput, ResourceBarrier, ResourceState,
@@ -13,7 +16,8 @@ use super::{
     VulkanDevice, VulkanError,
     material::VulkanMaterialStore,
     mesh::{
-        MeshDrawOptions, MeshPassResources, MeshPipelineSet, ShadowCascadeCull, VulkanMeshStore,
+        EmissiveLightUniforms, MAX_EMISSIVE_LIGHTS, MAX_LOCAL_SHADOW_CASTERS, MeshDrawOptions,
+        MeshPassResources, MeshPipelineSet, ShadowCascadeCull, VulkanMeshStore,
     },
     readback::{FramebufferReadbackCopy, FramebufferReadbackSample, record_image_to_buffer},
     shadow::{
@@ -221,6 +225,7 @@ impl VulkanDevice {
     ) -> Result<FramePresentStatus, VulkanError> {
         let features = frame_feature_flags(&self.materials, &snapshot.render_items);
         let camera = active_camera(snapshot);
+        let scene_metadata_required = scene_material_metadata_required(self.quality);
         if features.has_shadow_casters {
             self.ensure_shadow_resources()?;
         }
@@ -265,21 +270,23 @@ impl VulkanDevice {
         let shadows = self.shadows.as_ref();
         let initial_states = swapchain.graph_initial_states(frame.image_index, shadows)?;
         let graph = if refresh_shadows {
-            FrameGraphPlan::standard_frame_with_readback(
+            FrameGraphPlan::standard_frame_with_readback_and_scene_metadata(
                 DEFAULT_CLEAR_COLOR,
                 initial_states,
                 readback.copy.is_some(),
                 features.has_shadow_casters,
                 features.has_translucent_shadow_casters,
+                scene_metadata_required,
             )
         } else {
-            FrameGraphPlan::standard_frame_with_shadow_refresh(
+            FrameGraphPlan::standard_frame_with_shadow_refresh_and_scene_metadata(
                 DEFAULT_CLEAR_COLOR,
                 initial_states,
                 readback.copy.is_some(),
                 features.has_shadow_casters,
                 features.has_translucent_shadow_casters,
                 false,
+                scene_metadata_required,
             )
         }
         .map_err(|error| VulkanError::GraphCompile(error.to_string()))?;
@@ -291,10 +298,12 @@ impl VulkanDevice {
             mesh_frame_uniform_for_frame(
                 camera,
                 frame_light_intensity(snapshot),
+                self.quality,
                 swapchain.extent_2d(),
                 features.has_shadow_casters,
                 features.has_translucent_shadow_casters,
                 shadow_data,
+                emissive_light_uniforms(&self.materials, &self.meshes, snapshot, camera),
             ),
         )?;
         let scene_pass_resources = shadows.map_or_else(
@@ -750,7 +759,6 @@ fn required_shadow_resources<'a>(
 fn scene_material_metadata_required(quality: RenderQualitySettings) -> bool {
     quality.ssao().intensity() > 0.0
         || quality.ssr().intensity() > 0.0
-        || quality.contact_shadow().intensity() > 0.0
         || quality.anti_aliasing().blend() > 0.0
 }
 
@@ -807,13 +815,24 @@ fn record_scene_pass(
     snapshot: &FrameSnapshot,
     state: &FrameRecordState,
 ) -> Result<(), VulkanError> {
-    let clear_values = scene_clear_values(pass)?;
+    let metadata_required = scene_material_metadata_required(state.quality);
+    let clear_values = scene_clear_values(pass, metadata_required)?;
     let render_area = vk::Rect2D::default()
         .offset(vk::Offset2D { x: 0, y: 0 })
         .extent(swapchain.extent_2d());
+    let render_pass = if metadata_required {
+        swapchain.scene_render_pass()
+    } else {
+        swapchain.scene_fast_render_pass()
+    };
+    let framebuffer = if metadata_required {
+        swapchain.scene_framebuffer()
+    } else {
+        swapchain.scene_fast_framebuffer()
+    };
     let render_pass_info = vk::RenderPassBeginInfo::default()
-        .render_pass(swapchain.scene_render_pass())
-        .framebuffer(swapchain.scene_framebuffer())
+        .render_pass(render_pass)
+        .framebuffer(framebuffer)
         .render_area(render_area)
         .clear_values(&clear_values);
 
@@ -828,7 +847,6 @@ fn record_scene_pass(
         let camera = active_camera(snapshot);
         let mesh_options =
             MeshDrawOptions::scene(swapchain.extent_2d(), camera, snapshot.optimization);
-        let metadata_required = scene_material_metadata_required(state.quality);
         let opaque_pipeline = if metadata_required {
             swapchain.mesh_pipeline()
         } else {
@@ -1083,7 +1101,6 @@ fn record_post_pass(
             active_camera(snapshot),
             state.quality,
             state.features.has_transparent_scene_items,
-            frame_light_intensity(snapshot),
         );
         device.cmd_end_render_pass(frame.command_buffer);
     }
@@ -1192,6 +1209,176 @@ fn frame_light_intensity(snapshot: &FrameSnapshot) -> f32 {
         .max(0.0)
 }
 
+#[derive(Clone, Copy)]
+struct EmissiveLightCandidate {
+    score: f32,
+    position_radius: [f32; 4],
+    color: [f32; 4],
+}
+
+#[derive(Clone, Copy)]
+struct LocalShadowCasterCandidate {
+    score: f32,
+    center_radius: [f32; 4],
+}
+
+/// Extracts a small, stable local-light set from emissive mesh materials.
+fn emissive_light_uniforms(
+    materials: &VulkanMaterialStore,
+    meshes: &VulkanMeshStore,
+    snapshot: &FrameSnapshot,
+    camera: CameraSnapshot,
+) -> EmissiveLightUniforms {
+    const MIN_EMISSIVE_BRIGHTNESS: f32 = 0.02;
+    const EMISSIVE_LIGHT_COLOR_SCALE: f32 = 1.35;
+    const EMISSIVE_LIGHT_RADIUS_SCALE: f32 = 4.5;
+    const EMISSIVE_LIGHT_MIN_RADIUS: f32 = 1.5;
+    const EMISSIVE_LIGHT_MAX_RADIUS: f32 = 72.0;
+
+    let mut candidates = Vec::new();
+
+    for item in &snapshot.render_items {
+        if !item.flags.visible {
+            continue;
+        }
+
+        let Some(emissive) = materials.emissive_factor(item.material) else {
+            continue;
+        };
+        let brightness = max3(emissive);
+        if brightness <= MIN_EMISSIVE_BRIGHTNESS {
+            continue;
+        }
+
+        let Some(bounds) = meshes.bounds_for(item.mesh) else {
+            continue;
+        };
+        let center = bounds.center();
+        let source_radius = bounds.radius();
+        let light_radius = (source_radius * (EMISSIVE_LIGHT_RADIUS_SCALE + brightness.sqrt()))
+            .clamp(EMISSIVE_LIGHT_MIN_RADIUS, EMISSIVE_LIGHT_MAX_RADIUS);
+        let camera_delta = sub3(center, camera.eye);
+        let camera_distance_sq = dot3(camera_delta, camera_delta).max(1.0);
+        let score = brightness * light_radius * light_radius / (1.0 + camera_distance_sq * 0.0025);
+
+        candidates.push(EmissiveLightCandidate {
+            score,
+            position_radius: [center[0], center[1], center[2], light_radius],
+            color: [
+                emissive[0] * EMISSIVE_LIGHT_COLOR_SCALE,
+                emissive[1] * EMISSIVE_LIGHT_COLOR_SCALE,
+                emissive[2] * EMISSIVE_LIGHT_COLOR_SCALE,
+                brightness,
+            ],
+        });
+    }
+
+    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+
+    let mut uniforms = EmissiveLightUniforms::disabled();
+    for (index, candidate) in candidates.iter().take(MAX_EMISSIVE_LIGHTS).enumerate() {
+        uniforms.position_radius[index] = candidate.position_radius;
+        uniforms.color[index] = candidate.color;
+    }
+    uniforms.count[0] = candidates.len().min(MAX_EMISSIVE_LIGHTS) as f32;
+    let selected_light_position_radius = uniforms.position_radius;
+    let selected_light_count = uniforms.count[0] as usize;
+    fill_local_shadow_casters(
+        materials,
+        meshes,
+        snapshot,
+        camera,
+        &selected_light_position_radius,
+        selected_light_count,
+        &mut uniforms,
+    );
+
+    uniforms
+}
+
+fn fill_local_shadow_casters(
+    materials: &VulkanMaterialStore,
+    meshes: &VulkanMeshStore,
+    snapshot: &FrameSnapshot,
+    camera: CameraSnapshot,
+    light_position_radius: &[[f32; 4]; MAX_EMISSIVE_LIGHTS],
+    light_count: usize,
+    uniforms: &mut EmissiveLightUniforms,
+) {
+    if light_count == 0 {
+        return;
+    }
+
+    const MIN_OCCLUDER_RADIUS: f32 = 0.08;
+    const EMISSIVE_OCCLUDER_SKIP_BRIGHTNESS: f32 = 0.04;
+    const LOCAL_SHADOW_INFLUENCE_SCALE: f32 = 1.15;
+
+    let mut candidates = Vec::new();
+
+    for item in &snapshot.render_items {
+        if !item.flags.visible
+            || !item.flags.casts_shadow
+            || !materials.casts_opaque_shadow(item.material)
+        {
+            continue;
+        }
+
+        if materials
+            .emissive_factor(item.material)
+            .is_some_and(|emissive| max3(emissive) > EMISSIVE_OCCLUDER_SKIP_BRIGHTNESS)
+        {
+            continue;
+        }
+
+        let Some(bounds) = meshes.bounds_for(item.mesh) else {
+            continue;
+        };
+        let center = bounds.center();
+        let radius = bounds.radius();
+        if radius < MIN_OCCLUDER_RADIUS {
+            continue;
+        }
+
+        let mut light_score = 0.0_f32;
+        for light in light_position_radius.iter().take(light_count) {
+            let light_radius = light[3].max(0.001);
+            let light_to_caster = sub3(center, [light[0], light[1], light[2]]);
+            let distance_sq = dot3(light_to_caster, light_to_caster);
+            let influence_radius = (light_radius + radius) * LOCAL_SHADOW_INFLUENCE_SCALE;
+
+            if distance_sq > influence_radius * influence_radius {
+                continue;
+            }
+
+            light_score = light_score.max((radius * radius) / (distance_sq + radius * radius));
+        }
+
+        if light_score <= 0.0 {
+            continue;
+        }
+
+        let camera_delta = sub3(center, camera.eye);
+        let camera_distance_sq = dot3(camera_delta, camera_delta).max(1.0);
+        let camera_score = (radius * radius) / (camera_distance_sq * 0.015 + radius * radius);
+
+        candidates.push(LocalShadowCasterCandidate {
+            score: light_score * 0.8 + camera_score * 0.2,
+            center_radius: [center[0], center[1], center[2], radius],
+        });
+    }
+
+    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+
+    for (index, candidate) in candidates.iter().take(MAX_LOCAL_SHADOW_CASTERS).enumerate() {
+        uniforms.shadow_caster_center_radius[index] = candidate.center_radius;
+    }
+    uniforms.shadow_caster_count[0] = candidates.len().min(MAX_LOCAL_SHADOW_CASTERS) as f32;
+}
+
+fn max3(value: [f32; 3]) -> f32 {
+    value[0].max(value[1]).max(value[2])
+}
+
 /// Traces a compiled graph plan without exposing Vulkan objects through the graph API.
 fn trace_compiled_graph(label: &'static str, graph: &FrameGraphPlan) {
     if !tracing::enabled!(tracing::Level::TRACE) {
@@ -1259,22 +1446,29 @@ fn trace_compiled_graph(label: &'static str, graph: &FrameGraphPlan) {
 }
 
 /// Converts scene graph outputs into clear values matching the scene framebuffer attachments.
-fn scene_clear_values(pass: &GraphPass) -> Result<[vk::ClearValue; 4], VulkanError> {
-    Ok([
-        color_clear_value(clear_color_for_output(
-            pass,
-            crate::renderer::graph::GraphResource::SceneColor,
-        )?),
-        color_clear_value(clear_color_for_output(
+fn scene_clear_values(
+    pass: &GraphPass,
+    metadata_required: bool,
+) -> Result<Vec<vk::ClearValue>, VulkanError> {
+    let mut clear_values = vec![color_clear_value(clear_color_for_output(
+        pass,
+        crate::renderer::graph::GraphResource::SceneColor,
+    )?)];
+
+    if metadata_required {
+        clear_values.push(color_clear_value(clear_color_for_output(
             pass,
             crate::renderer::graph::GraphResource::SceneNormalRoughness,
-        )?),
-        color_clear_value(clear_color_for_output(
+        )?));
+        clear_values.push(color_clear_value(clear_color_for_output(
             pass,
             crate::renderer::graph::GraphResource::SceneTransparentNormalRoughness,
-        )?),
-        depth_clear_value(),
-    ])
+        )?));
+    }
+
+    clear_values.push(depth_clear_value());
+
+    Ok(clear_values)
 }
 
 /// Returns the clear color declared for one scene output resource.

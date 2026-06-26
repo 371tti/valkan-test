@@ -2,7 +2,7 @@
 #define REBUILD1_POST_SSAO_GLSL
 
 float screen_space_ao(vec2 uv, SurfaceMaterial material) {
-    if (surface_material_is_background(material) || !post_ssao_enabled()) {
+    if (surface_material_is_background(material)) {
         return 1.0;
     }
 
@@ -58,15 +58,20 @@ float screen_space_ao(vec2 uv, SurfaceMaterial material) {
             continue;
         }
 
-        vec3 sample_position = view_position(sample_uv, sample_depth);
-        vec3 delta = sample_position - position;
+        float sample_z = linear_depth(sample_depth);
+        vec2 sample_ndc = sample_uv * 2.0 - 1.0;
+        vec3 delta = vec3(
+            sample_ndc.x * sample_z * params.camera.z - position.x,
+            sample_ndc.y * sample_z * params.camera.w - position.y,
+            view_z - sample_z
+        );
         float distance_sq = dot(delta, delta);
 
         if (distance_sq <= 0.00000001) {
             continue;
         }
 
-        float closer = step(position.z + bias, sample_position.z);
+        float closer = step(sample_z + bias, view_z);
         float range = 1.0 - smoothstep(inner_radius_sq, radius_sq, distance_sq);
         float facing = saturate(dot(material.normal, delta) * inversesqrt(distance_sq));
 

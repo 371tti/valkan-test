@@ -730,6 +730,7 @@ impl FrameGraphInitialStates {
 
 impl FrameGraphPlan {
     /// Builds the executable frame graph, optionally exposing the final image for readback.
+    #[cfg(test)]
     pub(crate) fn standard_frame_with_readback(
         clear_color: [f32; 4],
         initial: FrameGraphInitialStates,
@@ -737,7 +738,7 @@ impl FrameGraphPlan {
         shadow_casters: bool,
         translucent_shadows: bool,
     ) -> Result<Self, GraphCompileError> {
-        Self::standard_frame_with_shadow_refresh(
+        Self::standard_frame_with_readback_and_scene_metadata(
             clear_color,
             initial,
             framebuffer_readback,
@@ -747,7 +748,28 @@ impl FrameGraphPlan {
         )
     }
 
+    /// Builds the executable frame graph while selecting whether scene metadata is written.
+    pub(crate) fn standard_frame_with_readback_and_scene_metadata(
+        clear_color: [f32; 4],
+        initial: FrameGraphInitialStates,
+        framebuffer_readback: bool,
+        shadow_casters: bool,
+        translucent_shadows: bool,
+        scene_metadata: bool,
+    ) -> Result<Self, GraphCompileError> {
+        Self::standard_frame_with_shadow_refresh_and_scene_metadata(
+            clear_color,
+            initial,
+            framebuffer_readback,
+            shadow_casters,
+            translucent_shadows,
+            true,
+            scene_metadata,
+        )
+    }
+
     /// Builds the executable frame graph while optionally reusing cached shadow maps.
+    #[cfg(test)]
     pub(crate) fn standard_frame_with_shadow_refresh(
         clear_color: [f32; 4],
         initial: FrameGraphInitialStates,
@@ -755,6 +777,27 @@ impl FrameGraphPlan {
         shadow_casters: bool,
         translucent_shadows: bool,
         refresh_shadows: bool,
+    ) -> Result<Self, GraphCompileError> {
+        Self::standard_frame_with_shadow_refresh_and_scene_metadata(
+            clear_color,
+            initial,
+            framebuffer_readback,
+            shadow_casters,
+            translucent_shadows,
+            refresh_shadows,
+            true,
+        )
+    }
+
+    /// Builds the executable frame graph while optionally reusing cached shadow maps.
+    pub(crate) fn standard_frame_with_shadow_refresh_and_scene_metadata(
+        clear_color: [f32; 4],
+        initial: FrameGraphInitialStates,
+        framebuffer_readback: bool,
+        shadow_casters: bool,
+        translucent_shadows: bool,
+        refresh_shadows: bool,
+        scene_metadata: bool,
     ) -> Result<Self, GraphCompileError> {
         let mut builder = FrameGraphBuilder::new();
         if shadow_casters {
@@ -900,43 +943,43 @@ impl FrameGraphPlan {
                 }
             }
         }
-        builder = builder
-            .pass(
-                scene_pass
-                    .write(PassOutput::color_clear(
-                        GraphResource::SceneColor,
-                        clear_color,
-                    ))
-                    .write(PassOutput::color_clear(
-                        GraphResource::SceneNormalRoughness,
-                        [0.5, 0.5, 1.0, 0.0],
-                    ))
-                    .write(PassOutput::color_clear(
-                        GraphResource::SceneTransparentNormalRoughness,
-                        [0.0, 0.0, 0.0, 0.0],
-                    ))
-                    .write(PassOutput::depth_clear_store(GraphResource::SceneDepth)),
-            )
-            .pass(
-                GraphPass::new(POST_PASS)
-                    .read(PassInput::read(
-                        GraphResource::SceneColor,
-                        ResourceState::ShaderRead,
-                    ))
-                    .read(PassInput::read(
-                        GraphResource::SceneNormalRoughness,
-                        ResourceState::ShaderRead,
-                    ))
-                    .read(PassInput::read(
-                        GraphResource::SceneTransparentNormalRoughness,
-                        ResourceState::ShaderRead,
-                    ))
-                    .read(PassInput::read(
-                        GraphResource::SceneDepth,
-                        ResourceState::ShaderRead,
-                    ))
-                    .write(PassOutput::color_load(GraphResource::SwapchainImage)),
-            );
+        scene_pass = scene_pass.write(PassOutput::color_clear(
+            GraphResource::SceneColor,
+            clear_color,
+        ));
+        if scene_metadata {
+            scene_pass = scene_pass
+                .write(PassOutput::color_clear(
+                    GraphResource::SceneNormalRoughness,
+                    [0.5, 0.5, 1.0, 0.0],
+                ))
+                .write(PassOutput::color_clear(
+                    GraphResource::SceneTransparentNormalRoughness,
+                    [0.0, 0.0, 0.0, 0.0],
+                ));
+        }
+        scene_pass = scene_pass.write(PassOutput::depth_clear_store(GraphResource::SceneDepth));
+
+        builder = builder.pass(scene_pass).pass(
+            GraphPass::new(POST_PASS)
+                .read(PassInput::read(
+                    GraphResource::SceneColor,
+                    ResourceState::ShaderRead,
+                ))
+                .read(PassInput::read(
+                    GraphResource::SceneNormalRoughness,
+                    ResourceState::ShaderRead,
+                ))
+                .read(PassInput::read(
+                    GraphResource::SceneTransparentNormalRoughness,
+                    ResourceState::ShaderRead,
+                ))
+                .read(PassInput::read(
+                    GraphResource::SceneDepth,
+                    ResourceState::ShaderRead,
+                ))
+                .write(PassOutput::color_load(GraphResource::SwapchainImage)),
+        );
 
         if framebuffer_readback {
             builder = builder.pass(
@@ -1490,6 +1533,57 @@ mod tests {
         assert_eq!(graph.resource_count(), 21);
         assert!(graph.transition_count() >= 10);
         assert!(graph.barrier_count() >= 6);
+    }
+
+    #[test]
+    fn standard_frame_graph_can_skip_scene_metadata_writes() {
+        let graph = FrameGraphPlan::standard_frame_with_readback_and_scene_metadata(
+            [0.0, 0.1, 0.2, 1.0],
+            FrameGraphInitialStates::new(
+                ResourceState::Undefined,
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+            ),
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect("graph should compile");
+        let scene = graph
+            .passes()
+            .iter()
+            .find(|pass| pass.name() == SCENE_PASS)
+            .expect("scene pass should exist");
+        let post = graph
+            .passes()
+            .iter()
+            .find(|pass| pass.name() == POST_PASS)
+            .expect("post pass should exist");
+
+        assert!(
+            !scene
+                .writes()
+                .iter()
+                .any(|output| output.resource() == GraphResource::SceneNormalRoughness)
+        );
+        assert!(
+            !scene
+                .writes()
+                .iter()
+                .any(|output| output.resource() == GraphResource::SceneTransparentNormalRoughness)
+        );
+        assert!(
+            post.reads()
+                .iter()
+                .any(|input| input.resource() == GraphResource::SceneNormalRoughness)
+        );
     }
 
     // Verifies that persistent resource states affect the next frame's barrier plan.

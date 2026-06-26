@@ -153,6 +153,13 @@ impl VulkanMaterialStore {
             .is_some_and(VulkanMaterial::has_any_texture)
     }
 
+    /// Returns the imported emissive RGB factor for CPU-side emissive light extraction.
+    pub(super) fn emissive_factor(&self, material: MaterialHandle) -> Option<[f32; 3]> {
+        self.materials
+            .get(&material)
+            .map(VulkanMaterial::emissive_factor)
+    }
+
     /// Returns whether a material asks the mesh pipeline to disable back-face culling.
     pub(super) fn is_double_sided(&self, material: MaterialHandle) -> bool {
         self.materials
@@ -273,6 +280,7 @@ struct VulkanMaterial {
     descriptor_set: vk::DescriptorSet,
     texture_flags: MaterialTextureFlags,
     alpha_mode: MaterialAlphaMode,
+    emissive_factor: [f32; 3],
     double_sided: bool,
 }
 
@@ -311,6 +319,7 @@ impl VulkanMaterial {
             descriptor_set,
             texture_flags,
             alpha_mode: descriptor.alpha_mode(),
+            emissive_factor: descriptor.emissive_factor(),
             double_sided: descriptor.double_sided(),
         })
     }
@@ -333,6 +342,11 @@ impl VulkanMaterial {
     /// Returns the alpha mode imported for this material.
     fn alpha_mode(&self) -> MaterialAlphaMode {
         self.alpha_mode
+    }
+
+    /// Returns the imported emissive RGB factor.
+    fn emissive_factor(&self) -> [f32; 3] {
+        self.emissive_factor
     }
 
     /// Returns whether this material requires a no-cull mesh pipeline variant.

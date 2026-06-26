@@ -2,7 +2,9 @@ use ash::vk;
 
 use crate::{
     math::{add3, cross3, dot3, identity_mat4, mul3, normalize_or, sub3},
-    protocol::{CameraSnapshot, RenderItemPacket},
+    protocol::{
+        CameraSnapshot, ContactShadowQualitySettings, RenderItemPacket, RenderQualitySettings,
+    },
     renderer::{
         DEFAULT_AMBIENT_COLOR, DEFAULT_DIRECTIONAL_LIGHT_COLOR, DEFAULT_DIRECTIONAL_LIGHT_DIR,
         DEFAULT_SHADOW_CASCADE_METRICS, DEFAULT_SHADOW_CASCADE_SPLITS, graph::SHADOW_CASCADE_COUNT,
@@ -10,13 +12,14 @@ use crate::{
     },
 };
 
-use super::mesh::{MeshFrameUniform, ShadowCascadeCull};
+use super::mesh::{EmissiveLightUniforms, MeshFrameUniform, ShadowCascadeCull};
 
 const SHADOW_SPLIT_LAMBDA: f32 = 0.78;
 const SHADOW_SPLIT_NEAR_FLOOR: f32 = 1.0;
 const SHADOW_RADIUS_PADDING: f32 = 1.08;
 const SHADOW_MIN_RADIUS: f32 = 4.0;
 const SHADOW_DEPTH_PADDING: f32 = 24.0;
+const SHADOW_CASTER_DEPTH_RESERVE_MAX: f32 = 640.0;
 const SHADOW_SIGNATURE_POSITION_STEP: f32 = 0.0001;
 const SHADOW_SIGNATURE_DIRECTION_STEP: f32 = 0.00001;
 const SHADOW_SIGNATURE_FOV_STEP: f32 = 0.00001;
@@ -95,10 +98,12 @@ pub(super) fn shadow_cascade_cull(
 pub(super) fn mesh_frame_uniform_for_frame(
     camera: CameraSnapshot,
     light_intensity: f32,
+    quality: RenderQualitySettings,
     extent: vk::Extent2D,
     has_shadow_casters: bool,
     has_translucent_shadow_casters: bool,
     shadow_data: Option<ShadowFrameData>,
+    emissive_lights: EmissiveLightUniforms,
 ) -> MeshFrameUniform {
     let aspect = if extent.height > 0 {
         extent.width as f32 / extent.height as f32
@@ -133,7 +138,36 @@ pub(super) fn mesh_frame_uniform_for_frame(
             },
         ],
         ambient_color: DEFAULT_AMBIENT_COLOR,
+        contact_shadow: contact_shadow_params(
+            quality.contact_shadow(),
+            has_shadow_casters,
+            light_intensity,
+        ),
+        emissive_light_position_radius: emissive_lights.position_radius,
+        emissive_light_color: emissive_lights.color,
+        emissive_light_count: emissive_lights.count,
+        local_shadow_caster_center_radius: emissive_lights.shadow_caster_center_radius,
+        local_shadow_caster_count: emissive_lights.shadow_caster_count,
     }
+}
+
+fn contact_shadow_params(
+    settings: ContactShadowQualitySettings,
+    has_shadow_casters: bool,
+    light_intensity: f32,
+) -> [f32; 4] {
+    let intensity = if has_shadow_casters {
+        settings.intensity() * light_intensity.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    [
+        intensity,
+        settings.max_distance(),
+        settings.thickness(),
+        settings.sample_count() as f32,
+    ]
 }
 
 /// Returns the camera-local shadow distance so scene scale does not dilute cascade texels.
@@ -187,9 +221,11 @@ fn shadow_view_projection(
     let (center, radius) = bounding_sphere(&frustum);
     let shadow_resolution = shadow_cascade_resolution(cascade_index);
     let radius = (radius * SHADOW_RADIUS_PADDING).max(SHADOW_MIN_RADIUS);
-    let view = stable_light_view(light_dir, center, radius);
+    let caster_depth_reserve =
+        shadow_caster_depth_reserve(radius, cascade_near, cascade_far, cascade_index);
+    let view = stable_light_view(light_dir, center, radius, caster_depth_reserve);
 
-    let (near, far) = shadow_depth_range(&view, radius, &frustum, center);
+    let (near, far) = shadow_depth_range(&view, radius, &frustum, center, caster_depth_reserve);
     let texel_world = radius * 2.0 / shadow_resolution;
     let depth_span = (far - near).max(1.0);
 
@@ -200,6 +236,7 @@ fn shadow_view_projection(
         radius,
         texel_world,
         shadow_resolution,
+        caster_depth_reserve,
         near,
         far,
         "built camera-cascade shadow projection"
@@ -318,6 +355,24 @@ fn shadow_cascade_resolution(cascade_index: usize) -> f32 {
     shadow_cascade_size(cascade_index) as f32
 }
 
+fn shadow_caster_depth_reserve(
+    shadow_radius: f32,
+    cascade_near: f32,
+    cascade_far: f32,
+    cascade_index: usize,
+) -> f32 {
+    let cascade_depth = (cascade_far - cascade_near).max(1.0);
+    let reserve = shadow_radius * 2.5 + cascade_depth * 0.75;
+    let minimum = match cascade_index {
+        0 => 96.0,
+        1 => 128.0,
+        2 => 192.0,
+        _ => 256.0,
+    };
+
+    reserve.max(minimum).min(SHADOW_CASTER_DEPTH_RESERVE_MAX)
+}
+
 fn camera_frustum_corners(
     camera: CameraSnapshot,
     aspect: f32,
@@ -361,9 +416,17 @@ fn bounding_sphere(points: &[[f32; 3]]) -> ([f32; 3], f32) {
     (center, radius)
 }
 
-fn stable_light_view(light_dir: [f32; 3], center: [f32; 3], radius: f32) -> [f32; 16] {
+fn stable_light_view(
+    light_dir: [f32; 3],
+    center: [f32; 3],
+    radius: f32,
+    caster_depth_reserve: f32,
+) -> [f32; 16] {
     let light_dir = normalize_or(light_dir, [0.0, -1.0, 0.0]);
-    let eye = sub3(center, mul3(light_dir, radius * 3.0 + 16.0));
+    let eye = sub3(
+        center,
+        mul3(light_dir, radius * 3.0 + 16.0 + caster_depth_reserve),
+    );
     let up = if dot3(light_dir, [0.0, 1.0, 0.0]).abs() > 0.92 {
         [0.0, 0.0, 1.0]
     } else {
@@ -378,6 +441,7 @@ fn shadow_depth_range(
     shadow_radius: f32,
     receiver_points: &[[f32; 3]],
     focus_center: [f32; 3],
+    caster_depth_reserve: f32,
 ) -> (f32, f32) {
     let mut min_depth = f32::INFINITY;
     let mut max_depth = f32::NEG_INFINITY;
@@ -397,9 +461,11 @@ fn shadow_depth_range(
         return (0.1, (shadow_radius * 4.0).max(16.0));
     }
 
-    let margin = (shadow_radius * 0.08).clamp(1.0, SHADOW_DEPTH_PADDING);
-    let near = (min_depth - margin).max(0.05);
-    let far = (max_depth + margin).max(near + 8.0);
+    let receiver_margin = (shadow_radius * 0.08).clamp(1.0, SHADOW_DEPTH_PADDING);
+    let near_margin = receiver_margin + caster_depth_reserve;
+    let far_margin = receiver_margin + caster_depth_reserve * 0.25;
+    let near = (min_depth - near_margin).max(0.05);
+    let far = (max_depth + far_margin).max(near + 8.0);
     (near, far)
 }
 
@@ -504,6 +570,57 @@ mod tests {
     }
 
     #[test]
+    fn contact_shadow_uniform_requires_light_and_shadow_casters() {
+        let extent = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let quality = RenderQualitySettings::balanced();
+
+        let without_casters = mesh_frame_uniform_for_frame(
+            camera(),
+            1.0,
+            quality,
+            extent,
+            false,
+            false,
+            None,
+            EmissiveLightUniforms::disabled(),
+        );
+        let without_light = mesh_frame_uniform_for_frame(
+            camera(),
+            0.0,
+            quality,
+            extent,
+            true,
+            false,
+            None,
+            EmissiveLightUniforms::disabled(),
+        );
+        let enabled = mesh_frame_uniform_for_frame(
+            camera(),
+            1.0,
+            quality,
+            extent,
+            true,
+            false,
+            None,
+            EmissiveLightUniforms::disabled(),
+        );
+
+        assert_eq!(without_casters.contact_shadow[0], 0.0);
+        assert_eq!(without_light.contact_shadow[0], 0.0);
+        assert_eq!(
+            enabled.contact_shadow[0],
+            quality.contact_shadow().intensity()
+        );
+        assert_eq!(
+            enabled.contact_shadow[1],
+            quality.contact_shadow().max_distance()
+        );
+    }
+
+    #[test]
     fn shadow_cascade_splits_keep_near_density_without_following_scene_scale() {
         let splits = shadow_cascade_splits(camera());
 
@@ -527,6 +644,16 @@ mod tests {
         assert!(near.texel_world < far.texel_world);
         assert!(near.depth_span > 0.0);
         assert!(far.depth_span > 0.0);
+    }
+
+    #[test]
+    fn shadow_projection_reserves_depth_for_large_casters() {
+        let near_reserve = shadow_caster_depth_reserve(12.0, 0.1, 20.0, 0);
+        let far_reserve = shadow_caster_depth_reserve(80.0, 111.0, 320.0, 3);
+
+        assert!(near_reserve >= 96.0);
+        assert!(far_reserve >= 256.0);
+        assert!(far_reserve > near_reserve);
     }
 
     #[test]

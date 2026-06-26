@@ -40,7 +40,7 @@ const float SHADOW_MSM_MOMENT_BIAS = 0.000020;
 const float SHADOW_CONTACT_EPSILON = 0.000030;
 const float SHADOW_DISTANCE_GAUSSIAN_START_TEXELS = 1.50;
 const float SHADOW_DISTANCE_GAUSSIAN_FADE_TEXELS = 22.0;
-const float SHADOW_DISTANCE_GAUSSIAN_MAX_RADIUS = 0.95;
+const float SHADOW_DISTANCE_GAUSSIAN_MAX_RADIUS = 6.50;
 const float SHADOW_BLOCKER_SEARCH_RADIUS = 1.0;
 
 float shadow_rcp_safe(float value, float floor_value) {
@@ -175,23 +175,29 @@ float closest_receiver_blocker_depth(
     float closest_depth = 0.0;
     float found = 0.0;
 
-    for (int y = -1; y <= 1; y++) {
-        for (int x = -1; x <= 1; x++) {
-            vec2 sample_uv = uv +
-                vec2(float(x), float(y)) *
-                texel *
-                SHADOW_BLOCKER_SEARCH_RADIUS;
-            float sample_depth = fetch_shadow_moments(moment_map, sample_uv).x;
-            float blocks_receiver = step(
-                sample_depth + SHADOW_CONTACT_EPSILON,
-                compare
-            );
-            closest_depth = max(
-                closest_depth,
-                sample_depth * blocks_receiver
-            );
-            found = max(found, blocks_receiver);
-        }
+    const vec2 OFFSETS[5] = vec2[5](
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(-1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, -1.0)
+    );
+
+    for (int i = 0; i < 5; i++) {
+        vec2 sample_uv = uv +
+            OFFSETS[i] *
+            texel *
+            SHADOW_BLOCKER_SEARCH_RADIUS;
+        float sample_depth = fetch_shadow_moments(moment_map, sample_uv).x;
+        float blocks_receiver = step(
+            sample_depth + SHADOW_CONTACT_EPSILON,
+            compare
+        );
+        closest_depth = max(
+            closest_depth,
+            sample_depth * blocks_receiver
+        );
+        found = max(found, blocks_receiver);
     }
 
     return mix(compare, closest_depth, found);
@@ -204,7 +210,7 @@ float moment_min_variance_for_radius(
     float gaussian_radius
 ) {
     float normalized_texel = shadow_texel_depth(texel_world, depth_span);
-    float footprint_radius = max(1.05, gaussian_radius * 0.85);
+    float footprint_radius = 1.05 + gaussian_radius;
     float footprint_variance = squared(normalized_texel * footprint_radius);
     float grazing_variance = (1.0 - clamp(ndotl, 0.0, 1.0)) * 0.000012;
 
@@ -411,6 +417,101 @@ float filtered_shadow_visibility(
         texture(moment_map, uv),
         compare,
         min_variance
+    );
+}
+
+float contact_shadow_visibility(
+    sampler2D raw_shadow_map,
+    vec4 shadow_pos,
+    float ndotl,
+    float texel_world,
+    float depth_span,
+    vec4 contact_shadow,
+    float filtered_visibility
+) {
+    float intensity = clamp(contact_shadow.x, 0.0, 1.0);
+
+    if (intensity <= 0.0) {
+        return 1.0;
+    }
+
+    if (shadow_pos.w <= 0.0 || ndotl <= 0.16) {
+        return 1.0;
+    }
+
+    vec3 projected;
+    vec2 uv = shadow_uv(shadow_pos, projected);
+
+    if (!shadow_projection_is_valid(projected, uv)) {
+        return 1.0;
+    }
+
+    float bias = receiver_plane_shadow_bias(
+        ndotl,
+        projected,
+        texel_world,
+        depth_span
+    );
+    float compare = clamp(projected.z - bias, 0.0, 1.0);
+    float quality = clamp((contact_shadow.w - 1.0) * 0.04347826, 0.0, 1.0);
+    float compare_slope = max(abs(dFdx(compare)), abs(dFdy(compare)));
+    float texel_world_floor = max(texel_world * 0.35, 0.0005);
+    float thickness = max(contact_shadow.z, texel_world_floor * 0.12);
+    float max_distance = max(
+        contact_shadow.y,
+        thickness + texel_world_floor * 1.5
+    );
+    float slope_world = compare_slope * max(depth_span, 0.001);
+    float min_separation = max(
+        thickness * 0.06,
+        texel_world_floor * 0.04 + slope_world * 0.18
+    );
+    float contact_ramp = max(
+        thickness * 0.40,
+        texel_world_floor * 0.70
+    );
+
+    vec4 center_moments = texture(raw_shadow_map, uv);
+    float separation =
+        (compare - center_moments.x) *
+        max(depth_span, 0.001);
+
+    if (separation <= min_separation || separation >= max_distance) {
+        return 1.0;
+    }
+
+    float visibility_gate = smoothstep(0.04, 0.35, filtered_visibility);
+    float near_fade = smoothstep(
+        min_separation,
+        min_separation + contact_ramp,
+        separation
+    );
+    float slope_stability =
+        1.0 - smoothstep(
+            thickness,
+            max(max_distance * 0.55, thickness + texel_world_floor),
+            slope_world
+        );
+    float light_facing = smoothstep(0.22, 0.60, ndotl);
+    float distance_fade = 1.0 - smoothstep(
+        thickness,
+        max_distance,
+        separation
+    );
+    float contact =
+        near_fade *
+        distance_fade *
+        slope_stability *
+        light_facing *
+        visibility_gate;
+    float darkening = contact *
+        intensity *
+        mix(0.72, 1.08, quality);
+
+    return clamp(
+        1.0 - darkening,
+        max(1.0 - intensity * 0.82, 0.0),
+        1.0
     );
 }
 
@@ -692,7 +793,84 @@ vec3 sample_shadow_cascade(
     );
 }
 
-vec3 shadow_factor(
+float sample_contact_shadow_cascade(
+    int index,
+    sampler2D raw_shadow_cascade_0,
+    sampler2D raw_shadow_cascade_1,
+    sampler2D raw_shadow_cascade_2,
+    sampler2D raw_shadow_cascade_3,
+    vec4 shadow_pos[4],
+    vec4 cascade_texel_world,
+    vec4 cascade_depth_span,
+    vec4 contact_shadow,
+    float ndotl,
+    float filtered_visibility
+) {
+    if (index == 0) {
+        return contact_shadow_visibility(
+            raw_shadow_cascade_0,
+            shadow_pos[0],
+            ndotl,
+            cascade_texel_world.x,
+            cascade_depth_span.x,
+            contact_shadow,
+            filtered_visibility
+        );
+    }
+
+    if (index == 1) {
+        return contact_shadow_visibility(
+            raw_shadow_cascade_1,
+            shadow_pos[1],
+            ndotl,
+            cascade_texel_world.y,
+            cascade_depth_span.y,
+            contact_shadow,
+            filtered_visibility
+        );
+    }
+
+    if (index == 2) {
+        return contact_shadow_visibility(
+            raw_shadow_cascade_2,
+            shadow_pos[2],
+            ndotl,
+            cascade_texel_world.z,
+            cascade_depth_span.z,
+            contact_shadow,
+            filtered_visibility
+        );
+    }
+
+    return contact_shadow_visibility(
+        raw_shadow_cascade_3,
+        shadow_pos[3],
+        ndotl,
+        cascade_texel_world.w,
+        cascade_depth_span.w,
+        contact_shadow,
+        filtered_visibility
+    );
+}
+
+float shadow_max_visibility(vec3 shadow) {
+    return max(max(shadow.r, shadow.g), shadow.b);
+}
+
+float shadow_lit_contact_support(vec3 shadow) {
+    return smoothstep(0.72, 0.96, shadow_max_visibility(shadow));
+}
+
+vec4 compose_shadow_result(vec3 shadow, float contact_visibility) {
+    float contact_support = shadow_lit_contact_support(shadow);
+
+    return vec4(
+        shadow,
+        mix(1.0, contact_visibility, contact_support)
+    );
+}
+
+vec4 shadow_factor(
     sampler2D shadow_cascade_0,
     sampler2D shadow_cascade_1,
     sampler2D shadow_cascade_2,
@@ -706,10 +884,11 @@ vec3 shadow_factor(
     sampler2D translucent_shadow_2,
     sampler2D translucent_shadow_3,
     vec4 shadow_pos[4],
-    float camera_distance_sq,
+    float camera_depth,
     vec4 cascade_splits,
     vec4 cascade_texel_world,
     vec4 cascade_depth_span,
+    vec4 contact_shadow,
     float translucent_enabled,
     float ndotl
 ) {
@@ -725,11 +904,8 @@ vec3 shadow_factor(
             split_depths[index]
         );
 
-        float transition_min_sq = squared(transition.x);
-        float transition_max_sq = squared(transition.y);
-
-        if (camera_distance_sq < transition_min_sq) {
-            return sample_shadow_cascade(
+        if (camera_depth < transition.x) {
+            vec3 shadow = sample_shadow_cascade(
                 index,
                 shadow_cascade_0,
                 shadow_cascade_1,
@@ -749,13 +925,31 @@ vec3 shadow_factor(
                 translucent_enabled,
                 ndotl
             );
+            float contact_visibility = 1.0;
+            if (shadow_lit_contact_support(shadow) > 0.0) {
+                contact_visibility = sample_contact_shadow_cascade(
+                    index,
+                    raw_shadow_cascade_0,
+                    raw_shadow_cascade_1,
+                    raw_shadow_cascade_2,
+                    raw_shadow_cascade_3,
+                    shadow_pos,
+                    cascade_texel_world,
+                    cascade_depth_span,
+                    contact_shadow,
+                    ndotl,
+                    shadow_max_visibility(shadow)
+                );
+            }
+
+            return compose_shadow_result(shadow, contact_visibility);
         }
 
-        if (camera_distance_sq <= transition_max_sq) {
+        if (camera_depth <= transition.y) {
             float t = smoothstep(
-                transition_min_sq,
-                transition_max_sq,
-                camera_distance_sq
+                transition.x,
+                transition.y,
+                camera_depth
             );
 
             vec3 lower = sample_shadow_cascade(
@@ -800,11 +994,53 @@ vec3 shadow_factor(
                 ndotl
             );
 
-            return mix(lower, upper, t);
+            vec3 blended_shadow = mix(lower, upper, t);
+            float lower_contact = 1.0;
+            float upper_contact = 1.0;
+
+            if (shadow_lit_contact_support(blended_shadow) > 0.0) {
+                lower_contact = sample_contact_shadow_cascade(
+                    index,
+                    raw_shadow_cascade_0,
+                    raw_shadow_cascade_1,
+                    raw_shadow_cascade_2,
+                    raw_shadow_cascade_3,
+                    shadow_pos,
+                    cascade_texel_world,
+                    cascade_depth_span,
+                    contact_shadow,
+                    ndotl,
+                    shadow_max_visibility(lower)
+                );
+                upper_contact = sample_contact_shadow_cascade(
+                    index + 1,
+                    raw_shadow_cascade_0,
+                    raw_shadow_cascade_1,
+                    raw_shadow_cascade_2,
+                    raw_shadow_cascade_3,
+                    shadow_pos,
+                    cascade_texel_world,
+                    cascade_depth_span,
+                    contact_shadow,
+                    ndotl,
+                    shadow_max_visibility(upper)
+                );
+            }
+
+            return compose_shadow_result(
+                blended_shadow,
+                mix(lower_contact, upper_contact, t)
+            );
         }
     }
 
-    return sample_shadow_cascade(
+    vec2 final_transition = cascade_transition_bounds(split_depths[3]);
+
+    if (camera_depth > final_transition.y) {
+        return vec4(1.0);
+    }
+
+    vec3 shadow = sample_shadow_cascade(
         3,
         shadow_cascade_0,
         shadow_cascade_1,
@@ -824,6 +1060,35 @@ vec3 shadow_factor(
         translucent_enabled,
         ndotl
     );
+    float contact_visibility = 1.0;
+    if (shadow_lit_contact_support(shadow) > 0.0) {
+        contact_visibility = sample_contact_shadow_cascade(
+            3,
+            raw_shadow_cascade_0,
+            raw_shadow_cascade_1,
+            raw_shadow_cascade_2,
+            raw_shadow_cascade_3,
+            shadow_pos,
+            cascade_texel_world,
+            cascade_depth_span,
+            contact_shadow,
+            ndotl,
+            shadow_max_visibility(shadow)
+        );
+    }
+    vec4 result = compose_shadow_result(shadow, contact_visibility);
+
+    if (camera_depth <= final_transition.x) {
+        return result;
+    }
+
+    float final_t = smoothstep(
+        final_transition.x,
+        final_transition.y,
+        camera_depth
+    );
+
+    return mix(result, vec4(1.0), final_t);
 }
 
 #endif

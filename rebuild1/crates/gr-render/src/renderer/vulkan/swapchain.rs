@@ -10,10 +10,11 @@ use super::{
     post::PostPipeline,
     shadow_blur::ShadowMomentBlurPipeline,
     swapchain_pass::{
-        create_post_framebuffer, create_post_render_pass, create_scene_framebuffer,
-        create_scene_render_pass, create_shadow_blur_render_pass, create_shadow_framebuffer,
-        create_shadow_render_pass, create_translucent_shadow_framebuffer,
-        create_translucent_shadow_render_pass, destroy_framebuffer, destroy_render_pass,
+        create_post_framebuffer, create_post_render_pass, create_scene_fast_framebuffer,
+        create_scene_fast_render_pass, create_scene_framebuffer, create_scene_render_pass,
+        create_shadow_blur_render_pass, create_shadow_framebuffer, create_shadow_render_pass,
+        create_translucent_shadow_framebuffer, create_translucent_shadow_render_pass,
+        destroy_framebuffer, destroy_render_pass,
     },
     swapchain_target::{
         ColorTarget, DepthTarget, create_color_target, create_depth_target, destroy_color_target,
@@ -77,6 +78,7 @@ pub(super) struct VulkanSwapchain {
     image_states: Vec<ResourceState>,
     scene: SceneTargets,
     scene_render_pass: vk::RenderPass,
+    scene_fast_render_pass: vk::RenderPass,
     post_render_pass: vk::RenderPass,
     mesh_pipeline: MeshPipelineSet,
     mesh_fast_pipeline: MeshPipelineSet,
@@ -84,6 +86,7 @@ pub(super) struct VulkanSwapchain {
     transparent_mesh_fast_pipeline: MeshPipelineSet,
     post_pipeline: PostPipeline,
     scene_framebuffer: vk::Framebuffer,
+    scene_fast_framebuffer: vk::Framebuffer,
     post_framebuffers: Vec<vk::Framebuffer>,
 }
 
@@ -237,6 +240,7 @@ struct SwapchainBuild<'a> {
     scene_transparent_normal_roughness: Option<ColorTarget>,
     scene_depth: Option<DepthTarget>,
     scene_render_pass: Option<vk::RenderPass>,
+    scene_fast_render_pass: Option<vk::RenderPass>,
     post_render_pass: Option<vk::RenderPass>,
     mesh_pipeline: Option<MeshPipelineSet>,
     mesh_fast_pipeline: Option<MeshPipelineSet>,
@@ -244,6 +248,7 @@ struct SwapchainBuild<'a> {
     transparent_mesh_fast_pipeline: Option<MeshPipelineSet>,
     post_pipeline: Option<PostPipeline>,
     scene_framebuffer: Option<vk::Framebuffer>,
+    scene_fast_framebuffer: Option<vk::Framebuffer>,
     post_framebuffers: Vec<vk::Framebuffer>,
     finished: bool,
 }
@@ -272,6 +277,7 @@ impl<'a> SwapchainBuild<'a> {
             scene_transparent_normal_roughness: None,
             scene_depth: None,
             scene_render_pass: None,
+            scene_fast_render_pass: None,
             post_render_pass: None,
             mesh_pipeline: None,
             mesh_fast_pipeline: None,
@@ -279,6 +285,7 @@ impl<'a> SwapchainBuild<'a> {
             transparent_mesh_fast_pipeline: None,
             post_pipeline: None,
             scene_framebuffer: None,
+            scene_fast_framebuffer: None,
             post_framebuffers: Vec::new(),
             finished: false,
         }
@@ -307,6 +314,10 @@ impl<'a> SwapchainBuild<'a> {
                 take_created(&mut self.scene_depth, "scene depth"),
             ),
             scene_render_pass: take_created(&mut self.scene_render_pass, "scene render pass"),
+            scene_fast_render_pass: take_created(
+                &mut self.scene_fast_render_pass,
+                "fast scene render pass",
+            ),
             post_render_pass: take_created(&mut self.post_render_pass, "post render pass"),
             mesh_pipeline: take_created(&mut self.mesh_pipeline, "mesh pipeline"),
             mesh_fast_pipeline: take_created(&mut self.mesh_fast_pipeline, "fast mesh pipeline"),
@@ -320,6 +331,10 @@ impl<'a> SwapchainBuild<'a> {
             ),
             post_pipeline: take_created(&mut self.post_pipeline, "post pipeline"),
             scene_framebuffer: take_created(&mut self.scene_framebuffer, "scene framebuffer"),
+            scene_fast_framebuffer: take_created(
+                &mut self.scene_fast_framebuffer,
+                "fast scene framebuffer",
+            ),
             post_framebuffers: std::mem::take(&mut self.post_framebuffers),
         };
         self.finished = true;
@@ -336,6 +351,9 @@ impl Drop for SwapchainBuild<'_> {
 
         self.device
             .destroy_framebuffers(std::mem::take(&mut self.post_framebuffers));
+        if let Some(framebuffer) = self.scene_fast_framebuffer.take() {
+            destroy_framebuffer(&self.device.device, framebuffer);
+        }
         if let Some(framebuffer) = self.scene_framebuffer.take() {
             destroy_framebuffer(&self.device.device, framebuffer);
         }
@@ -362,9 +380,13 @@ impl Drop for SwapchainBuild<'_> {
                 .meshes
                 .destroy_pipeline_set(&self.device.device, pipeline);
         }
-        for render_pass in [self.post_render_pass.take(), self.scene_render_pass.take()]
-            .into_iter()
-            .flatten()
+        for render_pass in [
+            self.post_render_pass.take(),
+            self.scene_fast_render_pass.take(),
+            self.scene_render_pass.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             destroy_render_pass(&self.device.device, render_pass);
         }
@@ -911,11 +933,19 @@ impl VulkanDevice {
             scene_transparent_normal_roughness.format,
             scene_depth.format,
         )?);
+        build.scene_fast_render_pass = Some(create_scene_fast_render_pass(
+            &self.device,
+            scene_color.format,
+            scene_depth.format,
+        )?);
         build.post_render_pass = Some(create_post_render_pass(&self.device, config.format)?);
 
         let scene_render_pass = build
             .scene_render_pass
             .expect("scene render pass was just created");
+        let scene_fast_render_pass = build
+            .scene_fast_render_pass
+            .expect("fast scene render pass was just created");
         let post_render_pass = build
             .post_render_pass
             .expect("post render pass was just created");
@@ -926,7 +956,7 @@ impl VulkanDevice {
         );
         build.mesh_fast_pipeline = Some(
             self.meshes
-                .create_scene_fast_pipeline_set(&self.device, scene_render_pass)?,
+                .create_scene_fast_pipeline_set(&self.device, scene_fast_render_pass)?,
         );
         build.transparent_mesh_pipeline = Some(
             self.meshes
@@ -934,7 +964,7 @@ impl VulkanDevice {
         );
         build.transparent_mesh_fast_pipeline = Some(
             self.meshes
-                .create_scene_transparent_fast_pipeline_set(&self.device, scene_render_pass)?,
+                .create_scene_transparent_fast_pipeline_set(&self.device, scene_fast_render_pass)?,
         );
         build.post_pipeline = Some(PostPipeline::create(
             &self.device,
@@ -954,6 +984,13 @@ impl VulkanDevice {
             scene_depth.view,
             config.extent,
         )?);
+        build.scene_fast_framebuffer = Some(create_scene_fast_framebuffer(
+            &self.device,
+            scene_fast_render_pass,
+            scene_color.view,
+            scene_depth.view,
+            config.extent,
+        )?);
         build.post_framebuffers =
             self.create_post_framebuffers(post_render_pass, &build.image_views, config.extent)?;
 
@@ -962,7 +999,7 @@ impl VulkanDevice {
             height = config.extent.height(),
             image_count = build.images.len(),
             image_view_count = build.image_views.len(),
-            framebuffer_count = build.post_framebuffers.len() + 1,
+            framebuffer_count = build.post_framebuffers.len() + 2,
             format = ?config.format,
             present_mode = ?config.present_mode,
             transfer_src_supported = config.transfer_src_supported,
@@ -979,7 +1016,7 @@ impl VulkanDevice {
             height = swapchain.extent.height(),
             image_count = swapchain.images.len(),
             image_view_count = swapchain.image_views.len(),
-            framebuffer_count = swapchain.post_framebuffers.len() + 1,
+            framebuffer_count = swapchain.post_framebuffers.len() + 2,
             format = ?swapchain.format,
             color_space = ?swapchain.color_space,
             present_mode = ?swapchain.present_mode,
@@ -987,6 +1024,7 @@ impl VulkanDevice {
         );
 
         self.destroy_framebuffers(swapchain.post_framebuffers);
+        destroy_framebuffer(&self.device, swapchain.scene_fast_framebuffer);
         destroy_framebuffer(&self.device, swapchain.scene_framebuffer);
         swapchain.post_pipeline.destroy(&self.device);
         self.meshes
@@ -998,6 +1036,7 @@ impl VulkanDevice {
         self.meshes
             .destroy_pipeline_set(&self.device, swapchain.transparent_mesh_fast_pipeline);
         destroy_render_pass(&self.device, swapchain.post_render_pass);
+        destroy_render_pass(&self.device, swapchain.scene_fast_render_pass);
         destroy_render_pass(&self.device, swapchain.scene_render_pass);
         swapchain.scene.destroy(&self.device);
         self.destroy_image_views(swapchain.image_views);
@@ -1091,6 +1130,11 @@ impl VulkanSwapchain {
         self.scene_render_pass
     }
 
+    /// Returns the lightweight scene render pass that omits material metadata attachments.
+    pub(super) fn scene_fast_render_pass(&self) -> vk::RenderPass {
+        self.scene_fast_render_pass
+    }
+
     /// Returns the post render pass that writes the acquired swapchain image.
     pub(super) fn post_render_pass(&self) -> vk::RenderPass {
         self.post_render_pass
@@ -1146,6 +1190,11 @@ impl VulkanSwapchain {
     /// Returns the framebuffer used by the graph scene pass.
     pub(super) fn scene_framebuffer(&self) -> vk::Framebuffer {
         self.scene_framebuffer
+    }
+
+    /// Returns the lightweight scene framebuffer used without material metadata.
+    pub(super) fn scene_fast_framebuffer(&self) -> vk::Framebuffer {
+        self.scene_fast_framebuffer
     }
 
     /// Returns the post framebuffer that corresponds to one acquired swapchain image.

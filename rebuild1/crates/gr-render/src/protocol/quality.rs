@@ -71,7 +71,7 @@ impl RenderQualitySettings {
         )
     }
 
-    /// Creates a complete renderer quality profile including screen-space contact shadows.
+    /// Creates a complete renderer quality profile including contact shadows.
     pub fn new_with_contact_shadow(
         ssao: SsaoQualitySettings,
         ssr: SsrQualitySettings,
@@ -275,10 +275,10 @@ pub struct ContactShadowQualitySettings {
 }
 
 impl ContactShadowQualitySettings {
-    /// Creates bounded controls for the post-pass screen-space contact shadow ray march.
+    /// Creates bounded controls for the shadow-map contact shadow evaluator.
     ///
-    /// `max_distance` is measured in view-space world units, `thickness` is the
-    /// accepted depth thickness for a hit, and `sample_count` bounds fullscreen cost.
+    /// `max_distance` and `thickness` are measured in light-space world units.
+    /// `sample_count` is retained as a bounded quality tier for profile compatibility.
     pub fn new(intensity: f32, max_distance: f32, thickness: f32, sample_count: u32) -> Self {
         Self {
             intensity: finite_clamp(intensity, 0.0, 1.0, 0.0),
@@ -288,24 +288,24 @@ impl ContactShadowQualitySettings {
         }
     }
 
-    /// Disables contact shadows so the post shader skips the ray march.
+    /// Disables contact shadows.
     pub fn disabled() -> Self {
         Self::new(0.0, 0.30, 0.070, 1)
     }
 
     /// Returns a short, low-cost contact shadow profile for camera movement.
     pub fn interactive() -> Self {
-        Self::new(0.14, 0.32, 0.070, 6)
+        Self::new(0.58, 0.45, 0.070, 6)
     }
 
     /// Returns the default contact shadow profile for practical scene grounding.
     pub fn balanced() -> Self {
-        Self::new(0.24, 0.58, 0.060, 14)
+        Self::new(0.82, 0.85, 0.058, 14)
     }
 
-    /// Returns the inspection profile with longer rays and denser sampling.
+    /// Returns the inspection profile with longer reach and stronger contact response.
     pub fn high_quality() -> Self {
-        Self::new(0.34, 0.92, 0.052, 24)
+        Self::new(0.95, 1.20, 0.052, 24)
     }
 
     /// Returns the final darkening strength.
@@ -313,17 +313,17 @@ impl ContactShadowQualitySettings {
         self.intensity
     }
 
-    /// Returns the maximum screen-space shadow ray distance in view-space units.
+    /// Returns the maximum contact range in light-space world units.
     pub fn max_distance(self) -> f32 {
         self.max_distance
     }
 
-    /// Returns the accepted view-depth thickness for a contact hit.
+    /// Returns the accepted light-depth thickness for a contact hit.
     pub fn thickness(self) -> f32 {
         self.thickness
     }
 
-    /// Returns the maximum number of samples evaluated per shaded pixel.
+    /// Returns the bounded quality tier used by the contact evaluator.
     pub fn sample_count(self) -> u32 {
         self.sample_count
     }
@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn contact_shadow_settings_bound_post_work() {
+    fn contact_shadow_settings_bound_shadow_work() {
         let settings = ContactShadowQualitySettings::new(5.0, f32::INFINITY, -1.0, 128);
 
         assert_eq!(settings.intensity(), 1.0);

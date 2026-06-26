@@ -58,6 +58,8 @@ const SHADOW_TRANSLUCENT_TEXTURED_FRAGMENT_SHADER: &[u8] = include_bytes!(concat
 const MESH_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
 const SHADOW_DEPTH_BIAS_CONSTANT: f32 = 0.35;
 const SHADOW_DEPTH_BIAS_SLOPE: f32 = 0.65;
+pub(super) const MAX_EMISSIVE_LIGHTS: usize = 4;
+pub(super) const MAX_LOCAL_SHADOW_CASTERS: usize = 8;
 
 pub(super) struct VulkanMeshStore {
     meshes: BTreeMap<MeshHandle, VulkanMesh>,
@@ -457,6 +459,11 @@ impl VulkanMeshStore {
                 })?;
 
         write_buffer_value(device, buffer, &value)
+    }
+
+    /// Returns uploaded mesh bounds used by CPU-side emissive-light extraction.
+    pub(super) fn bounds_for(&self, mesh: MeshHandle) -> Option<SceneBounds> {
+        self.meshes.get(&mesh).and_then(|mesh| mesh.bounds)
     }
 
     /// Binds the mesh pipeline and records one indexed mesh draw if the handle is live.
@@ -882,6 +889,10 @@ fn shadow_cascade_contains_bounds(
     let to_center = sub3(bounds.center(), shadow_cull.camera.eye);
     let depth = dot3(to_center, forward);
     let radius = bounds.radius();
+    let range = (shadow_cull.max_depth - shadow_cull.min_depth).max(1.0);
+    if radius >= range * 0.75 {
+        return true;
+    }
     let padding = shadow_cascade_depth_padding(shadow_cull, radius);
     let min_depth = shadow_cull.min_depth - radius - padding;
     let max_depth = shadow_cull.max_depth + radius + padding;
@@ -947,6 +958,34 @@ pub(super) struct MeshFrameUniform {
     pub(super) light_dir: [f32; 4],
     pub(super) light_color: [f32; 4],
     pub(super) ambient_color: [f32; 4],
+    pub(super) contact_shadow: [f32; 4],
+    pub(super) emissive_light_position_radius: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
+    pub(super) emissive_light_color: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
+    pub(super) emissive_light_count: [f32; 4],
+    pub(super) local_shadow_caster_center_radius: [[f32; 4]; MAX_LOCAL_SHADOW_CASTERS],
+    pub(super) local_shadow_caster_count: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct EmissiveLightUniforms {
+    pub(super) position_radius: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
+    pub(super) color: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
+    pub(super) count: [f32; 4],
+    pub(super) shadow_caster_center_radius: [[f32; 4]; MAX_LOCAL_SHADOW_CASTERS],
+    pub(super) shadow_caster_count: [f32; 4],
+}
+
+impl EmissiveLightUniforms {
+    /// Returns an empty local-light payload for frames without emissive mesh lights.
+    pub(super) fn disabled() -> Self {
+        Self {
+            position_radius: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
+            color: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
+            count: [0.0; 4],
+            shadow_caster_center_radius: [[0.0; 4]; MAX_LOCAL_SHADOW_CASTERS],
+            shadow_caster_count: [0.0; 4],
+        }
+    }
 }
 
 /// Creates the frame descriptor set layout shared with `shaders/mesh.vert`.
@@ -1233,6 +1272,12 @@ fn identity_frame_uniform() -> MeshFrameUniform {
             0.0,
         ],
         ambient_color: DEFAULT_AMBIENT_COLOR,
+        contact_shadow: [0.0, 0.0, 0.0, 0.0],
+        emissive_light_position_radius: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
+        emissive_light_color: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
+        emissive_light_count: [0.0; 4],
+        local_shadow_caster_center_radius: [[0.0; 4]; MAX_LOCAL_SHADOW_CASTERS],
+        local_shadow_caster_count: [0.0; 4],
     }
 }
 
@@ -1250,10 +1295,8 @@ impl MeshPipelineTarget {
     /// Returns how many color attachments the target writes.
     fn color_attachment_count(self) -> usize {
         match self {
-            Self::SceneOpaque
-            | Self::SceneOpaqueFast
-            | Self::SceneTransparent
-            | Self::SceneTransparentFast => 3,
+            Self::SceneOpaque | Self::SceneTransparent => 3,
+            Self::SceneOpaqueFast | Self::SceneTransparentFast => 1,
             Self::OpaqueShadow | Self::TranslucentShadow => 1,
         }
     }
@@ -1300,13 +1343,9 @@ impl MeshPipelineTarget {
                 vk::PipelineColorBlendAttachmentState::default()
                     .color_write_mask(vk::ColorComponentFlags::empty()),
             ],
-            Self::SceneOpaqueFast => vec![
-                vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask),
-                vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(vk::ColorComponentFlags::empty()),
-                vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(vk::ColorComponentFlags::empty()),
-            ],
+            Self::SceneOpaqueFast => {
+                vec![vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask)]
+            }
             Self::SceneTransparent => vec![
                 vk::PipelineColorBlendAttachmentState::default()
                     .blend_enable(true)
@@ -1331,10 +1370,6 @@ impl MeshPipelineTarget {
                     .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                     .alpha_blend_op(vk::BlendOp::ADD)
                     .color_write_mask(write_mask),
-                vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(vk::ColorComponentFlags::empty()),
-                vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(vk::ColorComponentFlags::empty()),
             ],
             Self::OpaqueShadow => {
                 vec![vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask)]
@@ -1704,9 +1739,11 @@ mod tests {
         let cull = ShadowCascadeCull::new(camera, 0.1, 12.0);
         let near_bounds = SceneBounds::new([0.0, 0.0, -10.0], 1.0);
         let far_bounds = SceneBounds::new([0.0, 0.0, -80.0], 1.0);
+        let large_bounds = SceneBounds::new([0.0, 0.0, -80.0], 12.0);
 
         assert!(shadow_cascade_contains_bounds(near_bounds, cull));
         assert!(!shadow_cascade_contains_bounds(far_bounds, cull));
+        assert!(shadow_cascade_contains_bounds(large_bounds, cull));
         assert!(shadow_cascade_contains_bounds(None, cull));
     }
 
@@ -1752,16 +1789,8 @@ mod tests {
 
         assert!(MeshPipelineTarget::SceneTransparentFast.uses_depth_test());
         assert!(!MeshPipelineTarget::SceneTransparentFast.writes_depth());
-        assert_eq!(attachments.len(), 3);
+        assert_eq!(attachments.len(), 1);
         assert!(attachments[0].blend_enable != 0);
-        assert_eq!(
-            attachments[1].color_write_mask,
-            vk::ColorComponentFlags::empty()
-        );
-        assert_eq!(
-            attachments[2].color_write_mask,
-            vk::ColorComponentFlags::empty()
-        );
     }
 
     #[test]
@@ -1770,15 +1799,7 @@ mod tests {
 
         assert!(MeshPipelineTarget::SceneOpaqueFast.uses_depth_test());
         assert!(MeshPipelineTarget::SceneOpaqueFast.writes_depth());
-        assert_eq!(attachments.len(), 3);
+        assert_eq!(attachments.len(), 1);
         assert!(attachments[0].blend_enable == 0);
-        assert_eq!(
-            attachments[1].color_write_mask,
-            vk::ColorComponentFlags::empty()
-        );
-        assert_eq!(
-            attachments[2].color_write_mask,
-            vk::ColorComponentFlags::empty()
-        );
     }
 }

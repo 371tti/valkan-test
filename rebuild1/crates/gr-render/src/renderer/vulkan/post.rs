@@ -3,12 +3,11 @@ use std::{ffi::CStr, io::Cursor, mem::size_of};
 use ash::{Device, util, vk};
 
 use crate::{
-    math::{cross3, dot3, normalize_or, sub3},
     protocol::{
-        AntiAliasingQualitySettings, CameraEffects, CameraSnapshot, ContactShadowQualitySettings,
-        RenderQualitySettings,
+        AntiAliasingQualitySettings, CameraEffects, CameraSnapshot, RenderQualitySettings,
+        ShadowSofteningQualitySettings,
     },
-    renderer::{DEFAULT_DIRECTIONAL_LIGHT_DIR, pipeline::shader_interface},
+    renderer::pipeline::shader_interface,
 };
 
 use super::VulkanError;
@@ -178,15 +177,13 @@ impl PostPushConstants {
         extent: vk::Extent2D,
         quality: RenderQualitySettings,
         has_transparent_scene_items: bool,
-        light_intensity: f32,
     ) -> Self {
         let white_balance = camera_effects.white_balance();
         let ssao = quality.ssao();
         let ssr = quality.ssr();
         let anti_aliasing = quality.anti_aliasing();
-        let contact_shadow = quality.contact_shadow();
+        let shadow_softening = quality.shadow_softening();
         let post = quality.post();
-        let view_light = Self::view_light_params(camera);
 
         Self {
             white_balance: [white_balance[0], white_balance[1], white_balance[2], 1.0],
@@ -205,16 +202,16 @@ impl PostPushConstants {
                 ssr.thickness(),
             ],
             aa: Self::aa_params(extent, anti_aliasing),
-            shadow: Self::shadow_params(contact_shadow, light_intensity),
+            shadow: Self::shadow_params(shadow_softening),
             features: [
                 if has_transparent_scene_items {
                     1.0
                 } else {
                     0.0
                 },
-                view_light[0],
-                view_light[1],
-                view_light[2],
+                0.0,
+                0.0,
+                0.0,
             ],
             exposure: camera_effects.exposure().value(),
             contrast: (camera_effects.contrast() * post.contrast()).clamp(0.25, 4.0),
@@ -256,42 +253,14 @@ impl PostPushConstants {
         ]
     }
 
-    /// Packs bounded contact shadow controls used by the post fragment shader.
-    fn shadow_params(
-        contact_shadow: ContactShadowQualitySettings,
-        light_intensity: f32,
-    ) -> [f32; 4] {
+    /// Keeps the post push layout stable for shadow cleanup controls.
+    fn shadow_params(shadow_softening: ShadowSofteningQualitySettings) -> [f32; 4] {
         [
-            contact_shadow.intensity() * light_intensity.clamp(0.0, 1.0),
-            contact_shadow.max_distance(),
-            contact_shadow.thickness(),
-            contact_shadow.sample_count() as f32,
+            shadow_softening.intensity(),
+            shadow_softening.radius_pixels(),
+            shadow_softening.depth_sensitivity(),
+            shadow_softening.max_luma_delta(),
         ]
-    }
-
-    /// Converts the renderer's directional light vector into view space for post effects.
-    fn view_light_params(camera: CameraSnapshot) -> [f32; 3] {
-        let forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
-        let right = normalize_or(cross3(forward, camera.up), [1.0, 0.0, 0.0]);
-        let up = cross3(right, forward);
-        let to_light = normalize_or(
-            [
-                -DEFAULT_DIRECTIONAL_LIGHT_DIR[0],
-                -DEFAULT_DIRECTIONAL_LIGHT_DIR[1],
-                -DEFAULT_DIRECTIONAL_LIGHT_DIR[2],
-            ],
-            [0.0, 1.0, 0.0],
-        );
-        let view_light = normalize_or(
-            [
-                dot3(right, to_light),
-                dot3(up, to_light),
-                -dot3(forward, to_light),
-            ],
-            [0.0, 1.0, 0.0],
-        );
-
-        view_light
     }
 }
 
@@ -351,7 +320,6 @@ impl PostPipeline {
         camera: CameraSnapshot,
         quality: RenderQualitySettings,
         has_transparent_scene_items: bool,
-        light_intensity: f32,
     ) {
         let viewports = [vk::Viewport::default()
             .x(0.0)
@@ -370,7 +338,6 @@ impl PostPipeline {
             extent,
             quality,
             has_transparent_scene_items,
-            light_intensity,
         );
         let push_bytes = push_constant_bytes(&push);
 
@@ -387,9 +354,8 @@ impl PostPipeline {
             ssr_steps = push.ssr[1],
             aa_threshold = push.aa[2],
             aa_blend = push.aa[3],
-            contact_shadow = push.shadow[0],
-            contact_shadow_distance = push.shadow[1],
-            contact_shadow_samples = push.shadow[3],
+            shadow_softening = push.shadow[0],
+            shadow_softening_radius = push.shadow[1],
             has_transparent_scene_items,
             "recording Vulkan post pass"
         );

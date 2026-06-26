@@ -102,20 +102,13 @@ bool post_aa_enabled() {
     return params.aa.w > 0.0;
 }
 
-bool post_contact_shadow_enabled() {
-    return params.shadow.x > 0.0 &&
-        params.shadow.y > 0.0 &&
-        params.shadow.w >= 1.0;
-}
-
 bool post_transparent_metadata_enabled() {
     return params.features.x > 0.5;
 }
 
 bool post_requires_surface_material() {
     return post_ssao_enabled() ||
-        post_ssr_enabled() ||
-        post_contact_shadow_enabled();
+        post_ssr_enabled();
 }
 
 float depth_at_ssr(vec2 uv) {
@@ -267,133 +260,5 @@ SurfaceMaterial load_feature_surface_material(vec2 uv, out bool valid) {
     return valid
         ? surface_material(uv)
         : empty_surface_material(POST_BACKGROUND_DEPTH);
-}
-
-// =========================================================
-// Screen-space contact shadows
-// =========================================================
-
-const int CONTACT_SHADOW_MAX_STEPS = 24;
-
-float contact_shadow_sample_occlusion(
-    vec3 ray_position,
-    vec2 sample_uv,
-    float ray_distance,
-    float base_thickness,
-    vec3 receiver_normal
-) {
-    if (
-        sample_uv.x <= 0.0 || sample_uv.x >= 1.0 ||
-        sample_uv.y <= 0.0 || sample_uv.y >= 1.0 ||
-        ray_position.z >= -params.depth.x
-    ) {
-        return 0.0;
-    }
-
-    float sample_depth = depth_at(sample_uv);
-
-    if (is_background_depth(sample_depth)) {
-        return 0.0;
-    }
-
-    float ray_view_depth = -ray_position.z;
-    float scene_view_depth = linear_depth(sample_depth);
-    float depth_delta = ray_view_depth - scene_view_depth;
-    float self_bias =
-        base_thickness * 0.55 +
-        ray_distance * 0.010 +
-        scene_view_depth * 0.00018;
-    float thickness =
-        base_thickness +
-        ray_distance * 0.090 +
-        scene_view_depth * 0.00055;
-
-    if (depth_delta <= self_bias || depth_delta >= thickness * 1.35) {
-        return 0.0;
-    }
-
-    float front = smoothstep(self_bias, self_bias + base_thickness * 0.70, depth_delta);
-    float back = 1.0 - smoothstep(thickness * 0.72, thickness * 1.35, depth_delta);
-    float occlusion = front * back;
-
-    vec3 sample_normal = oct_decode(texture(scene_normal_roughness, clamp_screen_uv(sample_uv)).xy);
-    float same_normal = smoothstep(0.90, 0.985, dot(sample_normal, receiver_normal));
-    float shallow_hit = 1.0 - smoothstep(self_bias + base_thickness, thickness, depth_delta);
-
-    return occlusion * (1.0 - same_normal * shallow_hit * 0.88);
-}
-
-float screen_space_contact_shadow(vec2 uv, SurfaceMaterial material) {
-    if (
-        !post_contact_shadow_enabled() ||
-        surface_material_is_background(material) ||
-        material.transparent_weight > 0.75
-    ) {
-        return 1.0;
-    }
-
-    vec3 origin = view_position(uv, material.source_depth);
-    float view_depth = -origin.z;
-
-    if (view_depth <= params.depth.x) {
-        return 1.0;
-    }
-
-    vec3 normal = normalize_fast(material.normal);
-    vec3 light_dir = normalize_fast(params.features.yzw);
-    float ndotl = saturate(dot(normal, light_dir));
-
-    if (ndotl <= 0.025) {
-        return 1.0;
-    }
-
-    int sample_count = int(clamp(params.shadow.w, 1.0, float(CONTACT_SHADOW_MAX_STEPS)));
-    float max_distance = max(params.shadow.y, 0.05);
-    float base_thickness = max(params.shadow.z, 0.008);
-    vec3 ray_origin =
-        origin +
-        normal * max(base_thickness * 0.48, view_depth * 0.00070) +
-        light_dir * max(base_thickness * 0.60, 0.014);
-    float transmittance = 1.0;
-
-    for (int i = 0; i < CONTACT_SHADOW_MAX_STEPS; i++) {
-        if (i >= sample_count) {
-            break;
-        }
-
-        float step_t = (float(i) + 0.5) / float(sample_count);
-        float ray_distance = max_distance * pow(step_t, 1.35);
-        vec3 ray_position = ray_origin + light_dir * ray_distance;
-        vec2 sample_uv = project_view_position(ray_position);
-        float sample_occlusion = contact_shadow_sample_occlusion(
-            ray_position,
-            sample_uv,
-            ray_distance,
-            base_thickness,
-            normal
-        );
-        float distance_fade =
-            1.0 - smoothstep(max_distance * 0.34, max_distance, ray_distance);
-        float step_weight = mix(0.68, 0.18, step_t);
-
-        transmittance *= 1.0 - saturate(sample_occlusion * distance_fade * step_weight);
-    }
-
-    float light_fade = smoothstep(0.06, 0.42, ndotl);
-    float depth_fade = 1.0 - smoothstep(48.0, 140.0, view_depth);
-    float strength =
-        clamp(params.shadow.x, 0.0, 1.0) *
-        material.occlusion_weight *
-        light_fade *
-        depth_fade;
-
-    float occlusion = 1.0 - transmittance;
-
-    return 1.0 - saturate(occlusion * strength * 1.45);
-}
-
-vec3 contact_shadowed_scene_color(vec2 uv, vec3 color, SurfaceMaterial material) {
-    float visibility = screen_space_contact_shadow(uv, material);
-    return color * visibility;
 }
 #endif

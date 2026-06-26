@@ -83,6 +83,51 @@ pub(super) fn create_scene_render_pass(
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
+/// Creates the lightweight scene render pass used when post metadata is not sampled.
+pub(super) fn create_scene_fast_render_pass(
+    device: &Device,
+    color_format: vk::Format,
+    depth_format: vk::Format,
+) -> Result<vk::RenderPass, super::VulkanError> {
+    let color_attachment = vk::AttachmentDescription::default()
+        .format(color_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(depth_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let color_attachment_ref = vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let depth_attachment_ref = vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let color_attachment_refs = [color_attachment_ref];
+    let subpass = vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_attachment_refs)
+        .depth_stencil_attachment(&depth_attachment_ref);
+    let attachments = [color_attachment, depth_attachment];
+    let subpasses = [subpass];
+    let create_info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses);
+
+    // Safety: all slices in `create_info` live for the duration of the call.
+    unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
+}
+
 /// Creates the render pass that writes moment shadow data while depth-testing casters.
 pub(super) fn create_shadow_render_pass(
     device: &Device,
@@ -226,6 +271,26 @@ pub(super) fn create_scene_framebuffer(
         transparent_normal_roughness_view,
         depth_view,
     ];
+    let create_info = vk::FramebufferCreateInfo::default()
+        .render_pass(render_pass)
+        .attachments(&attachments)
+        .width(extent.width())
+        .height(extent.height())
+        .layers(1);
+
+    // Safety: both image views match the render pass attachments and outlive the framebuffer.
+    unsafe { device.create_framebuffer(&create_info, None) }.map_err(super::VulkanError::Vk)
+}
+
+/// Creates the lightweight scene framebuffer that omits material metadata attachments.
+pub(super) fn create_scene_fast_framebuffer(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    color_view: vk::ImageView,
+    depth_view: vk::ImageView,
+    extent: NonZeroExtent,
+) -> Result<vk::Framebuffer, super::VulkanError> {
+    let attachments = [color_view, depth_view];
     let create_info = vk::FramebufferCreateInfo::default()
         .render_pass(render_pass)
         .attachments(&attachments)

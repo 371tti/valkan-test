@@ -22,6 +22,12 @@ layout(set = 0, binding = 0) uniform FrameCamera {
     vec4 light_dir;
     vec4 light_color;
     vec4 ambient_color;
+    vec4 contact_shadow;
+    vec4 emissive_light_position_radius[4];
+    vec4 emissive_light_color[4];
+    vec4 emissive_light_count;
+    vec4 local_shadow_caster_center_radius[8];
+    vec4 local_shadow_caster_count;
 } frame_camera;
 
 layout(set = 1, binding = 0) uniform MaterialParams {
@@ -157,11 +163,17 @@ float read_occlusion() {
         return 1.0;
     }
     float strength = clamp(material.emissive_occlusion.a, 0.0, 1.0);
+    if (strength <= 0.0) {
+        return 1.0;
+    }
     return mix(1.0, texture(occlusion_texture, frag_uv).r, strength);
 }
 
 vec3 read_emissive() {
     vec3 emissive = material.emissive_occlusion.rgb;
+    if (dot(emissive, emissive) <= 0.0) {
+        return vec3(0.0);
+    }
     if (has_texture(TEX_EMISSIVE)) {
         emissive *= texture(emissive_texture, frag_uv).rgb;
     }
