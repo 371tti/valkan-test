@@ -173,6 +173,35 @@ pub(super) fn create_shadow_render_pass(
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
+/// Creates the depth-only render pass used for one face of a local-light shadow cubemap.
+pub(super) fn create_local_shadow_render_pass(
+    device: &Device,
+    depth_format: vk::Format,
+) -> Result<vk::RenderPass, super::VulkanError> {
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(depth_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let depth_attachment_ref = vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let subpass = vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .depth_stencil_attachment(&depth_attachment_ref);
+    let attachments = [depth_attachment];
+    let subpasses = [subpass];
+    let create_info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses);
+
+    unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
+}
+
 /// Creates the color-only pass that accumulates transparent shadow transmittance per cascade.
 pub(super) fn create_translucent_shadow_render_pass(
     device: &Device,
@@ -209,10 +238,42 @@ pub(super) fn create_post_render_pass(
     device: &Device,
     format: vk::Format,
 ) -> Result<vk::RenderPass, super::VulkanError> {
+    create_color_only_render_pass(device, format, vk::AttachmentLoadOp::DONT_CARE)
+}
+
+/// Creates the color-only pass that overwrites one bloom mip during downsample.
+pub(super) fn create_bloom_downsample_render_pass(
+    device: &Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass, super::VulkanError> {
+    create_color_only_render_pass(device, format, vk::AttachmentLoadOp::DONT_CARE)
+}
+
+/// Creates the color-only pass that preserves one bloom mip before additive upsample blending.
+pub(super) fn create_bloom_upsample_render_pass(
+    device: &Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass, super::VulkanError> {
+    create_color_only_render_pass(device, format, vk::AttachmentLoadOp::LOAD)
+}
+
+/// Creates the color-only pass that overwrites one low-resolution god-ray target.
+pub(super) fn create_god_ray_render_pass(
+    device: &Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass, super::VulkanError> {
+    create_color_only_render_pass(device, format, vk::AttachmentLoadOp::DONT_CARE)
+}
+
+fn create_color_only_render_pass(
+    device: &Device,
+    format: vk::Format,
+    load_op: vk::AttachmentLoadOp,
+) -> Result<vk::RenderPass, super::VulkanError> {
     let color_attachment = vk::AttachmentDescription::default()
         .format(format)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .load_op(load_op)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -319,6 +380,24 @@ pub(super) fn create_shadow_framebuffer(
         .layers(1);
 
     // Safety: both image views match the shadow render pass attachments.
+    unsafe { device.create_framebuffer(&create_info, None) }.map_err(super::VulkanError::Vk)
+}
+
+/// Creates a depth-only framebuffer for one local shadow cubemap face.
+pub(super) fn create_local_shadow_framebuffer(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    depth_view: vk::ImageView,
+    extent: NonZeroExtent,
+) -> Result<vk::Framebuffer, super::VulkanError> {
+    let attachments = [depth_view];
+    let create_info = vk::FramebufferCreateInfo::default()
+        .render_pass(render_pass)
+        .attachments(&attachments)
+        .width(extent.width())
+        .height(extent.height())
+        .layers(1);
+
     unsafe { device.create_framebuffer(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 

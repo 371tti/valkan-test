@@ -3,14 +3,20 @@ use std::{ffi::CStr, io::Cursor, mem::size_of};
 use ash::{Device, util, vk};
 
 use crate::{
+    math::{cross3, dot3, normalize_or, sub3},
     protocol::{
-        AntiAliasingQualitySettings, CameraEffects, CameraSnapshot, RenderQualitySettings,
-        ShadowSofteningQualitySettings,
+        AntiAliasingQualitySettings, BloomQualitySettings, CameraEffects, CameraSnapshot,
+        RenderQualitySettings, ShadowSofteningQualitySettings,
     },
-    renderer::pipeline::shader_interface,
+    renderer::{
+        DEFAULT_DIRECTIONAL_LIGHT_COLOR, DEFAULT_DIRECTIONAL_LIGHT_DIR, pipeline::shader_interface,
+    },
 };
 
-use super::VulkanError;
+use super::{
+    VulkanError,
+    mesh::{EmissiveLightUniforms, MAX_LOCAL_LIGHTS},
+};
 
 const SHADER_ENTRY: &CStr = c"main";
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.vert.spv"));
@@ -19,6 +25,16 @@ const POST_SCENE_COLOR_BINDING: u32 = 0;
 const POST_SCENE_DEPTH_BINDING: u32 = 1;
 const POST_SCENE_NORMAL_ROUGHNESS_BINDING: u32 = 2;
 const POST_SCENE_TRANSPARENT_NORMAL_ROUGHNESS_BINDING: u32 = 3;
+const POST_BLOOM_BINDING: u32 = 4;
+const POST_GOD_RAY_0_BINDING: u32 = 5;
+const POST_GOD_RAY_1_BINDING: u32 = 6;
+const GOD_RAY_SOURCE_COUNT: usize = 2;
+
+#[derive(Clone, Copy, Default)]
+struct GodRaySource {
+    source: [f32; 4],
+    color: [f32; 4],
+}
 
 pub(super) struct PostPipeline {
     pipeline: vk::Pipeline,
@@ -162,7 +178,12 @@ struct PostPushConstants {
     ssr: [f32; 4],
     aa: [f32; 4],
     shadow: [f32; 4],
+    bloom: [f32; 4],
     features: [f32; 4],
+    god_ray_source0: [f32; 4],
+    god_ray_color0: [f32; 4],
+    god_ray_source1: [f32; 4],
+    god_ray_color1: [f32; 4],
     exposure: f32,
     contrast: f32,
     saturation: f32,
@@ -177,17 +198,29 @@ impl PostPushConstants {
         extent: vk::Extent2D,
         quality: RenderQualitySettings,
         has_transparent_scene_items: bool,
+        god_ray_history_index: usize,
+        directional_light_intensity: f32,
+        emissive_lights: EmissiveLightUniforms,
     ) -> Self {
         let white_balance = camera_effects.white_balance();
         let ssao = quality.ssao();
         let ssr = quality.ssr();
         let anti_aliasing = quality.anti_aliasing();
         let shadow_softening = quality.shadow_softening();
+        let bloom = quality.bloom();
         let post = quality.post();
+        let camera_params = Self::camera_params(camera, extent);
+        let god_ray_sources = Self::god_ray_sources(
+            camera,
+            camera_params,
+            bloom,
+            directional_light_intensity,
+            emissive_lights,
+        );
 
         Self {
             white_balance: [white_balance[0], white_balance[1], white_balance[2], 1.0],
-            camera: Self::camera_params(camera, extent),
+            camera: camera_params,
             depth: Self::depth_params(camera),
             ssao: [
                 ssao.intensity(),
@@ -203,16 +236,21 @@ impl PostPushConstants {
             ],
             aa: Self::aa_params(extent, anti_aliasing),
             shadow: Self::shadow_params(shadow_softening),
+            bloom: Self::bloom_params(bloom),
             features: [
                 if has_transparent_scene_items {
                     1.0
                 } else {
                     0.0
                 },
-                0.0,
+                god_ray_history_index.min(1) as f32,
                 0.0,
                 0.0,
             ],
+            god_ray_source0: god_ray_sources[0].source,
+            god_ray_color0: god_ray_sources[0].color,
+            god_ray_source1: god_ray_sources[1].source,
+            god_ray_color1: god_ray_sources[1].color,
             exposure: camera_effects.exposure().value(),
             contrast: (camera_effects.contrast() * post.contrast()).clamp(0.25, 4.0),
             saturation: (camera_effects.saturation() * post.saturation()).clamp(0.0, 4.0),
@@ -262,6 +300,204 @@ impl PostPushConstants {
             shadow_softening.max_luma_delta(),
         ]
     }
+
+    /// Packs the single-pass bloom controls.
+    fn bloom_params(bloom: BloomQualitySettings) -> [f32; 4] {
+        [
+            bloom.intensity(),
+            bloom.threshold(),
+            bloom.radius_pixels(),
+            bloom.god_rays_intensity(),
+        ]
+    }
+
+    /// Selects a tiny set of visible light sources used by the screen-space god-ray pass.
+    fn god_ray_sources(
+        camera: CameraSnapshot,
+        camera_params: [f32; 4],
+        bloom: BloomQualitySettings,
+        directional_light_intensity: f32,
+        emissive_lights: EmissiveLightUniforms,
+    ) -> [GodRaySource; GOD_RAY_SOURCE_COUNT] {
+        let mut sources = [GodRaySource::default(); GOD_RAY_SOURCE_COUNT];
+        if bloom.god_rays_intensity() <= 0.0 {
+            return sources;
+        }
+
+        let forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
+        let right = normalize_or(cross3(forward, camera.up), [1.0, 0.0, 0.0]);
+        let up = cross3(right, forward);
+
+        if let Some(source) = Self::directional_god_ray_source(
+            camera_params,
+            forward,
+            right,
+            up,
+            directional_light_intensity,
+        ) {
+            Self::push_god_ray_source(&mut sources, source);
+        }
+
+        let light_count = (emissive_lights.count[0] as usize).min(MAX_LOCAL_LIGHTS);
+        let focal = camera_params[0]
+            .abs()
+            .max(camera_params[1].abs())
+            .max(0.0001);
+        let near = camera.near.max(0.001);
+        for index in 0..light_count {
+            if let Some(source) = Self::local_god_ray_source(
+                camera,
+                camera_params,
+                forward,
+                right,
+                up,
+                focal,
+                near,
+                emissive_lights,
+                index,
+            ) {
+                Self::push_god_ray_source(&mut sources, source);
+            }
+        }
+
+        sources
+    }
+
+    fn directional_god_ray_source(
+        camera_params: [f32; 4],
+        forward: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+        directional_light_intensity: f32,
+    ) -> Option<GodRaySource> {
+        let light_dir = normalize_or(DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
+        let sun_dir = [-light_dir[0], -light_dir[1], -light_dir[2]];
+        let forward_alignment = dot3(forward, sun_dir);
+        let visibility = smoothstep(-0.02, 0.24, forward_alignment);
+        if visibility <= 0.001 {
+            return None;
+        }
+
+        let inv_depth = 1.0 / forward_alignment.max(0.0001);
+        let ndc_x = dot3(right, sun_dir) * camera_params[0] * inv_depth;
+        let ndc_y = dot3(up, sun_dir) * camera_params[1] * inv_depth;
+        let uv = [ndc_x * 0.5 + 0.5, ndc_y * 0.5 + 0.5];
+        let screen_presence = screen_presence(uv, 0.30);
+        if screen_presence <= 0.001 {
+            return None;
+        }
+
+        let color = [
+            DEFAULT_DIRECTIONAL_LIGHT_COLOR[0] * directional_light_intensity,
+            DEFAULT_DIRECTIONAL_LIGHT_COLOR[1] * directional_light_intensity,
+            DEFAULT_DIRECTIONAL_LIGHT_COLOR[2] * directional_light_intensity,
+        ];
+        let brightness = max3(color).sqrt().clamp(0.0, 2.0);
+        let chroma = chroma3(color, [1.0, 0.88, 0.72]);
+
+        Some(GodRaySource {
+            source: [
+                uv[0],
+                uv[1],
+                0.040,
+                visibility * screen_presence * brightness,
+            ],
+            color: [chroma[0], chroma[1], chroma[2], 1.0],
+        })
+    }
+
+    fn local_god_ray_source(
+        camera: CameraSnapshot,
+        camera_params: [f32; 4],
+        forward: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+        focal: f32,
+        near: f32,
+        emissive_lights: EmissiveLightUniforms,
+        index: usize,
+    ) -> Option<GodRaySource> {
+        let position_radius = emissive_lights.position_radius[index];
+        let color = emissive_lights.color[index];
+        let position = [position_radius[0], position_radius[1], position_radius[2]];
+        let delta = sub3(position, camera.eye);
+        let depth = dot3(forward, delta);
+        if !depth.is_finite() || depth <= near {
+            return None;
+        }
+
+        let inv_depth = 1.0 / depth;
+        let ndc_x = dot3(right, delta) * camera_params[0] * inv_depth;
+        let ndc_y = dot3(up, delta) * camera_params[1] * inv_depth;
+        let uv = [ndc_x * 0.5 + 0.5, ndc_y * 0.5 + 0.5];
+        let screen_presence = screen_presence(uv, 0.10);
+        if screen_presence <= 0.001 {
+            return None;
+        }
+
+        let range = position_radius[3].max(0.001);
+        let distance = dot3(delta, delta).sqrt();
+        let distance_fade = 1.0 - smoothstep(range * 0.72, range * 1.20, distance);
+        let light_color = [color[0], color[1], color[2]];
+        let brightness = color[3].max(max3(light_color)).max(0.0);
+        let strength = (brightness * 0.22).sqrt().clamp(0.0, 1.5) * distance_fade * screen_presence;
+        if strength <= 0.001 || !strength.is_finite() {
+            return None;
+        }
+
+        let source_radius = emissive_lights.direction_radius[index][3]
+            .max(emissive_lights.size_kind[index][0].max(emissive_lights.size_kind[index][1]))
+            .max(range * 0.012)
+            .min(range * 0.35);
+        let screen_radius = (source_radius * focal * 0.5 * inv_depth).clamp(0.006, 0.095);
+        let chroma = chroma3(light_color, [1.0, 0.82, 0.55]);
+
+        Some(GodRaySource {
+            source: [uv[0], uv[1], screen_radius, strength],
+            color: [chroma[0], chroma[1], chroma[2], 0.0],
+        })
+    }
+
+    fn push_god_ray_source(
+        sources: &mut [GodRaySource; GOD_RAY_SOURCE_COUNT],
+        source: GodRaySource,
+    ) {
+        if source.source[3] <= 0.0 {
+            return;
+        }
+        if source.source[3] > sources[0].source[3] {
+            sources[1] = sources[0];
+            sources[0] = source;
+        } else if source.source[3] > sources[1].source[3] {
+            sources[1] = source;
+        }
+    }
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0).max(0.0001)).clamp(0.0, 1.0);
+
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn screen_presence(uv: [f32; 2], margin: f32) -> f32 {
+    let offscreen_x = ((uv[0] - 0.5).abs() - (0.5 + margin)).max(0.0);
+    let offscreen_y = ((uv[1] - 0.5).abs() - (0.5 + margin)).max(0.0);
+
+    1.0 - smoothstep(0.02, 0.42 + margin, offscreen_x.hypot(offscreen_y))
+}
+
+fn chroma3(color: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let peak = max3(color);
+    if !peak.is_finite() || peak <= 0.0001 {
+        return fallback;
+    }
+
+    [color[0] / peak, color[1] / peak, color[2] / peak]
+}
+
+fn max3(value: [f32; 3]) -> f32 {
+    value[0].max(value[1]).max(value[2])
 }
 
 impl PostPipeline {
@@ -273,6 +509,8 @@ impl PostPipeline {
         scene_depth_view: vk::ImageView,
         scene_normal_roughness_view: vk::ImageView,
         scene_transparent_normal_roughness_view: vk::ImageView,
+        bloom_view: vk::ImageView,
+        god_ray_history_views: [vk::ImageView; 2],
     ) -> Result<Self, VulkanError> {
         let mut build = PostBuild::new(device);
         build.empty_set_layout = Some(create_empty_set_layout(device)?);
@@ -297,6 +535,8 @@ impl PostPipeline {
             scene_depth_view,
             scene_normal_roughness_view,
             scene_transparent_normal_roughness_view,
+            bloom_view,
+            god_ray_history_views,
             build.color_sampler(),
             build.data_sampler(),
         );
@@ -320,6 +560,9 @@ impl PostPipeline {
         camera: CameraSnapshot,
         quality: RenderQualitySettings,
         has_transparent_scene_items: bool,
+        god_ray_history_index: usize,
+        directional_light_intensity: f32,
+        emissive_lights: EmissiveLightUniforms,
     ) {
         let viewports = [vk::Viewport::default()
             .x(0.0)
@@ -338,6 +581,9 @@ impl PostPipeline {
             extent,
             quality,
             has_transparent_scene_items,
+            god_ray_history_index,
+            directional_light_intensity,
+            emissive_lights,
         );
         let push_bytes = push_constant_bytes(&push);
 
@@ -356,6 +602,12 @@ impl PostPipeline {
             aa_blend = push.aa[3],
             shadow_softening = push.shadow[0],
             shadow_softening_radius = push.shadow[1],
+            bloom_intensity = push.bloom[0],
+            bloom_threshold = push.bloom[1],
+            bloom_radius = push.bloom[2],
+            god_rays_intensity = push.bloom[3],
+            god_ray_source0 = ?push.god_ray_source0,
+            god_ray_source1 = ?push.god_ray_source1,
             has_transparent_scene_items,
             "recording Vulkan post pass"
         );
@@ -408,6 +660,9 @@ fn create_pass_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, Vu
         post_sampler_binding(POST_SCENE_DEPTH_BINDING),
         post_sampler_binding(POST_SCENE_NORMAL_ROUGHNESS_BINDING),
         post_sampler_binding(POST_SCENE_TRANSPARENT_NORMAL_ROUGHNESS_BINDING),
+        post_sampler_binding(POST_BLOOM_BINDING),
+        post_sampler_binding(POST_GOD_RAY_0_BINDING),
+        post_sampler_binding(POST_GOD_RAY_1_BINDING),
     ];
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
@@ -469,11 +724,11 @@ fn create_sampler(device: &Device, filter: vk::Filter) -> Result<vk::Sampler, Vu
     unsafe { device.create_sampler(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
-/// Creates the descriptor pool for scene color, depth, and normal/roughness sampler bindings.
+/// Creates the descriptor pool for post-process sampled image bindings.
 fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, VulkanError> {
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(4);
+        .descriptor_count(7);
     let pool_sizes = [pool_size];
     let create_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(1)
@@ -508,6 +763,8 @@ fn update_descriptor_set(
     scene_depth_view: vk::ImageView,
     scene_normal_roughness_view: vk::ImageView,
     scene_transparent_normal_roughness_view: vk::ImageView,
+    bloom_view: vk::ImageView,
+    god_ray_history_views: [vk::ImageView; 2],
     color_sampler: vk::Sampler,
     data_sampler: vk::Sampler,
 ) {
@@ -518,6 +775,9 @@ fn update_descriptor_set(
         data_sampler,
         scene_transparent_normal_roughness_view,
     )];
+    let bloom_info = [post_image_info(color_sampler, bloom_view)];
+    let god_ray_0_info = [post_image_info(color_sampler, god_ray_history_views[0])];
+    let god_ray_1_info = [post_image_info(color_sampler, god_ray_history_views[1])];
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
@@ -539,6 +799,21 @@ fn update_descriptor_set(
             .dst_binding(POST_SCENE_TRANSPARENT_NORMAL_ROUGHNESS_BINDING)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&transparent_normal_roughness_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(POST_BLOOM_BINDING)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&bloom_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(POST_GOD_RAY_0_BINDING)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&god_ray_0_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(POST_GOD_RAY_1_BINDING)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&god_ray_1_info),
     ];
 
     // Safety: descriptor set, sampler, and image view belong to this device and remain alive.

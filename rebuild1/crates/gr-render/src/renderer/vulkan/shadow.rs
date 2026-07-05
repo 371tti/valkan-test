@@ -12,7 +12,10 @@ use crate::{
     },
 };
 
-use super::mesh::{EmissiveLightUniforms, MeshFrameUniform, ShadowCascadeCull};
+use super::mesh::{
+    EmissiveLightUniforms, LOCAL_SHADOW_FACE_COUNT, LOCAL_SHADOW_MATRIX_COUNT, MAX_LOCAL_LIGHTS,
+    MeshFrameUniform, ShadowCascadeCull,
+};
 
 const SHADOW_SPLIT_LAMBDA: f32 = 0.78;
 const SHADOW_SPLIT_NEAR_FLOOR: f32 = 1.0;
@@ -39,6 +42,20 @@ pub(super) struct ShadowFrameData {
     pub(super) splits: [f32; 4],
     pub(super) texel_world: [f32; 4],
     pub(super) depth_span: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LocalShadowFrameData {
+    pub(super) view_proj: [[f32; 16]; LOCAL_SHADOW_MATRIX_COUNT],
+    pub(super) params: [[f32; 4]; MAX_LOCAL_LIGHTS],
+    pub(super) lights: [Option<LocalShadowLightData>; MAX_LOCAL_LIGHTS],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LocalShadowLightData {
+    pub(super) light_index: usize,
+    pub(super) light_position_radius: [f32; 4],
+    pub(super) source_radius: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -103,6 +120,7 @@ pub(super) fn mesh_frame_uniform_for_frame(
     has_shadow_casters: bool,
     has_translucent_shadow_casters: bool,
     shadow_data: Option<ShadowFrameData>,
+    local_shadow_data: Option<LocalShadowFrameData>,
     emissive_lights: EmissiveLightUniforms,
 ) -> MeshFrameUniform {
     let aspect = if extent.height > 0 {
@@ -112,6 +130,7 @@ pub(super) fn mesh_frame_uniform_for_frame(
     };
     let light_dir = normalize_or(DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
     let shadow_data = shadow_data.unwrap_or_else(disabled_shadow_frame_data);
+    let local_shadow_data = local_shadow_data.unwrap_or_else(disabled_local_shadow_frame_data);
 
     MeshFrameUniform {
         view_proj: camera.view_projection(aspect),
@@ -143,12 +162,98 @@ pub(super) fn mesh_frame_uniform_for_frame(
             has_shadow_casters,
             light_intensity,
         ),
+        local_shadow_view_proj: local_shadow_data.view_proj,
+        local_shadow_params: local_shadow_data.params,
         emissive_light_position_radius: emissive_lights.position_radius,
         emissive_light_color: emissive_lights.color,
+        emissive_light_direction_radius: emissive_lights.direction_radius,
+        emissive_light_size_kind: emissive_lights.size_kind,
         emissive_light_count: emissive_lights.count,
-        local_shadow_caster_center_radius: emissive_lights.shadow_caster_center_radius,
-        local_shadow_caster_count: emissive_lights.shadow_caster_count,
     }
+}
+
+/// Returns whether any local light should receive a cubemap shadow this frame.
+pub(super) fn has_local_shadow_light(emissive_lights: &EmissiveLightUniforms) -> bool {
+    let light_count =
+        (emissive_lights.count[0] as usize).min(emissive_lights.position_radius.len());
+    (0..light_count).any(|index| emissive_lights.size_kind[index][3] > 0.0)
+}
+
+/// Builds point-light projections for every local light that has cubemap shadows enabled.
+pub(super) fn local_shadow_frame_data(
+    emissive_lights: &EmissiveLightUniforms,
+    extent: vk::Extent2D,
+) -> Option<LocalShadowFrameData> {
+    let light_count =
+        (emissive_lights.count[0] as usize).min(emissive_lights.position_radius.len());
+    let face_resolution = extent.width.min(extent.height).max(1) as f32;
+    let filter_texel_angle = 1.5 / face_resolution;
+    let mut view_proj = [identity_mat4(); LOCAL_SHADOW_MATRIX_COUNT];
+    let mut params = [[0.0, 0.0, 1.0, 1.0]; MAX_LOCAL_LIGHTS];
+    let mut lights = [None; MAX_LOCAL_LIGHTS];
+    let mut enabled_count = 0usize;
+
+    for light_index in 0..light_count {
+        if emissive_lights.size_kind[light_index][3] <= 0.0 {
+            continue;
+        }
+
+        let position_radius = emissive_lights.position_radius[light_index];
+        let direction_radius = emissive_lights.direction_radius[light_index];
+        let size_kind = emissive_lights.size_kind[light_index];
+        let position = [position_radius[0], position_radius[1], position_radius[2]];
+        let range = position_radius[3].max(0.25);
+        let source_radius = direction_radius[3]
+            .max(size_kind[0].abs().max(size_kind[1].abs()))
+            .max(0.03);
+        let near = (range * 0.005)
+            .max(source_radius * 0.05)
+            .clamp(0.03, range * 0.05);
+        let far = range.max(near + 1.0);
+        let matrix_offset = light_index * LOCAL_SHADOW_FACE_COUNT;
+        let matrices = local_shadow_cube_view_projections(position, near, far);
+        view_proj[matrix_offset..matrix_offset + LOCAL_SHADOW_FACE_COUNT]
+            .copy_from_slice(&matrices);
+        params[light_index] = [1.0, filter_texel_angle, near, far];
+        lights[light_index] = Some(LocalShadowLightData {
+            light_index,
+            light_position_radius: position_radius,
+            source_radius,
+        });
+        enabled_count += 1;
+    }
+
+    if enabled_count == 0 {
+        return None;
+    }
+
+    Some(LocalShadowFrameData {
+        view_proj,
+        params,
+        lights,
+    })
+}
+
+fn local_shadow_cube_view_projections(
+    position: [f32; 3],
+    near: f32,
+    far: f32,
+) -> [[f32; 16]; LOCAL_SHADOW_FACE_COUNT] {
+    const FACES: [([f32; 3], [f32; 3]); LOCAL_SHADOW_FACE_COUNT] = [
+        ([1.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+        ([-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+        ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+        ([0.0, -1.0, 0.0], [0.0, 0.0, -1.0]),
+        ([0.0, 0.0, 1.0], [0.0, -1.0, 0.0]),
+        ([0.0, 0.0, -1.0], [0.0, -1.0, 0.0]),
+    ];
+    let projection = perspective_cubemap(std::f32::consts::FRAC_PI_2, 1.0, near, far);
+
+    std::array::from_fn(|index| {
+        let (direction, up) = FACES[index];
+        let view = look_at_rh(position, add3(position, direction), up);
+        mat4_mul(projection, view)
+    })
 }
 
 fn contact_shadow_params(
@@ -283,6 +388,14 @@ fn disabled_shadow_frame_data() -> ShadowFrameData {
         splits: DEFAULT_SHADOW_CASCADE_SPLITS,
         texel_world: DEFAULT_SHADOW_CASCADE_METRICS,
         depth_span: DEFAULT_SHADOW_CASCADE_METRICS,
+    }
+}
+
+fn disabled_local_shadow_frame_data() -> LocalShadowFrameData {
+    LocalShadowFrameData {
+        view_proj: [identity_mat4(); LOCAL_SHADOW_MATRIX_COUNT],
+        params: [[0.0, 0.0, 1.0, 1.0]; MAX_LOCAL_LIGHTS],
+        lights: [None; MAX_LOCAL_LIGHTS],
     }
 }
 
@@ -513,6 +626,29 @@ fn orthographic_vulkan(width: f32, height: f32, near: f32, far: f32) -> [f32; 16
     ]
 }
 
+fn perspective_cubemap(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
+    let f = 1.0 / (fov_y * 0.5).tan().max(0.001);
+    let z = far / (near - far).min(-0.001);
+    [
+        f / aspect.max(0.001),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        f,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        z,
+        -1.0,
+        0.0,
+        0.0,
+        z * near,
+        0.0,
+    ]
+}
+
 /// Builds a right-handed view matrix from explicit camera basis vectors.
 fn look_at_rh(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [f32; 16] {
     let forward = normalize_or(sub3(target, eye), [0.0, 0.0, -1.0]);
@@ -585,6 +721,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             EmissiveLightUniforms::disabled(),
         );
         let without_light = mesh_frame_uniform_for_frame(
@@ -595,6 +732,7 @@ mod tests {
             true,
             false,
             None,
+            None,
             EmissiveLightUniforms::disabled(),
         );
         let enabled = mesh_frame_uniform_for_frame(
@@ -604,6 +742,7 @@ mod tests {
             extent,
             true,
             false,
+            None,
             None,
             EmissiveLightUniforms::disabled(),
         );
@@ -654,6 +793,73 @@ mod tests {
         assert!(near_reserve >= 96.0);
         assert!(far_reserve >= 256.0);
         assert!(far_reserve > near_reserve);
+    }
+
+    #[test]
+    fn local_shadow_frame_data_builds_cube_faces_for_shadowed_lights() {
+        let mut emissive_lights = EmissiveLightUniforms::disabled();
+        emissive_lights.position_radius[0] = [0.0, 0.0, 0.0, 40.0];
+        emissive_lights.direction_radius[0] = [0.0, -1.0, 0.0, 1.0];
+        emissive_lights.size_kind[0] = [0.0, 0.0, 1.0, 1.0];
+        emissive_lights.position_radius[1] = [2.0, 3.0, 4.0, 24.0];
+        emissive_lights.direction_radius[1] = [0.0, -1.0, 0.0, 0.5];
+        emissive_lights.size_kind[1] = [0.0, 0.0, 1.0, 0.0];
+        emissive_lights.position_radius[2] = [5.0, 6.0, 7.0, 32.0];
+        emissive_lights.direction_radius[2] = [0.0, -1.0, 0.0, 0.75];
+        emissive_lights.size_kind[2] = [0.0, 0.0, 1.0, 1.0];
+        emissive_lights.count[0] = 3.0;
+        let extent = vk::Extent2D {
+            width: 1024,
+            height: 1024,
+        };
+
+        let data = local_shadow_frame_data(&emissive_lights, extent)
+            .expect("enabled local light should build cubemap shadow data");
+
+        assert_eq!(data.view_proj.len(), LOCAL_SHADOW_MATRIX_COUNT);
+        assert_eq!(data.params[0][0], 1.0);
+        assert!((data.params[0][1] - (1.5 / 1024.0)).abs() < 0.000001);
+        assert!(data.params[0][2] > 0.0);
+        assert!(data.params[0][3] > data.params[0][2]);
+        assert_eq!(data.params[1][0], 0.0);
+        assert_eq!(data.params[2][0], 1.0);
+        assert_eq!(data.params[2][1], data.params[0][1]);
+        assert!(data.lights[0].is_some());
+        assert!(data.lights[1].is_none());
+        assert!(data.lights[2].is_some());
+    }
+
+    #[test]
+    fn local_shadow_cube_faces_match_sampler_axes() {
+        let faces = local_shadow_cube_view_projections([0.0, 0.0, 0.0], 0.1, 100.0);
+        let centers = [
+            [10.0, 0.0, 0.0],
+            [-10.0, 0.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [0.0, -10.0, 0.0],
+            [0.0, 0.0, 10.0],
+            [0.0, 0.0, -10.0],
+        ];
+
+        for (face, center) in faces.iter().zip(centers) {
+            let projected = transform_point(*face, center);
+            assert!(projected[0].abs() < 0.0001);
+            assert!(projected[1].abs() < 0.0001);
+            assert!(projected[2].is_finite());
+        }
+
+        assert!(transform_point(faces[0], [10.0, 0.0, -1.0])[0] > 0.0);
+        assert!(transform_point(faces[0], [10.0, 1.0, 0.0])[1] < 0.0);
+        assert!(transform_point(faces[1], [-10.0, 0.0, 1.0])[0] > 0.0);
+        assert!(transform_point(faces[1], [-10.0, 1.0, 0.0])[1] < 0.0);
+        assert!(transform_point(faces[2], [1.0, 10.0, 0.0])[0] > 0.0);
+        assert!(transform_point(faces[2], [0.0, 10.0, 1.0])[1] > 0.0);
+        assert!(transform_point(faces[3], [1.0, -10.0, 0.0])[0] > 0.0);
+        assert!(transform_point(faces[3], [0.0, -10.0, 1.0])[1] < 0.0);
+        assert!(transform_point(faces[4], [1.0, 0.0, 10.0])[0] > 0.0);
+        assert!(transform_point(faces[4], [0.0, 1.0, 10.0])[1] < 0.0);
+        assert!(transform_point(faces[5], [-1.0, 0.0, -10.0])[0] > 0.0);
+        assert!(transform_point(faces[5], [0.0, 1.0, -10.0])[1] < 0.0);
     }
 
     #[test]

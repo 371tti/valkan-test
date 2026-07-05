@@ -13,7 +13,7 @@ use crate::{
 
 use super::{
     VulkanError,
-    buffer::{GpuBuffer, create_buffer_with_data},
+    buffer::{GpuBuffer, create_device_local_buffer_with_data},
     material_texture::{DefaultMaterialTextures, VulkanTexture},
 };
 
@@ -26,6 +26,17 @@ pub(super) struct VulkanMaterialStore {
     descriptor_pool: vk::DescriptorPool,
     material_set_layout: vk::DescriptorSetLayout,
     sampler: vk::Sampler,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MaterialDrawInfo {
+    pub(super) descriptor_set: vk::DescriptorSet,
+    pub(super) uses_any_texture: bool,
+    pub(super) uses_base_color_texture: bool,
+    pub(super) double_sided: bool,
+    pub(super) transparent: bool,
+    pub(super) casts_opaque_shadow: bool,
+    pub(super) casts_translucent_shadow: bool,
 }
 
 impl VulkanMaterialStore {
@@ -99,6 +110,8 @@ impl VulkanMaterialStore {
         &mut self,
         device: &Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        queue_family_index: u32,
+        queue: vk::Queue,
         records: &[(MaterialHandle, MaterialDescriptor)],
     ) -> Result<(), VulkanError> {
         for (handle, descriptor) in records {
@@ -108,6 +121,8 @@ impl VulkanMaterialStore {
                 self.descriptor_pool,
                 self.material_set_layout,
                 self.sampler,
+                queue_family_index,
+                queue,
                 descriptor,
                 &self.textures,
                 self.defaults.as_ref(),
@@ -116,7 +131,7 @@ impl VulkanMaterialStore {
                 material = handle.raw(),
                 alpha_mode = descriptor.alpha_mode().name(),
                 texture_count = descriptor.textures().len(),
-                descriptor_set = material.descriptor_set().as_raw(),
+                descriptor_set = material.descriptor_set.as_raw(),
                 "uploaded Vulkan material descriptors"
             );
             if let Some(old) = self.materials.insert(*handle, material) {
@@ -132,25 +147,9 @@ impl VulkanMaterialStore {
         self.material_set_layout
     }
 
-    /// Returns the descriptor set for a live material handle.
-    pub(super) fn descriptor_set_for(&self, material: MaterialHandle) -> Option<vk::DescriptorSet> {
-        self.materials
-            .get(&material)
-            .map(VulkanMaterial::descriptor_set)
-    }
-
-    /// Returns whether the material can be drawn with the texture-sampling pipeline variant.
-    pub(super) fn has_base_color_texture(&self, material: MaterialHandle) -> bool {
-        self.materials
-            .get(&material)
-            .is_some_and(VulkanMaterial::has_base_color_texture)
-    }
-
-    /// Returns whether the material needs the texture-sampling scene shader variant.
-    pub(super) fn has_any_texture(&self, material: MaterialHandle) -> bool {
-        self.materials
-            .get(&material)
-            .is_some_and(VulkanMaterial::has_any_texture)
+    /// Returns all hot-path material facts used for draw list building and command recording.
+    pub(super) fn draw_info(&self, material: MaterialHandle) -> Option<MaterialDrawInfo> {
+        self.materials.get(&material).map(VulkanMaterial::draw_info)
     }
 
     /// Returns the imported emissive RGB factor for CPU-side emissive light extraction.
@@ -158,37 +157,6 @@ impl VulkanMaterialStore {
         self.materials
             .get(&material)
             .map(VulkanMaterial::emissive_factor)
-    }
-
-    /// Returns whether a material asks the mesh pipeline to disable back-face culling.
-    pub(super) fn is_double_sided(&self, material: MaterialHandle) -> bool {
-        self.materials
-            .get(&material)
-            .is_some_and(VulkanMaterial::is_double_sided)
-    }
-
-    /// Returns whether this material should be blended after opaque scene depth is written.
-    pub(super) fn is_transparent(&self, material: MaterialHandle) -> bool {
-        self.materials
-            .get(&material)
-            .is_some_and(|material| matches!(material.alpha_mode(), MaterialAlphaMode::Transparent))
-    }
-
-    /// Returns whether this material belongs to the opaque shadow caster pass.
-    pub(super) fn casts_opaque_shadow(&self, material: MaterialHandle) -> bool {
-        self.materials.get(&material).is_some_and(|material| {
-            matches!(
-                material.alpha_mode(),
-                MaterialAlphaMode::Opaque | MaterialAlphaMode::Cutout
-            )
-        })
-    }
-
-    /// Returns whether this material belongs to the translucent shadow transmittance pass.
-    pub(super) fn casts_translucent_shadow(&self, material: MaterialHandle) -> bool {
-        self.materials
-            .get(&material)
-            .is_some_and(|material| matches!(material.alpha_mode(), MaterialAlphaMode::Transparent))
     }
 
     /// Destroys backend material and texture resources whose protocol handles have retired.
@@ -292,15 +260,19 @@ impl VulkanMaterial {
         descriptor_pool: vk::DescriptorPool,
         material_set_layout: vk::DescriptorSetLayout,
         sampler: vk::Sampler,
+        queue_family_index: u32,
+        queue: vk::Queue,
         descriptor: &MaterialDescriptor,
         textures: &BTreeMap<TextureHandle, VulkanTexture>,
         defaults: Option<&DefaultMaterialTextures>,
     ) -> Result<Self, VulkanError> {
         let texture_flags = MaterialTextureFlags::from_descriptor(descriptor);
         let texture_set = MaterialTextureSet::resolve(descriptor, textures, defaults)?;
-        let params = create_buffer_with_data(
+        let params = create_device_local_buffer_with_data(
             device,
             memory_properties,
+            queue_family_index,
+            queue,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &[MaterialParams::from_descriptor(descriptor, texture_flags)],
         )?;
@@ -324,34 +296,26 @@ impl VulkanMaterial {
         })
     }
 
-    /// Returns the descriptor set written for this material record.
-    fn descriptor_set(&self) -> vk::DescriptorSet {
-        self.descriptor_set
-    }
-
-    /// Returns whether this material wrote a base-color texture descriptor.
-    fn has_base_color_texture(&self) -> bool {
-        self.texture_flags.has(MaterialTextureSlot::BaseColor)
-    }
-
-    /// Returns whether this material wrote any texture descriptor.
-    fn has_any_texture(&self) -> bool {
-        self.texture_flags.any()
-    }
-
-    /// Returns the alpha mode imported for this material.
-    fn alpha_mode(&self) -> MaterialAlphaMode {
-        self.alpha_mode
+    /// Packs material state needed by per-frame draw list preparation.
+    fn draw_info(&self) -> MaterialDrawInfo {
+        let transparent = matches!(self.alpha_mode, MaterialAlphaMode::Transparent);
+        MaterialDrawInfo {
+            descriptor_set: self.descriptor_set,
+            uses_any_texture: self.texture_flags.any(),
+            uses_base_color_texture: self.texture_flags.has(MaterialTextureSlot::BaseColor),
+            double_sided: self.double_sided,
+            transparent,
+            casts_opaque_shadow: matches!(
+                self.alpha_mode,
+                MaterialAlphaMode::Opaque | MaterialAlphaMode::Cutout
+            ),
+            casts_translucent_shadow: transparent,
+        }
     }
 
     /// Returns the imported emissive RGB factor.
     fn emissive_factor(&self) -> [f32; 3] {
         self.emissive_factor
-    }
-
-    /// Returns whether this material requires a no-cull mesh pipeline variant.
-    fn is_double_sided(&self) -> bool {
-        self.double_sided
     }
 
     /// Destroys the material parameter buffer after GPU use has retired.

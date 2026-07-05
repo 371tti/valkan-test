@@ -248,6 +248,186 @@ impl LightPacket {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalLightKind {
+    Point,
+    Sphere,
+    Spot,
+    Rectangle,
+}
+
+impl LocalLightKind {
+    /// Returns the compact shader code copied into local-light uniforms.
+    pub(crate) fn shader_code(self) -> f32 {
+        match self {
+            Self::Point => 0.0,
+            Self::Sphere => 1.0,
+            Self::Spot => 2.0,
+            Self::Rectangle => 3.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LocalLightPacket {
+    pub kind: LocalLightKind,
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    pub direction: [f32; 3],
+    pub source_radius: f32,
+    pub half_size: [f32; 2],
+    pub casts_shadow: bool,
+}
+
+impl LocalLightPacket {
+    const MIN_RANGE: f32 = 0.01;
+    const MAX_RANGE: f32 = 4096.0;
+    const MAX_INTENSITY: f32 = 2048.0;
+
+    /// Creates a bounded point light with optional analytic local shadows.
+    pub fn point(position: [f32; 3], color: [f32; 3], intensity: f32, range: f32) -> Option<Self> {
+        Self::new(
+            LocalLightKind::Point,
+            position,
+            color,
+            intensity,
+            range,
+            [0.0, -1.0, 0.0],
+            0.0,
+            [0.0, 0.0],
+            true,
+        )
+    }
+
+    /// Creates a bounded sphere light whose radius softens highlights and shadows.
+    pub fn sphere(
+        position: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        source_radius: f32,
+    ) -> Option<Self> {
+        Self::new(
+            LocalLightKind::Sphere,
+            position,
+            color,
+            intensity,
+            range,
+            [0.0, -1.0, 0.0],
+            source_radius,
+            [0.0, 0.0],
+            true,
+        )
+    }
+
+    /// Creates a bounded spotlight facing along `direction`.
+    pub fn spot(
+        position: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        direction: [f32; 3],
+        inner_cone_angle: f32,
+        outer_cone_angle: f32,
+    ) -> Option<Self> {
+        const MIN_OUTER_CONE: f32 = 0.01;
+        const MAX_OUTER_CONE: f32 = std::f32::consts::FRAC_PI_2;
+        const MIN_CONE_GAP: f32 = 0.001;
+
+        let outer_cone_angle = finite_clamp(
+            outer_cone_angle,
+            MIN_OUTER_CONE,
+            MAX_OUTER_CONE,
+            std::f32::consts::FRAC_PI_4,
+        );
+        let inner_cone_angle = finite_clamp(
+            inner_cone_angle,
+            0.0,
+            (outer_cone_angle - MIN_CONE_GAP).max(0.0),
+            0.0,
+        );
+
+        Self::new(
+            LocalLightKind::Spot,
+            position,
+            color,
+            intensity,
+            range,
+            direction,
+            0.0,
+            [inner_cone_angle.cos(), outer_cone_angle.cos()],
+            true,
+        )
+    }
+
+    /// Creates a bounded rectangular area light facing along `direction`.
+    pub fn rectangle(
+        position: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        direction: [f32; 3],
+        half_size: [f32; 2],
+    ) -> Option<Self> {
+        let source_radius = (half_size[0] * half_size[0] + half_size[1] * half_size[1]).sqrt();
+        Self::new(
+            LocalLightKind::Rectangle,
+            position,
+            color,
+            intensity,
+            range,
+            direction,
+            source_radius,
+            half_size,
+            true,
+        )
+    }
+
+    /// Returns a copy with analytic local shadows toggled.
+    pub fn with_shadow(mut self, casts_shadow: bool) -> Self {
+        self.casts_shadow = casts_shadow;
+        self
+    }
+
+    /// Builds one validated local-light packet before it crosses the renderer boundary.
+    fn new(
+        kind: LocalLightKind,
+        position: [f32; 3],
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        direction: [f32; 3],
+        source_radius: f32,
+        half_size: [f32; 2],
+        casts_shadow: bool,
+    ) -> Option<Self> {
+        let finite_position = position.iter().all(|value| value.is_finite());
+        let finite_color = color.iter().all(|value| value.is_finite() && *value >= 0.0);
+        let finite_direction = direction.iter().all(|value| value.is_finite());
+        let finite_half_size = half_size
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0);
+        let direction = normalize_or(direction, [0.0, -1.0, 0.0]);
+        let range = finite_clamp(range, Self::MIN_RANGE, Self::MAX_RANGE, 12.0);
+        let intensity = finite_clamp(intensity, 0.0, Self::MAX_INTENSITY, 0.0);
+        let source_radius = finite_clamp(source_radius, 0.0, range, 0.0);
+
+        (finite_position && finite_color && finite_direction && finite_half_size).then_some(Self {
+            kind,
+            position,
+            color,
+            intensity,
+            range,
+            direction,
+            source_radius,
+            half_size,
+            casts_shadow,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DebugDraw {
     pub show_bounds: bool,
@@ -346,6 +526,7 @@ pub struct FrameSnapshot {
     pub scene: SceneHandle,
     pub views: Vec<ViewPacket>,
     pub lights: Vec<LightPacket>,
+    pub local_lights: Vec<LocalLightPacket>,
     pub render_items: Vec<RenderItemPacket>,
     pub camera_effects: CameraEffects,
     pub debug_draw: DebugDraw,
@@ -365,6 +546,7 @@ pub struct FrameSnapshotBuilder {
     scene: SceneHandle,
     views: Vec<ViewPacket>,
     lights: Vec<LightPacket>,
+    local_lights: Vec<LocalLightPacket>,
     render_items: Vec<RenderItemPacket>,
     camera_effects: CameraEffects,
     debug_draw: DebugDraw,
@@ -386,6 +568,7 @@ impl FrameSnapshotBuilder {
             scene,
             views: Vec::new(),
             lights: Vec::new(),
+            local_lights: Vec::new(),
             render_items: Vec::new(),
             camera_effects: CameraEffects::default(),
             debug_draw: DebugDraw::default(),
@@ -402,6 +585,12 @@ impl FrameSnapshotBuilder {
     /// Adds one light packet to the snapshot.
     pub fn add_light(&mut self, light: LightPacket) -> &mut Self {
         self.lights.push(light);
+        self
+    }
+
+    /// Adds one local point, sphere, or area light to the snapshot.
+    pub fn add_local_light(&mut self, light: LocalLightPacket) -> &mut Self {
+        self.local_lights.push(light);
         self
     }
 
@@ -448,6 +637,7 @@ impl FrameSnapshotBuilder {
             scene: self.scene,
             views: self.views,
             lights: self.lights,
+            local_lights: self.local_lights,
             render_items: self.render_items,
             camera_effects: self.camera_effects,
             debug_draw: self.debug_draw,
@@ -468,6 +658,15 @@ fn mat4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
         }
     }
     out
+}
+
+/// Clamps finite values and substitutes a fallback for invalid inputs.
+fn finite_clamp(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
 }
 
 /// Builds a Vulkan right-handed perspective matrix with NDC depth in 0..1.
@@ -541,6 +740,75 @@ mod tests {
         let result = FrameSnapshotBuilder::new(frame, scene, surface, generation).build();
 
         assert!(matches!(result, Err(SnapshotError::MissingView)));
+    }
+
+    // Verifies that local area lights survive snapshot building as renderer-owned data.
+    #[test]
+    fn snapshot_carries_local_area_lights() {
+        let frame = FrameId::from_raw(1).expect("test frame id is non-zero");
+        let scene = SceneHandle::from_raw(1).expect("test scene handle is non-zero");
+        let surface = SurfaceId::from_raw(1).expect("test surface id is non-zero");
+        let generation = SurfaceGeneration::from_raw(1).expect("test generation is non-zero");
+        let view = ViewId::from_raw(1).expect("test view id is non-zero");
+        let extent = NonZeroExtent::new(640, 360).expect("test extent is non-zero");
+        let light = LocalLightPacket::rectangle(
+            [1.0, 2.0, 3.0],
+            [1.0, 0.7, 0.4],
+            3.0,
+            18.0,
+            [0.0, -1.0, 0.0],
+            [2.0, 0.5],
+        )
+        .expect("area light should be valid");
+        let mut builder = FrameSnapshotBuilder::new(frame, scene, surface, generation);
+
+        builder
+            .add_view(ViewPacket::new(view, extent))
+            .add_local_light(light);
+        let snapshot = builder.build().expect("snapshot has one view");
+
+        assert_eq!(snapshot.local_lights, vec![light]);
+        assert_eq!(snapshot.local_lights[0].kind, LocalLightKind::Rectangle);
+        assert_eq!(snapshot.local_lights[0].source_radius, (4.25_f32).sqrt());
+    }
+
+    // Verifies that spotlights keep their direction and cone falloff values for shaders.
+    #[test]
+    fn local_spot_light_packs_cone_cosines() {
+        let light = LocalLightPacket::spot(
+            [0.0, 1.0, 2.0],
+            [1.0, 0.9, 0.7],
+            2.0,
+            24.0,
+            [0.0, -2.0, 0.0],
+            0.2,
+            0.6,
+        )
+        .expect("spot light should be valid");
+
+        assert_eq!(light.kind, LocalLightKind::Spot);
+        assert_eq!(light.direction, [0.0, -1.0, 0.0]);
+        assert!(light.half_size[0] > light.half_size[1]);
+        assert!((light.half_size[0] - 0.2_f32.cos()).abs() < 0.0001);
+        assert!((light.half_size[1] - 0.6_f32.cos()).abs() < 0.0001);
+    }
+
+    // Verifies that invalid local-light values are rejected at the protocol edge.
+    #[test]
+    fn local_light_rejects_invalid_values() {
+        assert!(LocalLightPacket::point([f32::NAN, 0.0, 0.0], [1.0; 3], 1.0, 4.0).is_none());
+        assert!(LocalLightPacket::point([0.0; 3], [-1.0, 0.0, 0.0], 1.0, 4.0).is_none());
+        assert!(
+            LocalLightPacket::rectangle(
+                [0.0; 3],
+                [1.0; 3],
+                1.0,
+                4.0,
+                [0.0, -1.0, 0.0],
+                [1.0, f32::NAN],
+            )
+            .is_none()
+        );
     }
 
     // Verifies that camera effect values crossing the renderer boundary are constrained.

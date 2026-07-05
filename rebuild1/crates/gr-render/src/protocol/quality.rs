@@ -5,6 +5,7 @@ pub struct RenderQualitySettings {
     anti_aliasing: AntiAliasingQualitySettings,
     shadow_softening: ShadowSofteningQualitySettings,
     contact_shadow: ContactShadowQualitySettings,
+    bloom: BloomQualitySettings,
     post: PostQualitySettings,
 }
 
@@ -16,6 +17,7 @@ impl RenderQualitySettings {
         anti_aliasing: AntiAliasingQualitySettings,
         shadow_softening: ShadowSofteningQualitySettings,
         contact_shadow: ContactShadowQualitySettings,
+        bloom: BloomQualitySettings,
         post: PostQualitySettings,
     ) -> Self {
         Self {
@@ -24,6 +26,7 @@ impl RenderQualitySettings {
             anti_aliasing,
             shadow_softening,
             contact_shadow,
+            bloom,
             post,
         }
     }
@@ -67,6 +70,7 @@ impl RenderQualitySettings {
             anti_aliasing,
             shadow_softening,
             ContactShadowQualitySettings::balanced(),
+            BloomQualitySettings::balanced(),
             post,
         )
     }
@@ -85,6 +89,7 @@ impl RenderQualitySettings {
             anti_aliasing,
             ShadowSofteningQualitySettings::balanced(),
             contact_shadow,
+            BloomQualitySettings::balanced(),
             post,
         )
     }
@@ -97,6 +102,7 @@ impl RenderQualitySettings {
             AntiAliasingQualitySettings::disabled(),
             ShadowSofteningQualitySettings::disabled(),
             ContactShadowQualitySettings::disabled(),
+            BloomQualitySettings::disabled(),
             PostQualitySettings::natural(),
         )
     }
@@ -109,6 +115,7 @@ impl RenderQualitySettings {
             AntiAliasingQualitySettings::interactive(),
             ShadowSofteningQualitySettings::interactive(),
             ContactShadowQualitySettings::interactive(),
+            BloomQualitySettings::interactive(),
             PostQualitySettings::natural(),
         )
     }
@@ -121,6 +128,7 @@ impl RenderQualitySettings {
             AntiAliasingQualitySettings::balanced(),
             ShadowSofteningQualitySettings::balanced(),
             ContactShadowQualitySettings::balanced(),
+            BloomQualitySettings::balanced(),
             PostQualitySettings::natural(),
         )
     }
@@ -133,6 +141,7 @@ impl RenderQualitySettings {
             AntiAliasingQualitySettings::high_quality(),
             ShadowSofteningQualitySettings::high_quality(),
             ContactShadowQualitySettings::high_quality(),
+            BloomQualitySettings::high_quality(),
             PostQualitySettings::natural(),
         )
     }
@@ -155,6 +164,12 @@ impl RenderQualitySettings {
     /// Returns a copy with a different screen-space contact shadow profile.
     pub fn with_contact_shadow(mut self, contact_shadow: ContactShadowQualitySettings) -> Self {
         self.contact_shadow = contact_shadow;
+        self
+    }
+
+    /// Returns a copy with a different bloom profile.
+    pub fn with_bloom(mut self, bloom: BloomQualitySettings) -> Self {
+        self.bloom = bloom;
         self
     }
 
@@ -181,6 +196,11 @@ impl RenderQualitySettings {
     /// Returns the screen-space contact shadow quality applied by the post pass.
     pub fn contact_shadow(self) -> ContactShadowQualitySettings {
         self.contact_shadow
+    }
+
+    /// Returns the bloom quality applied by the post pass.
+    pub fn bloom(self) -> BloomQualitySettings {
+        self.bloom
     }
 
     /// Returns the final look multipliers applied after app-side camera effects.
@@ -510,6 +530,75 @@ impl AntiAliasingQualitySettings {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BloomQualitySettings {
+    intensity: f32,
+    threshold: f32,
+    radius_pixels: f32,
+    god_rays_intensity: f32,
+}
+
+impl BloomQualitySettings {
+    /// Creates bounded controls for the post-pass bloom and god rays.
+    ///
+    /// `intensity` controls the broad glow, `threshold` selects HDR highlights,
+    /// `radius_pixels` controls how far bloom taps spread, and
+    /// `god_rays_intensity` controls screen-space volumetric rays from visible light sources.
+    pub fn new(
+        intensity: f32,
+        threshold: f32,
+        radius_pixels: f32,
+        god_rays_intensity: f32,
+    ) -> Self {
+        Self {
+            intensity: finite_clamp(intensity, 0.0, 2.0, 0.0),
+            threshold: finite_clamp(threshold, 0.2, 8.0, 1.1),
+            radius_pixels: finite_clamp(radius_pixels, 0.5, 32.0, 8.0),
+            god_rays_intensity: finite_clamp(god_rays_intensity, 0.0, 1.0, 0.0),
+        }
+    }
+
+    /// Disables bloom and god rays so the post shader can skip the taps.
+    pub fn disabled() -> Self {
+        Self::new(0.0, 1.50, 1.0, 0.0)
+    }
+
+    /// Returns a subtle bloom profile for normal camera movement.
+    pub fn interactive() -> Self {
+        Self::new(0.025, 1.55, 6.0, 0.12)
+    }
+
+    /// Returns a visible bloom profile for regular rendering.
+    pub fn balanced() -> Self {
+        Self::new(0.060, 1.38, 13.0, 0.28)
+    }
+
+    /// Returns a stronger profile intended for visual inspection.
+    pub fn high_quality() -> Self {
+        Self::new(0.095, 1.24, 22.0, 0.44)
+    }
+
+    /// Returns the broad glow contribution.
+    pub fn intensity(self) -> f32 {
+        self.intensity
+    }
+
+    /// Returns the HDR luminance threshold used by bright-pass extraction.
+    pub fn threshold(self) -> f32 {
+        self.threshold
+    }
+
+    /// Returns the post-process sampling radius in screen pixels.
+    pub fn radius_pixels(self) -> f32 {
+        self.radius_pixels
+    }
+
+    /// Returns the screen-space volumetric ray contribution.
+    pub fn god_rays_intensity(self) -> f32 {
+        self.god_rays_intensity
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PostQualitySettings {
     contrast: f32,
     saturation: f32,
@@ -566,6 +655,7 @@ mod tests {
         assert_eq!(settings.anti_aliasing().blend(), 1.0);
         assert!(settings.shadow_softening().radius_pixels().is_finite());
         assert!(settings.contact_shadow().max_distance().is_finite());
+        assert!(settings.bloom().threshold().is_finite());
         assert!(settings.post().contrast().is_finite());
     }
 
@@ -578,6 +668,8 @@ mod tests {
         assert_eq!(settings.anti_aliasing().blend(), 0.0);
         assert_eq!(settings.shadow_softening().intensity(), 0.0);
         assert_eq!(settings.contact_shadow().intensity(), 0.0);
+        assert_eq!(settings.bloom().intensity(), 0.0);
+        assert_eq!(settings.bloom().god_rays_intensity(), 0.0);
     }
 
     #[test]
@@ -611,6 +703,16 @@ mod tests {
     }
 
     #[test]
+    fn bloom_settings_bound_post_work() {
+        let settings = BloomQualitySettings::new(5.0, f32::INFINITY, -1.0, 5.0);
+
+        assert_eq!(settings.intensity(), 2.0);
+        assert!(settings.threshold().is_finite());
+        assert_eq!(settings.radius_pixels(), 0.5);
+        assert_eq!(settings.god_rays_intensity(), 1.0);
+    }
+
+    #[test]
     fn default_visual_profiles_enable_contact_shadows() {
         assert!(
             RenderQualitySettings::interactive()
@@ -628,6 +730,19 @@ mod tests {
             RenderQualitySettings::high_quality()
                 .contact_shadow()
                 .intensity()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn default_visual_profiles_enable_bloom() {
+        assert!(RenderQualitySettings::interactive().bloom().intensity() > 0.0);
+        assert!(RenderQualitySettings::balanced().bloom().intensity() > 0.0);
+        assert!(RenderQualitySettings::high_quality().bloom().intensity() > 0.0);
+        assert!(
+            RenderQualitySettings::high_quality()
+                .bloom()
+                .god_rays_intensity()
                 > 0.0
         );
     }
@@ -657,5 +772,12 @@ mod tests {
             interactive.contact_shadow().sample_count() < balanced.contact_shadow().sample_count()
         );
         assert!(balanced.contact_shadow().sample_count() < high.contact_shadow().sample_count());
+
+        assert!(interactive.bloom().intensity() < balanced.bloom().intensity());
+        assert!(balanced.bloom().intensity() < high.bloom().intensity());
+        assert!(interactive.bloom().radius_pixels() < balanced.bloom().radius_pixels());
+        assert!(balanced.bloom().radius_pixels() < high.bloom().radius_pixels());
+        assert!(interactive.bloom().god_rays_intensity() < balanced.bloom().god_rays_intensity());
+        assert!(balanced.bloom().god_rays_intensity() < high.bloom().god_rays_intensity());
     }
 }

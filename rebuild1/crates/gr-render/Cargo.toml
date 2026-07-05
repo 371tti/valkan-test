@@ -8,7 +8,7 @@ name = "gr_render"
 
 [dependencies]
 ash = "0.38.0"
-gltf = { version = "1.4", features = ["import", "KHR_materials_emissive_strength"] }
+gltf = { version = "1.4", features = ["import", "KHR_materials_emissive_strength", "KHR_lights_punctual"] }
 meshopt = "0.6.2"
 raw-window-handle = "0.6"
 thiserror = "2"

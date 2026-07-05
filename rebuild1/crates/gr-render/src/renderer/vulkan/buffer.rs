@@ -2,7 +2,7 @@ use std::mem::size_of_val;
 
 use ash::{Device, Instance, vk};
 
-use super::VulkanError;
+use super::{VulkanError, immediate::submit_immediate_commands};
 
 pub(super) struct GpuBuffer {
     buffer: vk::Buffer,
@@ -60,21 +60,63 @@ pub(super) fn create_buffer_with_data<T: Copy>(
     values: &[T],
 ) -> Result<GpuBuffer, VulkanError> {
     let size = size_of_val(values) as vk::DeviceSize;
-    let buffer = create_buffer(device, size, usage)?;
-    let memory = match allocate_buffer_memory(device, memory_properties, buffer) {
-        Ok(memory) => memory,
+    let gpu_buffer = create_buffer_with_properties(
+        device,
+        memory_properties,
+        usage,
+        size,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    write_buffer_slice(device, &gpu_buffer, values)?;
+    Ok(gpu_buffer)
+}
+
+/// Creates one device-local buffer and uploads typed data through a short-lived staging buffer.
+pub(super) fn create_device_local_buffer_with_data<T: Copy>(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue_family_index: u32,
+    queue: vk::Queue,
+    usage: vk::BufferUsageFlags,
+    values: &[T],
+) -> Result<GpuBuffer, VulkanError> {
+    let size = size_of_val(values) as vk::DeviceSize;
+    let staging = create_buffer_with_data(
+        device,
+        memory_properties,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        values,
+    )?;
+    let device_buffer = match create_buffer_with_properties(
+        device,
+        memory_properties,
+        usage | vk::BufferUsageFlags::TRANSFER_DST,
+        size,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) {
+        Ok(buffer) => buffer,
         Err(error) => {
-            destroy_buffer(device, buffer);
+            staging.destroy(device);
             return Err(error);
         }
     };
 
-    // Safety: the buffer and allocation were created by this device and the allocation satisfies
-    // the memory requirements returned for the buffer.
-    unsafe { device.bind_buffer_memory(buffer, memory, 0) }.map_err(VulkanError::Vk)?;
-    let gpu_buffer = GpuBuffer { buffer, memory };
-    write_buffer_slice(device, &gpu_buffer, values)?;
-    Ok(gpu_buffer)
+    let upload_result = upload_buffer_copy(
+        device,
+        queue_family_index,
+        queue,
+        staging.handle(),
+        device_buffer.handle(),
+        size,
+        usage,
+    );
+    staging.destroy(device);
+    if let Err(error) = upload_result {
+        device_buffer.destroy(device);
+        return Err(error);
+    }
+
+    Ok(device_buffer)
 }
 
 /// Creates one host-visible coherent buffer with explicit usage and byte size.
@@ -84,18 +126,13 @@ pub(super) fn create_host_buffer(
     usage: vk::BufferUsageFlags,
     size: vk::DeviceSize,
 ) -> Result<GpuBuffer, VulkanError> {
-    let buffer = create_buffer(device, size, usage)?;
-    let memory = match allocate_buffer_memory(device, memory_properties, buffer) {
-        Ok(memory) => memory,
-        Err(error) => {
-            destroy_buffer(device, buffer);
-            return Err(error);
-        }
-    };
-
-    // Safety: the selected allocation type satisfies the buffer requirements.
-    unsafe { device.bind_buffer_memory(buffer, memory, 0) }.map_err(VulkanError::Vk)?;
-    Ok(GpuBuffer { buffer, memory })
+    create_buffer_with_properties(
+        device,
+        memory_properties,
+        usage,
+        size,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
 }
 
 /// Copies one typed value into a host-visible coherent buffer allocation.
@@ -129,19 +166,39 @@ fn create_buffer(
     unsafe { device.create_buffer(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
-/// Allocates host-visible memory compatible with one Vulkan buffer.
+/// Creates one buffer and binds memory with explicit placement requirements.
+fn create_buffer_with_properties(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    usage: vk::BufferUsageFlags,
+    size: vk::DeviceSize,
+    properties: vk::MemoryPropertyFlags,
+) -> Result<GpuBuffer, VulkanError> {
+    let buffer = create_buffer(device, size, usage)?;
+    let memory = match allocate_buffer_memory(device, memory_properties, buffer, properties) {
+        Ok(memory) => memory,
+        Err(error) => {
+            destroy_buffer(device, buffer);
+            return Err(error);
+        }
+    };
+
+    // Safety: the selected allocation type satisfies the buffer requirements.
+    unsafe { device.bind_buffer_memory(buffer, memory, 0) }.map_err(VulkanError::Vk)?;
+    Ok(GpuBuffer { buffer, memory })
+}
+
+/// Allocates memory compatible with one Vulkan buffer and requested placement.
 fn allocate_buffer_memory(
     device: &Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     buffer: vk::Buffer,
+    properties: vk::MemoryPropertyFlags,
 ) -> Result<vk::DeviceMemory, VulkanError> {
     // Safety: the buffer was created by this device.
     let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-    let memory_type_index = find_memory_type(
-        memory_properties,
-        requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
+    let memory_type_index =
+        find_memory_type(memory_properties, requirements.memory_type_bits, properties)?;
     let allocate_info = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(memory_type_index);
@@ -166,6 +223,101 @@ pub(super) fn find_memory_type(
     }
 
     Err(VulkanError::MemoryTypeUnavailable)
+}
+
+/// Copies one staging buffer into a device-local buffer and makes it visible to draw commands.
+fn upload_buffer_copy(
+    device: &Device,
+    queue_family_index: u32,
+    queue: vk::Queue,
+    source: vk::Buffer,
+    destination: vk::Buffer,
+    size: vk::DeviceSize,
+    final_usage: vk::BufferUsageFlags,
+) -> Result<(), VulkanError> {
+    submit_immediate_commands(device, queue_family_index, queue, |command_buffer| {
+        copy_buffer(device, command_buffer, source, destination, size);
+        transition_uploaded_buffer(device, command_buffer, destination, size, final_usage);
+    })
+}
+
+/// Records one full-buffer copy for setup-time uploads.
+fn copy_buffer(
+    device: &Device,
+    command_buffer: vk::CommandBuffer,
+    source: vk::Buffer,
+    destination: vk::Buffer,
+    size: vk::DeviceSize,
+) {
+    let regions = [vk::BufferCopy::default().size(size)];
+
+    // Safety: the command buffer is recording and both buffers are alive on this device.
+    unsafe {
+        device.cmd_copy_buffer(command_buffer, source, destination, &regions);
+    }
+}
+
+/// Makes uploaded buffer data visible to the pipeline stages that will consume it.
+fn transition_uploaded_buffer(
+    device: &Device,
+    command_buffer: vk::CommandBuffer,
+    buffer: vk::Buffer,
+    size: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) {
+    let (dst_stage, dst_access) = buffer_read_stage_access(usage);
+    let barrier = vk::BufferMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(dst_access)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(buffer)
+        .offset(0)
+        .size(size);
+    let barriers = [barrier];
+
+    // Safety: the command buffer is recording and the buffer belongs to this device.
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &barriers,
+            &[],
+        );
+    }
+}
+
+/// Returns conservative shader/draw read masks for a freshly uploaded static buffer.
+fn buffer_read_stage_access(
+    usage: vk::BufferUsageFlags,
+) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+    let mut stages = vk::PipelineStageFlags::empty();
+    let mut access = vk::AccessFlags::empty();
+
+    if usage.contains(vk::BufferUsageFlags::VERTEX_BUFFER) {
+        stages |= vk::PipelineStageFlags::VERTEX_INPUT;
+        access |= vk::AccessFlags::VERTEX_ATTRIBUTE_READ;
+    }
+    if usage.contains(vk::BufferUsageFlags::INDEX_BUFFER) {
+        stages |= vk::PipelineStageFlags::VERTEX_INPUT;
+        access |= vk::AccessFlags::INDEX_READ;
+    }
+    if usage.contains(vk::BufferUsageFlags::UNIFORM_BUFFER) {
+        stages |= vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER;
+        access |= vk::AccessFlags::UNIFORM_READ;
+    }
+
+    if stages.is_empty() || access.is_empty() {
+        (
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::AccessFlags::MEMORY_READ,
+        )
+    } else {
+        (stages, access)
+    }
 }
 
 /// Copies one typed slice into a host-visible coherent buffer allocation.

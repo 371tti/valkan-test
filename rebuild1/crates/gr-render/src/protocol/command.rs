@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use super::{
-    FrameId, FrameSnapshot, FramebufferReadback, FramebufferReadbackOptions, MaterialHandle,
-    MeshHandle, MessageEnvelope, NativeSurfacePlatform, NonZeroExtent, RenderQualitySettings,
-    RequestId, SceneHandle, SurfaceDescriptor, SurfaceGeneration, SurfaceId, TextureHandle,
+    FrameId, FrameSnapshot, FramebufferReadback, FramebufferReadbackOptions, LocalLightPacket,
+    MaterialHandle, MeshHandle, MessageEnvelope, NativeSurfacePlatform, NonZeroExtent,
+    RenderQualitySettings, RequestId, SceneHandle, SurfaceDescriptor, SurfaceGeneration, SurfaceId,
+    TextureHandle,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -83,6 +84,7 @@ pub struct LoadedAsset {
     pub meshes: Vec<MeshHandle>,
     pub materials: Vec<MaterialHandle>,
     pub textures: Vec<TextureHandle>,
+    pub local_lights: Vec<LocalLightPacket>,
     pub bounds: Option<SceneBounds>,
 }
 
@@ -93,6 +95,7 @@ impl LoadedAsset {
         meshes: Vec<MeshHandle>,
         materials: Vec<MaterialHandle>,
         textures: Vec<TextureHandle>,
+        local_lights: Vec<LocalLightPacket>,
         bounds: Option<SceneBounds>,
     ) -> Self {
         Self {
@@ -100,6 +103,7 @@ impl LoadedAsset {
             meshes,
             materials,
             textures,
+            local_lights,
             bounds,
         }
     }

@@ -71,12 +71,20 @@ float screen_space_ao(vec2 uv, SurfaceMaterial material) {
             continue;
         }
 
+        total += 1.0;
         float closer = step(sample_z + bias, view_z);
+        if (closer <= 0.0) {
+            continue;
+        }
+
         float range = 1.0 - smoothstep(inner_radius_sq, radius_sq, distance_sq);
+        if (range <= 0.0) {
+            continue;
+        }
+
         float facing = saturate(dot(material.normal, delta) * inversesqrt(distance_sq));
 
-        occlusion += closer * range * facing;
-        total += 1.0;
+        occlusion += range * facing;
     }
 
     if (total <= 0.0) {

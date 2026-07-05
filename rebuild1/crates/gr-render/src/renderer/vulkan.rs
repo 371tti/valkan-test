@@ -1,6 +1,8 @@
+mod bloom;
 mod buffer;
 mod debug;
 mod frame;
+mod god_rays;
 mod immediate;
 mod lod;
 mod material;
@@ -131,7 +133,18 @@ impl RendererBackend for VulkanRendererBackend {
                 }
                 RendererCommand::SubmitFrame { snapshot } => {
                     let frame_id = snapshot.frame_id;
-                    match context.present_frame(snapshot)? {
+                    let result = match context.present_frame(snapshot) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            tracing::error!(
+                                frame_id = frame_id.raw(),
+                                error = %error,
+                                "Vulkan frame presentation failed"
+                            );
+                            return Err(error.into());
+                        }
+                    };
+                    match result {
                         FramePresentResult::Presented { readback } => {
                             if let Some(readback) = readback {
                                 let readback_frame_id = readback.frame_id;
@@ -804,6 +817,8 @@ impl VulkanDevice {
             instance,
             &self.device,
             self.physical_device,
+            self.queue_family_index,
+            self.graphics_queue,
             handles,
             meshes,
         )?;
@@ -841,6 +856,8 @@ impl VulkanDevice {
         self.materials.upload_imported_materials(
             &self.device,
             &self.memory_properties,
+            self.queue_family_index,
+            self.graphics_queue,
             materials,
         )?;
         self.shadow_cache.invalidate();

@@ -5,6 +5,7 @@ layout(location = 1) in vec3 frag_normal;
 layout(location = 3) in vec4 frag_color;
 layout(location = 5) in vec4 frag_shadow_pos[4];
 layout(location = 9) in vec3 frag_world_pos;
+layout(location = 10) in float frag_view_depth;
 layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform FrameCamera {
@@ -19,11 +20,13 @@ layout(set = 0, binding = 0) uniform FrameCamera {
     vec4 light_color;
     vec4 ambient_color;
     vec4 contact_shadow;
+    mat4 local_shadow_view_proj[24];
+    vec4 local_shadow_params[4];
     vec4 emissive_light_position_radius[4];
     vec4 emissive_light_color[4];
+    vec4 emissive_light_direction_radius[4];
+    vec4 emissive_light_size_kind[4];
     vec4 emissive_light_count;
-    vec4 local_shadow_caster_center_radius[8];
-    vec4 local_shadow_caster_count;
 } frame_camera;
 
 layout(set = 1, binding = 0) uniform MaterialParams {
@@ -45,6 +48,7 @@ layout(set = 2, binding = 8) uniform sampler2D raw_shadow_cascade_0;
 layout(set = 2, binding = 9) uniform sampler2D raw_shadow_cascade_1;
 layout(set = 2, binding = 10) uniform sampler2D raw_shadow_cascade_2;
 layout(set = 2, binding = 11) uniform sampler2D raw_shadow_cascade_3;
+layout(set = 2, binding = 12) uniform samplerCube local_shadow_depth[4];
 
 #include "shadow_sampling.glsl"
 #include "pbr_lighting.glsl"

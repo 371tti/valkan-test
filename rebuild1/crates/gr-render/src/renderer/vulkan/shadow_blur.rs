@@ -2,8 +2,6 @@ use std::{ffi::CStr, io::Cursor, mem::size_of};
 
 use ash::{Device, util, vk};
 
-use crate::renderer::graph::SHADOW_CASCADE_COUNT;
-
 use super::VulkanError;
 
 const SHADER_ENTRY: &CStr = c"main";
@@ -17,8 +15,8 @@ pub(super) struct ShadowMomentBlurPipeline {
     pipeline_layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    horizontal_sets: [vk::DescriptorSet; SHADOW_CASCADE_COUNT],
-    vertical_sets: [vk::DescriptorSet; SHADOW_CASCADE_COUNT],
+    horizontal_sets: Vec<vk::DescriptorSet>,
+    vertical_sets: Vec<vk::DescriptorSet>,
     sampler: vk::Sampler,
 }
 
@@ -28,8 +26,8 @@ struct ShadowMomentBlurBuild<'a> {
     pipeline_layout: Option<vk::PipelineLayout>,
     set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
-    horizontal_sets: Option<[vk::DescriptorSet; SHADOW_CASCADE_COUNT]>,
-    vertical_sets: Option<[vk::DescriptorSet; SHADOW_CASCADE_COUNT]>,
+    horizontal_sets: Option<Vec<vk::DescriptorSet>>,
+    vertical_sets: Option<Vec<vk::DescriptorSet>>,
     sampler: Option<vk::Sampler>,
     finished: bool,
 }
@@ -114,9 +112,14 @@ impl ShadowMomentBlurPipeline {
     pub(super) fn create(
         device: &Device,
         render_pass: vk::RenderPass,
-        horizontal_source_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
-        vertical_source_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+        horizontal_source_views: &[vk::ImageView],
+        vertical_source_views: &[vk::ImageView],
     ) -> Result<Self, VulkanError> {
+        assert_eq!(
+            horizontal_source_views.len(),
+            vertical_source_views.len(),
+            "shadow blur source counts must match"
+        );
         let mut build = ShadowMomentBlurBuild::new(device);
         build.set_layout = Some(create_set_layout(device)?);
         build.pipeline_layout = Some(create_pipeline_layout(
@@ -124,11 +127,15 @@ impl ShadowMomentBlurPipeline {
             expect_created(build.set_layout, "shadow blur descriptor set layout"),
         )?);
         build.sampler = Some(create_sampler(device)?);
-        build.descriptor_pool = Some(create_descriptor_pool(device)?);
+        build.descriptor_pool = Some(create_descriptor_pool(
+            device,
+            horizontal_source_views.len(),
+        )?);
         let sets = allocate_descriptor_sets(
             device,
             expect_created(build.descriptor_pool, "shadow blur descriptor pool"),
             expect_created(build.set_layout, "shadow blur descriptor set layout"),
+            horizontal_source_views.len(),
         )?;
         build.horizontal_sets = Some(sets.0);
         build.vertical_sets = Some(sets.1);
@@ -136,9 +143,11 @@ impl ShadowMomentBlurPipeline {
             device,
             build
                 .horizontal_sets
+                .as_ref()
                 .expect("horizontal descriptor sets were created"),
             build
                 .vertical_sets
+                .as_ref()
                 .expect("vertical descriptor sets were created"),
             horizontal_source_views,
             vertical_source_views,
@@ -258,7 +267,11 @@ impl ShadowMomentBlurPipeline {
 
 /// Uses a mild cascade-scaled blur so far cascades avoid blocky moment edges.
 fn cascade_blur_radius(cascade_index: usize) -> f32 {
-    [1.0, 1.15, 1.35, 1.6][cascade_index.min(SHADOW_CASCADE_COUNT - 1)]
+    if cascade_index > 3 {
+        1.0
+    } else {
+        [1.0, 1.15, 1.35, 1.6][cascade_index]
+    }
 }
 
 /// Creates the sampled-image descriptor layout for one blur source texture.
@@ -308,13 +321,16 @@ fn create_sampler(device: &Device) -> Result<vk::Sampler, VulkanError> {
 }
 
 /// Allocates descriptor storage for horizontal and vertical blur source images.
-fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, VulkanError> {
+fn create_descriptor_pool(
+    device: &Device,
+    map_count: usize,
+) -> Result<vk::DescriptorPool, VulkanError> {
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count((SHADOW_CASCADE_COUNT * 2) as u32);
+        .descriptor_count((map_count * 2) as u32);
     let pool_sizes = [pool_size];
     let create_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets((SHADOW_CASCADE_COUNT * 2) as u32)
+        .max_sets((map_count * 2) as u32)
         .pool_sizes(&pool_sizes);
 
     unsafe { device.create_descriptor_pool(&create_info, None) }.map_err(VulkanError::Vk)
@@ -325,52 +341,47 @@ fn allocate_descriptor_sets(
     device: &Device,
     descriptor_pool: vk::DescriptorPool,
     set_layout: vk::DescriptorSetLayout,
-) -> Result<
-    (
-        [vk::DescriptorSet; SHADOW_CASCADE_COUNT],
-        [vk::DescriptorSet; SHADOW_CASCADE_COUNT],
-    ),
-    VulkanError,
-> {
-    let layouts = vec![set_layout; SHADOW_CASCADE_COUNT * 2];
+    map_count: usize,
+) -> Result<(Vec<vk::DescriptorSet>, Vec<vk::DescriptorSet>), VulkanError> {
+    let layouts = vec![set_layout; map_count * 2];
     let allocate_info = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(descriptor_pool)
         .set_layouts(&layouts);
     let sets =
         unsafe { device.allocate_descriptor_sets(&allocate_info) }.map_err(VulkanError::Vk)?;
-    let horizontal_sets = descriptor_array(&sets[..SHADOW_CASCADE_COUNT]);
-    let vertical_sets = descriptor_array(&sets[SHADOW_CASCADE_COUNT..]);
+    let horizontal_sets = sets[..map_count].to_vec();
+    let vertical_sets = sets[map_count..].to_vec();
 
     Ok((horizontal_sets, vertical_sets))
-}
-
-/// Copies a fixed-size descriptor slice into the cascade array type.
-fn descriptor_array(slice: &[vk::DescriptorSet]) -> [vk::DescriptorSet; SHADOW_CASCADE_COUNT] {
-    std::array::from_fn(|index| slice[index])
 }
 
 /// Writes source moment maps into every blur descriptor set.
 fn update_descriptor_sets(
     device: &Device,
-    horizontal_sets: [vk::DescriptorSet; SHADOW_CASCADE_COUNT],
-    vertical_sets: [vk::DescriptorSet; SHADOW_CASCADE_COUNT],
-    horizontal_source_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
-    vertical_source_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+    horizontal_sets: &[vk::DescriptorSet],
+    vertical_sets: &[vk::DescriptorSet],
+    horizontal_source_views: &[vk::ImageView],
+    vertical_source_views: &[vk::ImageView],
     sampler: vk::Sampler,
 ) {
-    let mut image_infos = Vec::with_capacity(SHADOW_CASCADE_COUNT * 2);
+    let mut image_infos = Vec::with_capacity(horizontal_source_views.len() * 2);
     for view in horizontal_source_views
-        .into_iter()
-        .chain(vertical_source_views)
+        .iter()
+        .copied()
+        .chain(vertical_source_views.iter().copied())
     {
         image_infos.push(descriptor_image_info(sampler, view));
     }
 
-    let mut writes = Vec::with_capacity(SHADOW_CASCADE_COUNT * 2);
-    for (index, set) in horizontal_sets.into_iter().chain(vertical_sets).enumerate() {
+    let mut writes = Vec::with_capacity(horizontal_source_views.len() * 2);
+    for (index, set) in horizontal_sets
+        .iter()
+        .chain(vertical_sets.iter())
+        .enumerate()
+    {
         writes.push(
             vk::WriteDescriptorSet::default()
-                .dst_set(set)
+                .dst_set(*set)
                 .dst_binding(SOURCE_MOMENTS_BINDING)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&image_infos[index..index + 1]),

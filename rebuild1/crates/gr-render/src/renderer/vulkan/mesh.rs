@@ -27,13 +27,15 @@ use crate::{
 use super::{
     VulkanError,
     buffer::{
-        GpuBuffer, create_buffer_with_data, destroy_buffers, memory_properties, write_buffer_value,
+        GpuBuffer, create_buffer_with_data, create_device_local_buffer_with_data, destroy_buffers,
+        memory_properties, write_buffer_value,
     },
     lod::unique_lod_indices,
-    material::VulkanMaterialStore,
 };
 
 const SHADER_ENTRY: &CStr = c"main";
+const UNTEXTURED_VERTEX_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mesh_untextured.vert.spv"));
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
 const SCENE_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mesh_scene.frag.spv"));
@@ -49,6 +51,10 @@ const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sh
 const SHADOW_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
 const SHADOW_TEXTURED_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/shadow_textured.frag.spv"));
+const SHADOW_DEPTH_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth.frag.spv"));
+const SHADOW_DEPTH_TEXTURED_FRAGMENT_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth_textured.frag.spv"));
 const SHADOW_TRANSLUCENT_FRAGMENT_SHADER: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/shadow_translucent.frag.spv"));
 const SHADOW_TRANSLUCENT_TEXTURED_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(
@@ -58,8 +64,9 @@ const SHADOW_TRANSLUCENT_TEXTURED_FRAGMENT_SHADER: &[u8] = include_bytes!(concat
 const MESH_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
 const SHADOW_DEPTH_BIAS_CONSTANT: f32 = 0.35;
 const SHADOW_DEPTH_BIAS_SLOPE: f32 = 0.65;
-pub(super) const MAX_EMISSIVE_LIGHTS: usize = 4;
-pub(super) const MAX_LOCAL_SHADOW_CASTERS: usize = 8;
+pub(super) const MAX_LOCAL_LIGHTS: usize = 4;
+pub(super) const LOCAL_SHADOW_FACE_COUNT: usize = 6;
+pub(super) const LOCAL_SHADOW_MATRIX_COUNT: usize = MAX_LOCAL_LIGHTS * LOCAL_SHADOW_FACE_COUNT;
 
 pub(super) struct VulkanMeshStore {
     meshes: BTreeMap<MeshHandle, VulkanMesh>,
@@ -111,6 +118,7 @@ pub(super) struct MeshPassResources {
     descriptor_set: vk::DescriptorSet,
     shadow_sampler: vk::Sampler,
     transmittance_sampler: vk::Sampler,
+    local_shadow_sampler: vk::Sampler,
 }
 
 #[derive(Clone, Copy)]
@@ -264,6 +272,8 @@ impl VulkanMeshStore {
         instance: &Instance,
         device: &Device,
         physical_device: vk::PhysicalDevice,
+        queue_family_index: u32,
+        queue: vk::Queue,
         handles: &[MeshHandle],
         meshes: &[ImportedMesh],
     ) -> Result<(), VulkanError> {
@@ -275,7 +285,13 @@ impl VulkanMeshStore {
 
         for (handle, mesh) in handles.iter().copied().zip(meshes.iter()) {
             let geometry = MeshGeometry::from_imported(mesh);
-            let uploaded = VulkanMesh::upload(device, &memory_properties, &geometry)?;
+            let uploaded = VulkanMesh::upload(
+                device,
+                &memory_properties,
+                queue_family_index,
+                queue,
+                &geometry,
+            )?;
             total_vertices += geometry.vertex_count();
             total_source_indices += geometry.index_count();
             total_lod_buffers += uploaded.lods.len();
@@ -384,6 +400,24 @@ impl VulkanMeshStore {
         Ok(pipelines)
     }
 
+    /// Creates depth-only cubemap pipelines for point/local light shadow faces.
+    pub(super) fn create_local_shadow_pipeline_set(
+        &self,
+        device: &Device,
+        render_pass: vk::RenderPass,
+    ) -> Result<MeshPipelineSet, VulkanError> {
+        let pipelines = self.create_pipeline_set(
+            device,
+            render_pass,
+            SHADOW_VERTEX_SHADER,
+            SHADOW_DEPTH_FRAGMENT_SHADER,
+            SHADOW_DEPTH_TEXTURED_FRAGMENT_SHADER,
+            MeshPipelineTarget::LocalShadowDepth,
+        )?;
+        tracing::info!("created Vulkan local shadow cubemap mesh pipelines");
+        Ok(pipelines)
+    }
+
     /// Creates multiplicative-transmittance pipelines for transparent shadow casters.
     pub(super) fn create_translucent_shadow_pipeline_set(
         &self,
@@ -412,12 +446,28 @@ impl VulkanMeshStore {
         textured_fragment: &[u8],
         target: MeshPipelineTarget,
     ) -> Result<MeshPipelineSet, VulkanError> {
+        let untextured_vertex_shader = if target.uses_surface_normal() {
+            UNTEXTURED_VERTEX_SHADER
+        } else {
+            vertex_shader
+        };
+        let untextured_vertex_layout = if target.uses_surface_normal() {
+            MeshVertexLayout::SceneUntextured
+        } else {
+            MeshVertexLayout::Shadow
+        };
+        let textured_vertex_layout = if target.uses_surface_normal() {
+            MeshVertexLayout::SceneTextured
+        } else {
+            MeshVertexLayout::Shadow
+        };
         let untextured = create_mesh_pipeline_variants(
             device,
             self.pipeline_layout,
             render_pass,
-            vertex_shader,
+            untextured_vertex_shader,
             untextured_fragment,
+            untextured_vertex_layout,
             target,
         )?;
         let textured = match create_mesh_pipeline_variants(
@@ -426,6 +476,7 @@ impl VulkanMeshStore {
             render_pass,
             vertex_shader,
             textured_fragment,
+            textured_vertex_layout,
             target,
         ) {
             Ok(pipeline) => pipeline,
@@ -448,6 +499,7 @@ impl VulkanMeshStore {
         shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
         raw_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
         translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+        local_shadow_views: [vk::ImageView; MAX_LOCAL_LIGHTS],
     ) -> Result<MeshPassResources, VulkanError> {
         MeshPassResources::create(
             device,
@@ -455,6 +507,7 @@ impl VulkanMeshStore {
             shadow_views,
             raw_shadow_views,
             translucent_shadow_views,
+            local_shadow_views,
         )
     }
 
@@ -534,10 +587,10 @@ impl VulkanMeshStore {
         device: &Device,
         command_buffer: vk::CommandBuffer,
         pipeline_set: MeshPipelineSet,
-        materials: &VulkanMaterialStore,
         pass_resources: Option<&MeshPassResources>,
         frame_slot: usize,
         item: &RenderItemPacket,
+        material_descriptor_set: vk::DescriptorSet,
         options: MeshDrawOptions,
         pipeline_key: MeshPipelineKey,
         state: &mut MeshDrawState,
@@ -560,14 +613,6 @@ impl VulkanMeshStore {
             return Ok(false);
         };
         let Some(lod) = mesh.visible_lod(item, options) else {
-            return Ok(false);
-        };
-        let Some(material_descriptor_set) = materials.descriptor_set_for(item.material) else {
-            tracing::trace!(
-                mesh = item.mesh.raw(),
-                material = item.material.raw(),
-                "mesh draw skipped because the Vulkan material is missing"
-            );
             return Ok(false);
         };
         let frame_descriptor_set = self.frame_descriptor_sets.get(frame_slot).copied().ok_or(
@@ -769,6 +814,7 @@ impl MeshPassResources {
         shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
         raw_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
         translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+        local_shadow_views: [vk::ImageView; MAX_LOCAL_LIGHTS],
     ) -> Result<Self, VulkanError> {
         let shadow_sampler = create_pass_sampler(device, vk::Filter::LINEAR)?;
         let transmittance_sampler = match create_pass_sampler(device, vk::Filter::LINEAR) {
@@ -778,9 +824,18 @@ impl MeshPassResources {
                 return Err(error);
             }
         };
+        let local_shadow_sampler = match create_pass_sampler(device, vk::Filter::NEAREST) {
+            Ok(sampler) => sampler,
+            Err(error) => {
+                destroy_sampler(device, transmittance_sampler);
+                destroy_sampler(device, shadow_sampler);
+                return Err(error);
+            }
+        };
         let descriptor_pool = match create_pass_descriptor_pool(device) {
             Ok(pool) => pool,
             Err(error) => {
+                destroy_sampler(device, local_shadow_sampler);
                 destroy_sampler(device, transmittance_sampler);
                 destroy_sampler(device, shadow_sampler);
                 return Err(error);
@@ -791,6 +846,7 @@ impl MeshPassResources {
                 Ok(set) => set,
                 Err(error) => {
                     destroy_descriptor_pool(device, descriptor_pool);
+                    destroy_sampler(device, local_shadow_sampler);
                     destroy_sampler(device, transmittance_sampler);
                     destroy_sampler(device, shadow_sampler);
                     return Err(error);
@@ -802,9 +858,11 @@ impl MeshPassResources {
             descriptor_set,
             shadow_sampler,
             transmittance_sampler,
+            local_shadow_sampler,
             shadow_views,
             raw_shadow_views,
             translucent_shadow_views,
+            local_shadow_views,
         );
         tracing::info!("created Vulkan mesh pass descriptors");
         Ok(Self {
@@ -812,6 +870,7 @@ impl MeshPassResources {
             descriptor_set,
             shadow_sampler,
             transmittance_sampler,
+            local_shadow_sampler,
         })
     }
 
@@ -823,27 +882,34 @@ impl MeshPassResources {
     /// Destroys scene-pass descriptor resources before graph target image views are released.
     pub(super) fn destroy(self, device: &Device) {
         destroy_descriptor_pool(device, self.descriptor_pool);
+        destroy_sampler(device, self.local_shadow_sampler);
         destroy_sampler(device, self.transmittance_sampler);
         destroy_sampler(device, self.shadow_sampler);
     }
 }
 
 impl VulkanMesh {
-    /// Creates host-visible vertex and LOD index buffers for one renderer mesh geometry.
+    /// Creates device-local vertex and LOD index buffers for one renderer mesh geometry.
     fn upload(
         device: &Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        queue_family_index: u32,
+        queue: vk::Queue,
         geometry: &MeshGeometry,
     ) -> Result<Self, VulkanError> {
-        let vertex_buffer = create_buffer_with_data(
+        let vertex_buffer = create_device_local_buffer_with_data(
             device,
             memory_properties,
+            queue_family_index,
+            queue,
             vk::BufferUsageFlags::VERTEX_BUFFER,
             geometry.vertices(),
         )?;
         let lods = match upload_lod_buffers(
             device,
             memory_properties,
+            queue_family_index,
+            queue,
             geometry.vertices(),
             geometry.indices(),
         ) {
@@ -941,6 +1007,9 @@ impl VulkanMesh {
 
 /// Selects cheaper geometry for shadow cascades whose map texels cannot show full mesh detail.
 fn shadow_lod_for_cascade(cascade_index: usize) -> MeshLodLevel {
+    if cascade_index >= SHADOW_CASCADE_COUNT {
+        return MeshLodLevel::Medium;
+    }
     match cascade_index {
         0 => MeshLodLevel::Full,
         1 => MeshLodLevel::Medium,
@@ -995,6 +1064,8 @@ fn shadow_cascade_depth_padding(shadow_cull: ShadowCascadeCull, radius: f32) -> 
 fn upload_lod_buffers(
     device: &Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue_family_index: u32,
+    queue: vk::Queue,
     vertices: &[MeshVertex],
     indices: &[u32],
 ) -> Result<Vec<VulkanMeshLod>, VulkanError> {
@@ -1002,9 +1073,11 @@ fn upload_lod_buffers(
     let mut uploaded: Vec<VulkanMeshLod> = Vec::with_capacity(pending.len());
 
     for (level, lod_indices) in pending {
-        let buffer = match create_buffer_with_data(
+        let buffer = match create_device_local_buffer_with_data(
             device,
             memory_properties,
+            queue_family_index,
+            queue,
             vk::BufferUsageFlags::INDEX_BUFFER,
             &lod_indices,
         ) {
@@ -1041,31 +1114,33 @@ pub(super) struct MeshFrameUniform {
     pub(super) light_color: [f32; 4],
     pub(super) ambient_color: [f32; 4],
     pub(super) contact_shadow: [f32; 4],
-    pub(super) emissive_light_position_radius: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
-    pub(super) emissive_light_color: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
+    pub(super) local_shadow_view_proj: [[f32; 16]; LOCAL_SHADOW_MATRIX_COUNT],
+    pub(super) local_shadow_params: [[f32; 4]; MAX_LOCAL_LIGHTS],
+    pub(super) emissive_light_position_radius: [[f32; 4]; MAX_LOCAL_LIGHTS],
+    pub(super) emissive_light_color: [[f32; 4]; MAX_LOCAL_LIGHTS],
+    pub(super) emissive_light_direction_radius: [[f32; 4]; MAX_LOCAL_LIGHTS],
+    pub(super) emissive_light_size_kind: [[f32; 4]; MAX_LOCAL_LIGHTS],
     pub(super) emissive_light_count: [f32; 4],
-    pub(super) local_shadow_caster_center_radius: [[f32; 4]; MAX_LOCAL_SHADOW_CASTERS],
-    pub(super) local_shadow_caster_count: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct EmissiveLightUniforms {
-    pub(super) position_radius: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
-    pub(super) color: [[f32; 4]; MAX_EMISSIVE_LIGHTS],
+    pub(super) position_radius: [[f32; 4]; MAX_LOCAL_LIGHTS],
+    pub(super) color: [[f32; 4]; MAX_LOCAL_LIGHTS],
+    pub(super) direction_radius: [[f32; 4]; MAX_LOCAL_LIGHTS],
+    pub(super) size_kind: [[f32; 4]; MAX_LOCAL_LIGHTS],
     pub(super) count: [f32; 4],
-    pub(super) shadow_caster_center_radius: [[f32; 4]; MAX_LOCAL_SHADOW_CASTERS],
-    pub(super) shadow_caster_count: [f32; 4],
 }
 
 impl EmissiveLightUniforms {
     /// Returns an empty local-light payload for frames without emissive mesh lights.
     pub(super) fn disabled() -> Self {
         Self {
-            position_radius: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
-            color: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
+            position_radius: [[0.0; 4]; MAX_LOCAL_LIGHTS],
+            color: [[0.0; 4]; MAX_LOCAL_LIGHTS],
+            direction_radius: [[0.0; 4]; MAX_LOCAL_LIGHTS],
+            size_kind: [[0.0; 4]; MAX_LOCAL_LIGHTS],
             count: [0.0; 4],
-            shadow_caster_center_radius: [[0.0; 4]; MAX_LOCAL_SHADOW_CASTERS],
-            shadow_caster_count: [0.0; 4],
         }
     }
 }
@@ -1091,7 +1166,7 @@ fn create_pass_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, Vu
             vk::DescriptorSetLayoutBinding::default()
                 .binding(binding)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(1)
+                .descriptor_count(pass_shadow_binding_count(binding))
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
         })
         .to_vec();
@@ -1224,17 +1299,34 @@ fn create_pass_sampler(device: &Device, filter: vk::Filter) -> Result<vk::Sample
     unsafe { device.create_sampler(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
-/// Returns pass descriptor bindings in cascade order for filtered, translucent, then raw shadows.
-fn pass_shadow_bindings() -> [u32; SHADOW_CASCADE_COUNT * 3] {
+/// Returns pass descriptor bindings in cascade order for filtered, translucent, raw, and local shadows.
+fn pass_shadow_bindings() -> [u32; SHADOW_CASCADE_COUNT * 3 + 1] {
     std::array::from_fn(|index| {
         if index < SHADOW_CASCADE_COUNT {
             shader_interface::PASS_SHADOW_CASCADE_BINDINGS[index]
         } else if index < SHADOW_CASCADE_COUNT * 2 {
             shader_interface::PASS_TRANSLUCENT_SHADOW_BINDINGS[index - SHADOW_CASCADE_COUNT]
-        } else {
+        } else if index < SHADOW_CASCADE_COUNT * 3 {
             shader_interface::PASS_RAW_SHADOW_CASCADE_BINDINGS[index - SHADOW_CASCADE_COUNT * 2]
+        } else {
+            shader_interface::PASS_LOCAL_SHADOW_BINDING
         }
     })
+}
+
+fn pass_shadow_binding_count(binding: u32) -> u32 {
+    if binding == shader_interface::PASS_LOCAL_SHADOW_BINDING {
+        MAX_LOCAL_LIGHTS as u32
+    } else {
+        1
+    }
+}
+
+fn pass_descriptor_count() -> u32 {
+    pass_shadow_bindings()
+        .into_iter()
+        .map(pass_shadow_binding_count)
+        .sum()
 }
 
 /// Returns the image views written into pass descriptors in binding order.
@@ -1264,7 +1356,7 @@ fn bytes_of_u32(value: &u32) -> &[u8] {
 fn create_pass_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, VulkanError> {
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(pass_shadow_bindings().len() as u32);
+        .descriptor_count(pass_descriptor_count());
     let pool_sizes = [pool_size];
     let create_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(1)
@@ -1297,11 +1389,14 @@ fn update_pass_descriptor_set(
     descriptor_set: vk::DescriptorSet,
     shadow_sampler: vk::Sampler,
     transmittance_sampler: vk::Sampler,
+    local_shadow_sampler: vk::Sampler,
     shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     raw_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
+    local_shadow_views: [vk::ImageView; MAX_LOCAL_LIGHTS],
 ) {
-    let image_infos = pass_shadow_views(shadow_views, raw_shadow_views, translucent_shadow_views)
+    let views = pass_shadow_views(shadow_views, raw_shadow_views, translucent_shadow_views);
+    let image_infos = views
         .into_iter()
         .enumerate()
         .map(|(index, view)| {
@@ -1316,15 +1411,32 @@ fn update_pass_descriptor_set(
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         })
         .collect::<Vec<_>>();
+    let local_image_infos = local_shadow_views
+        .into_iter()
+        .map(|view| {
+            vk::DescriptorImageInfo::default()
+                .sampler(local_shadow_sampler)
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        })
+        .collect::<Vec<_>>();
     let writes = pass_shadow_bindings()
         .iter()
-        .zip(image_infos.iter())
-        .map(|(&binding, image_info)| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(binding)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(image_info))
+        .map(|&binding| {
+            if binding == shader_interface::PASS_LOCAL_SHADOW_BINDING {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&local_image_infos)
+            } else {
+                let image_index = binding as usize;
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&image_infos[image_index]))
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1355,11 +1467,13 @@ fn identity_frame_uniform() -> MeshFrameUniform {
         ],
         ambient_color: DEFAULT_AMBIENT_COLOR,
         contact_shadow: [0.0, 0.0, 0.0, 0.0],
-        emissive_light_position_radius: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
-        emissive_light_color: [[0.0; 4]; MAX_EMISSIVE_LIGHTS],
+        local_shadow_view_proj: [identity_mat4(); LOCAL_SHADOW_MATRIX_COUNT],
+        local_shadow_params: [[0.0, 0.0, 1.0, 1.0]; MAX_LOCAL_LIGHTS],
+        emissive_light_position_radius: [[0.0; 4]; MAX_LOCAL_LIGHTS],
+        emissive_light_color: [[0.0; 4]; MAX_LOCAL_LIGHTS],
+        emissive_light_direction_radius: [[0.0; 4]; MAX_LOCAL_LIGHTS],
+        emissive_light_size_kind: [[0.0; 4]; MAX_LOCAL_LIGHTS],
         emissive_light_count: [0.0; 4],
-        local_shadow_caster_center_radius: [[0.0; 4]; MAX_LOCAL_SHADOW_CASTERS],
-        local_shadow_caster_count: [0.0; 4],
     }
 }
 
@@ -1371,6 +1485,14 @@ enum MeshPipelineTarget {
     SceneTransparentFast,
     OpaqueShadow,
     TranslucentShadow,
+    LocalShadowDepth,
+}
+
+#[derive(Clone, Copy)]
+enum MeshVertexLayout {
+    SceneUntextured,
+    SceneTextured,
+    Shadow,
 }
 
 impl MeshPipelineTarget {
@@ -1380,12 +1502,13 @@ impl MeshPipelineTarget {
             Self::SceneOpaque | Self::SceneTransparent => 3,
             Self::SceneOpaqueFast | Self::SceneTransparentFast => 1,
             Self::OpaqueShadow | Self::TranslucentShadow => 1,
+            Self::LocalShadowDepth => 0,
         }
     }
 
     /// Returns whether polygon depth bias should be enabled for this pass.
     fn uses_depth_bias(self) -> bool {
-        matches!(self, Self::OpaqueShadow)
+        matches!(self, Self::OpaqueShadow | Self::LocalShadowDepth)
     }
 
     /// Returns whether the vertex shader consumes per-vertex normals.
@@ -1408,7 +1531,7 @@ impl MeshPipelineTarget {
     fn writes_depth(self) -> bool {
         matches!(
             self,
-            Self::SceneOpaque | Self::SceneOpaqueFast | Self::OpaqueShadow
+            Self::SceneOpaque | Self::SceneOpaqueFast | Self::OpaqueShadow | Self::LocalShadowDepth
         )
     }
 
@@ -1456,6 +1579,7 @@ impl MeshPipelineTarget {
             Self::OpaqueShadow => {
                 vec![vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask)]
             }
+            Self::LocalShadowDepth => Vec::new(),
             Self::TranslucentShadow => vec![
                 vk::PipelineColorBlendAttachmentState::default()
                     .blend_enable(true)
@@ -1478,6 +1602,7 @@ fn create_mesh_pipeline_variants(
     render_pass: vk::RenderPass,
     vertex_shader_bytes: &[u8],
     fragment_shader_bytes: &[u8],
+    vertex_layout: MeshVertexLayout,
     target: MeshPipelineTarget,
 ) -> Result<MeshPipelineVariants, VulkanError> {
     let culled = create_mesh_pipeline(
@@ -1486,6 +1611,7 @@ fn create_mesh_pipeline_variants(
         render_pass,
         vertex_shader_bytes,
         fragment_shader_bytes,
+        vertex_layout,
         target,
         vk::CullModeFlags::BACK,
     )?;
@@ -1495,6 +1621,7 @@ fn create_mesh_pipeline_variants(
         render_pass,
         vertex_shader_bytes,
         fragment_shader_bytes,
+        vertex_layout,
         target,
         vk::CullModeFlags::NONE,
     ) {
@@ -1520,6 +1647,7 @@ fn create_mesh_pipeline(
     render_pass: vk::RenderPass,
     vertex_shader_bytes: &[u8],
     fragment_shader_bytes: &[u8],
+    vertex_layout: MeshVertexLayout,
     target: MeshPipelineTarget,
     cull_mode: vk::CullModeFlags,
 ) -> Result<vk::Pipeline, VulkanError> {
@@ -1537,6 +1665,7 @@ fn create_mesh_pipeline(
         render_pass,
         vertex_shader,
         fragment_shader,
+        vertex_layout,
         target,
         cull_mode,
     );
@@ -1562,6 +1691,7 @@ fn create_graphics_pipeline(
     render_pass: vk::RenderPass,
     vertex_shader: vk::ShaderModule,
     fragment_shader: vk::ShaderModule,
+    vertex_layout: MeshVertexLayout,
     target: MeshPipelineTarget,
     cull_mode: vk::CullModeFlags,
 ) -> Result<vk::Pipeline, VulkanError> {
@@ -1579,7 +1709,7 @@ fn create_graphics_pipeline(
         .binding(0)
         .stride(size_of::<MeshVertex>() as u32)
         .input_rate(vk::VertexInputRate::VERTEX)];
-    let vertex_attributes = vertex_attributes_for_target(target);
+    let vertex_attributes = vertex_attributes_for_layout(vertex_layout);
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&vertex_bindings)
         .vertex_attribute_descriptions(&vertex_attributes);
@@ -1651,8 +1781,8 @@ fn create_graphics_pipeline(
 }
 
 /// Returns only the vertex attributes consumed by the selected shader path.
-fn vertex_attributes_for_target(
-    target: MeshPipelineTarget,
+fn vertex_attributes_for_layout(
+    layout: MeshVertexLayout,
 ) -> Vec<vk::VertexInputAttributeDescription> {
     let mut attributes = Vec::with_capacity(5);
     attributes.push(
@@ -1662,7 +1792,10 @@ fn vertex_attributes_for_target(
             .format(vk::Format::R32G32B32_SFLOAT)
             .offset(offset_of!(MeshVertex, position) as u32),
     );
-    if target.uses_surface_normal() {
+    if matches!(
+        layout,
+        MeshVertexLayout::SceneUntextured | MeshVertexLayout::SceneTextured
+    ) {
         attributes.push(
             vk::VertexInputAttributeDescription::default()
                 .binding(0)
@@ -1671,39 +1804,56 @@ fn vertex_attributes_for_target(
                 .offset(offset_of!(MeshVertex, normal) as u32),
         );
     }
-    attributes.push(
-        vk::VertexInputAttributeDescription::default()
-            .binding(0)
-            .location(2)
-            .format(vk::Format::R32G32_SFLOAT)
-            .offset(offset_of!(MeshVertex, uv) as u32),
-    );
 
-    if target.uses_surface_normal() {
-        // Scene shaders use location 3 as tangent and location 4 as color.
-        attributes.push(
-            vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(3)
-                .format(vk::Format::R32G32B32A32_SFLOAT)
-                .offset(offset_of!(MeshVertex, tangent) as u32),
-        );
-        attributes.push(
-            vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(4)
-                .format(vk::Format::R32G32B32A32_SFLOAT)
-                .offset(offset_of!(MeshVertex, color) as u32),
-        );
-    } else {
-        // Shadow shaders keep their old contract: location 3 is vertex color.
-        attributes.push(
-            vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(3)
-                .format(vk::Format::R32G32B32A32_SFLOAT)
-                .offset(offset_of!(MeshVertex, color) as u32),
-        );
+    match layout {
+        MeshVertexLayout::SceneUntextured => {
+            attributes.push(
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0)
+                    .location(4)
+                    .format(vk::Format::R32G32B32A32_SFLOAT)
+                    .offset(offset_of!(MeshVertex, color) as u32),
+            );
+        }
+        MeshVertexLayout::SceneTextured => {
+            attributes.push(
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0)
+                    .location(2)
+                    .format(vk::Format::R32G32_SFLOAT)
+                    .offset(offset_of!(MeshVertex, uv) as u32),
+            );
+            attributes.push(
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0)
+                    .location(3)
+                    .format(vk::Format::R32G32B32A32_SFLOAT)
+                    .offset(offset_of!(MeshVertex, tangent) as u32),
+            );
+            attributes.push(
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0)
+                    .location(4)
+                    .format(vk::Format::R32G32B32A32_SFLOAT)
+                    .offset(offset_of!(MeshVertex, color) as u32),
+            );
+        }
+        MeshVertexLayout::Shadow => {
+            attributes.push(
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0)
+                    .location(2)
+                    .format(vk::Format::R32G32_SFLOAT)
+                    .offset(offset_of!(MeshVertex, uv) as u32),
+            );
+            attributes.push(
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0)
+                    .location(3)
+                    .format(vk::Format::R32G32B32A32_SFLOAT)
+                    .offset(offset_of!(MeshVertex, color) as u32),
+            );
+        }
     }
 
     attributes
@@ -1797,13 +1947,16 @@ mod tests {
         assert_eq!(MESH_FRONT_FACE, vk::FrontFace::COUNTER_CLOCKWISE);
     }
 
-    // Verifies that distant shadow cascades draw cheaper geometry than the near cascade.
+    // Verifies that distant global cascades are cheap while local cubemap faces keep close detail.
     #[test]
     fn shadow_cascades_select_progressively_cheaper_lods() {
         assert_eq!(shadow_lod_for_cascade(0), MeshLodLevel::Full);
         assert_eq!(shadow_lod_for_cascade(1), MeshLodLevel::Medium);
         assert_eq!(shadow_lod_for_cascade(2), MeshLodLevel::Low);
-        assert_eq!(shadow_lod_for_cascade(99), MeshLodLevel::Low);
+        assert_eq!(
+            shadow_lod_for_cascade(SHADOW_CASCADE_COUNT),
+            MeshLodLevel::Medium
+        );
     }
 
     // Verifies that shadow cascade culling keeps overlapping casters and drops only far outsiders.
@@ -1883,5 +2036,25 @@ mod tests {
         assert!(MeshPipelineTarget::SceneOpaqueFast.writes_depth());
         assert_eq!(attachments.len(), 1);
         assert!(attachments[0].blend_enable == 0);
+    }
+
+    #[test]
+    fn untextured_scene_vertex_layout_skips_texture_attributes() {
+        let locations = vertex_attributes_for_layout(MeshVertexLayout::SceneUntextured)
+            .into_iter()
+            .map(|attribute| attribute.location)
+            .collect::<Vec<_>>();
+
+        assert_eq!(locations, vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn textured_scene_vertex_layout_keeps_normal_mapping_attributes() {
+        let locations = vertex_attributes_for_layout(MeshVertexLayout::SceneTextured)
+            .into_iter()
+            .map(|attribute| attribute.location)
+            .collect::<Vec<_>>();
+
+        assert_eq!(locations, vec![0, 1, 2, 3, 4]);
     }
 }

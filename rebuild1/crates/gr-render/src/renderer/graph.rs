@@ -6,6 +6,23 @@ const SCENE_PASS: &str = "scene";
 const POST_PASS: &str = "post";
 const FRAMEBUFFER_READBACK_PASS: &str = "framebuffer_readback";
 const PRESENT_PASS: &str = "present";
+pub(crate) const GOD_RAY_MASK_PASS: &str = "god_ray_mask";
+pub(crate) const GOD_RAY_PREFILTER_PASS: &str = "god_ray_prefilter";
+pub(crate) const GOD_RAY_RADIAL_PASS: &str = "god_ray_radial";
+pub(crate) const GOD_RAY_TEMPORAL_PASS: &str = "god_ray_temporal";
+const BLOOM_DOWNSAMPLE_PASSES: [&str; BLOOM_MIP_COUNT] = [
+    "bloom_downsample_0",
+    "bloom_downsample_1",
+    "bloom_downsample_2",
+    "bloom_downsample_3",
+    "bloom_downsample_4",
+];
+const BLOOM_UPSAMPLE_PASSES: [&str; BLOOM_MIP_COUNT - 1] = [
+    "bloom_upsample_0",
+    "bloom_upsample_1",
+    "bloom_upsample_2",
+    "bloom_upsample_3",
+];
 const SHADOW_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
     "shadow_cascade_0",
     "shadow_cascade_1",
@@ -32,6 +49,8 @@ const TRANSLUCENT_SHADOW_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
 ];
 
 pub(crate) const SHADOW_CASCADE_COUNT: usize = 4;
+pub(crate) const BLOOM_MIP_COUNT: usize = 5;
+pub(crate) const GOD_RAY_HISTORY_COUNT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum GraphResource {
@@ -56,6 +75,16 @@ pub(crate) enum GraphResource {
     SceneNormalRoughness,
     SceneTransparentNormalRoughness,
     SceneDepth,
+    BloomMip0,
+    BloomMip1,
+    BloomMip2,
+    BloomMip3,
+    BloomMip4,
+    GodRayMask,
+    GodRayPrefilter,
+    GodRayBlur,
+    GodRayHistory0,
+    GodRayHistory1,
 }
 
 impl GraphResource {
@@ -111,6 +140,27 @@ impl GraphResource {
             || self.translucent_shadow_cascade().is_some()
     }
 
+    /// Returns the bloom mip index for graph-owned post-processing resources.
+    pub(crate) fn bloom_mip(self) -> Option<usize> {
+        match self {
+            Self::BloomMip0 => Some(0),
+            Self::BloomMip1 => Some(1),
+            Self::BloomMip2 => Some(2),
+            Self::BloomMip3 => Some(3),
+            Self::BloomMip4 => Some(4),
+            _ => None,
+        }
+    }
+
+    /// Returns the temporal god-ray history index for persistent ping-pong targets.
+    pub(crate) fn god_ray_history(self) -> Option<usize> {
+        match self {
+            Self::GodRayHistory0 => Some(0),
+            Self::GodRayHistory1 => Some(1),
+            _ => None,
+        }
+    }
+
     /// Returns the stable resource name used in graph logs and diagnostics.
     pub(crate) fn name(self) -> &'static str {
         if let Some(index) = self.shadow_moment_raw_cascade() {
@@ -132,6 +182,16 @@ impl GraphResource {
             Self::SceneNormalRoughness => "scene_normal_roughness",
             Self::SceneTransparentNormalRoughness => "scene_transparent_normal_roughness",
             Self::SceneDepth => "scene_depth",
+            Self::BloomMip0 => "bloom_mip_0",
+            Self::BloomMip1 => "bloom_mip_1",
+            Self::BloomMip2 => "bloom_mip_2",
+            Self::BloomMip3 => "bloom_mip_3",
+            Self::BloomMip4 => "bloom_mip_4",
+            Self::GodRayMask => "god_ray_mask",
+            Self::GodRayPrefilter => "god_ray_prefilter",
+            Self::GodRayBlur => "god_ray_blur",
+            Self::GodRayHistory0 => "god_ray_history_0",
+            Self::GodRayHistory1 => "god_ray_history_1",
             Self::ShadowMomentRaw0
             | Self::ShadowMomentRaw1
             | Self::ShadowMomentRaw2
@@ -194,29 +254,29 @@ pub(crate) fn translucent_shadow_pass_names() -> [&'static str; SHADOW_CASCADE_C
 
 /// Returns the opaque shadow cascade index encoded in one graph pass name.
 pub(crate) fn shadow_pass_index(pass_name: &str) -> Option<usize> {
-    indexed_pass_index(pass_name, "shadow_cascade_")
+    indexed_pass_index(pass_name, "shadow_cascade_").filter(|index| *index < SHADOW_CASCADE_COUNT)
 }
 
 /// Returns the horizontal moment blur pass index encoded in one graph pass name.
 pub(crate) fn shadow_blur_h_pass_index(pass_name: &str) -> Option<usize> {
-    indexed_pass_index(pass_name, "shadow_blur_h_")
+    indexed_pass_index(pass_name, "shadow_blur_h_").filter(|index| *index < SHADOW_CASCADE_COUNT)
 }
 
 /// Returns the vertical moment blur pass index encoded in one graph pass name.
 pub(crate) fn shadow_blur_v_pass_index(pass_name: &str) -> Option<usize> {
-    indexed_pass_index(pass_name, "shadow_blur_v_")
+    indexed_pass_index(pass_name, "shadow_blur_v_").filter(|index| *index < SHADOW_CASCADE_COUNT)
 }
 
 /// Returns the translucent shadow cascade index encoded in one graph pass name.
 pub(crate) fn translucent_shadow_pass_index(pass_name: &str) -> Option<usize> {
     indexed_pass_index(pass_name, "translucent_shadow_")
+        .filter(|index| *index < SHADOW_CASCADE_COUNT)
 }
 
 fn indexed_pass_index(pass_name: &str, prefix: &str) -> Option<usize> {
     pass_name
         .strip_prefix(prefix)
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|index| *index < SHADOW_CASCADE_COUNT)
 }
 
 const SHADOW_MOMENT_RAW_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
@@ -260,6 +320,25 @@ pub(crate) const TRANSLUCENT_SHADOW_RESOURCES: [GraphResource; SHADOW_CASCADE_CO
     GraphResource::TranslucentShadow2,
     GraphResource::TranslucentShadow3,
 ];
+
+pub(crate) const BLOOM_MIP_RESOURCES: [GraphResource; BLOOM_MIP_COUNT] = [
+    GraphResource::BloomMip0,
+    GraphResource::BloomMip1,
+    GraphResource::BloomMip2,
+    GraphResource::BloomMip3,
+    GraphResource::BloomMip4,
+];
+
+pub(crate) const GOD_RAY_HISTORY_RESOURCES: [GraphResource; GOD_RAY_HISTORY_COUNT] =
+    [GraphResource::GodRayHistory0, GraphResource::GodRayHistory1];
+
+pub(crate) fn bloom_downsample_pass_index(pass_name: &str) -> Option<usize> {
+    indexed_pass_index(pass_name, "bloom_downsample_").filter(|index| *index < BLOOM_MIP_COUNT)
+}
+
+pub(crate) fn bloom_upsample_pass_index(pass_name: &str) -> Option<usize> {
+    indexed_pass_index(pass_name, "bloom_upsample_").filter(|index| *index + 1 < BLOOM_MIP_COUNT)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResourceState {
@@ -654,6 +733,11 @@ pub(crate) struct FrameGraphInitialStates {
     scene_normal_roughness: ResourceState,
     scene_transparent_normal_roughness: ResourceState,
     scene_depth: ResourceState,
+    bloom_mips: [ResourceState; BLOOM_MIP_COUNT],
+    god_ray_mask: ResourceState,
+    god_ray_prefilter: ResourceState,
+    god_ray_blur: ResourceState,
+    god_ray_histories: [ResourceState; GOD_RAY_HISTORY_COUNT],
 }
 
 impl FrameGraphInitialStates {
@@ -679,7 +763,33 @@ impl FrameGraphInitialStates {
             scene_normal_roughness,
             scene_transparent_normal_roughness,
             scene_depth,
+            bloom_mips: [ResourceState::Undefined; BLOOM_MIP_COUNT],
+            god_ray_mask: ResourceState::Undefined,
+            god_ray_prefilter: ResourceState::Undefined,
+            god_ray_blur: ResourceState::Undefined,
+            god_ray_histories: [ResourceState::Undefined; GOD_RAY_HISTORY_COUNT],
         }
+    }
+
+    /// Overrides persistent bloom states for frame graphs that execute the bloom mip chain.
+    pub(crate) fn with_bloom_mips(mut self, bloom_mips: [ResourceState; BLOOM_MIP_COUNT]) -> Self {
+        self.bloom_mips = bloom_mips;
+        self
+    }
+
+    /// Overrides persistent god-ray states for the low-resolution post chain.
+    pub(crate) fn with_god_rays(
+        mut self,
+        mask: ResourceState,
+        prefilter: ResourceState,
+        blur: ResourceState,
+        histories: [ResourceState; GOD_RAY_HISTORY_COUNT],
+    ) -> Self {
+        self.god_ray_mask = mask;
+        self.god_ray_prefilter = prefilter;
+        self.god_ray_blur = blur;
+        self.god_ray_histories = histories;
+        self
     }
 
     /// Returns the current state of the acquired swapchain image.
@@ -726,6 +836,31 @@ impl FrameGraphInitialStates {
     pub(crate) fn scene_depth(self) -> ResourceState {
         self.scene_depth
     }
+
+    /// Returns the current state of every persistent bloom mip target.
+    pub(crate) fn bloom_mips(self) -> [ResourceState; BLOOM_MIP_COUNT] {
+        self.bloom_mips
+    }
+
+    /// Returns the current state of the persistent god-ray mask target.
+    pub(crate) fn god_ray_mask(self) -> ResourceState {
+        self.god_ray_mask
+    }
+
+    /// Returns the current state of the persistent god-ray prefilter target.
+    pub(crate) fn god_ray_prefilter(self) -> ResourceState {
+        self.god_ray_prefilter
+    }
+
+    /// Returns the current state of the persistent god-ray radial blur target.
+    pub(crate) fn god_ray_blur(self) -> ResourceState {
+        self.god_ray_blur
+    }
+
+    /// Returns the current state of both temporal god-ray history targets.
+    pub(crate) fn god_ray_histories(self) -> [ResourceState; GOD_RAY_HISTORY_COUNT] {
+        self.god_ray_histories
+    }
 }
 
 impl FrameGraphPlan {
@@ -749,6 +884,7 @@ impl FrameGraphPlan {
     }
 
     /// Builds the executable frame graph while selecting whether scene metadata is written.
+    #[cfg(test)]
     pub(crate) fn standard_frame_with_readback_and_scene_metadata(
         clear_color: [f32; 4],
         initial: FrameGraphInitialStates,
@@ -790,6 +926,7 @@ impl FrameGraphPlan {
     }
 
     /// Builds the executable frame graph while optionally reusing cached shadow maps.
+    #[cfg(test)]
     pub(crate) fn standard_frame_with_shadow_refresh_and_scene_metadata(
         clear_color: [f32; 4],
         initial: FrameGraphInitialStates,
@@ -798,6 +935,57 @@ impl FrameGraphPlan {
         translucent_shadows: bool,
         refresh_shadows: bool,
         scene_metadata: bool,
+    ) -> Result<Self, GraphCompileError> {
+        Self::standard_frame_with_shadow_refresh_scene_metadata_and_bloom(
+            clear_color,
+            initial,
+            framebuffer_readback,
+            shadow_casters,
+            translucent_shadows,
+            refresh_shadows,
+            scene_metadata,
+            false,
+        )
+    }
+
+    /// Builds the executable frame graph with optional bloom mip-chain post-processing.
+    #[cfg(test)]
+    pub(crate) fn standard_frame_with_shadow_refresh_scene_metadata_and_bloom(
+        clear_color: [f32; 4],
+        initial: FrameGraphInitialStates,
+        framebuffer_readback: bool,
+        shadow_casters: bool,
+        translucent_shadows: bool,
+        refresh_shadows: bool,
+        scene_metadata: bool,
+        bloom: bool,
+    ) -> Result<Self, GraphCompileError> {
+        Self::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
+            clear_color,
+            initial,
+            framebuffer_readback,
+            shadow_casters,
+            translucent_shadows,
+            refresh_shadows,
+            scene_metadata,
+            bloom,
+            false,
+            0,
+        )
+    }
+
+    /// Builds the executable frame graph with optional bloom and low-resolution god-ray passes.
+    pub(crate) fn standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
+        clear_color: [f32; 4],
+        initial: FrameGraphInitialStates,
+        framebuffer_readback: bool,
+        shadow_casters: bool,
+        translucent_shadows: bool,
+        refresh_shadows: bool,
+        scene_metadata: bool,
+        bloom: bool,
+        god_rays: bool,
+        god_ray_history_write_index: usize,
     ) -> Result<Self, GraphCompileError> {
         let mut builder = FrameGraphBuilder::new();
         if shadow_casters {
@@ -875,6 +1063,42 @@ impl FrameGraphPlan {
                 initial.swapchain_image(),
                 ResourceState::Present,
             ));
+
+        let bloom_resource_count = if bloom { BLOOM_MIP_COUNT } else { 1 };
+        for (resource, state) in BLOOM_MIP_RESOURCES
+            .into_iter()
+            .zip(initial.bloom_mips())
+            .take(bloom_resource_count)
+        {
+            builder = builder.resource(GraphResourceDecl::new(
+                resource,
+                state,
+                ResourceState::ShaderRead,
+            ));
+        }
+        if god_rays {
+            for (resource, state) in [
+                (GraphResource::GodRayMask, initial.god_ray_mask()),
+                (GraphResource::GodRayPrefilter, initial.god_ray_prefilter()),
+                (GraphResource::GodRayBlur, initial.god_ray_blur()),
+            ] {
+                builder = builder.resource(GraphResourceDecl::new(
+                    resource,
+                    state,
+                    ResourceState::ShaderRead,
+                ));
+            }
+        }
+        for (resource, state) in GOD_RAY_HISTORY_RESOURCES
+            .into_iter()
+            .zip(initial.god_ray_histories())
+        {
+            builder = builder.resource(GraphResourceDecl::new(
+                resource,
+                state,
+                ResourceState::ShaderRead,
+            ));
+        }
 
         if shadow_casters && refresh_shadows {
             for (pass_name, resource) in shadow_pass_names()
@@ -960,26 +1184,109 @@ impl FrameGraphPlan {
         }
         scene_pass = scene_pass.write(PassOutput::depth_clear_store(GraphResource::SceneDepth));
 
-        builder = builder.pass(scene_pass).pass(
-            GraphPass::new(POST_PASS)
-                .read(PassInput::read(
-                    GraphResource::SceneColor,
-                    ResourceState::ShaderRead,
-                ))
-                .read(PassInput::read(
-                    GraphResource::SceneNormalRoughness,
-                    ResourceState::ShaderRead,
-                ))
-                .read(PassInput::read(
-                    GraphResource::SceneTransparentNormalRoughness,
-                    ResourceState::ShaderRead,
-                ))
-                .read(PassInput::read(
-                    GraphResource::SceneDepth,
-                    ResourceState::ShaderRead,
-                ))
-                .write(PassOutput::color_load(GraphResource::SwapchainImage)),
-        );
+        builder = builder.pass(scene_pass);
+        if bloom {
+            for (index, pass_name) in BLOOM_DOWNSAMPLE_PASSES.into_iter().enumerate() {
+                let input = if index == 0 {
+                    GraphResource::SceneColor
+                } else {
+                    BLOOM_MIP_RESOURCES[index - 1]
+                };
+                builder = builder.pass(
+                    GraphPass::new(pass_name)
+                        .read(PassInput::read(input, ResourceState::ShaderRead))
+                        .write(PassOutput::color_load(BLOOM_MIP_RESOURCES[index])),
+                );
+            }
+            for target_index in (0..BLOOM_MIP_COUNT - 1).rev() {
+                builder = builder.pass(
+                    GraphPass::new(BLOOM_UPSAMPLE_PASSES[target_index])
+                        .read(PassInput::read(
+                            BLOOM_MIP_RESOURCES[target_index + 1],
+                            ResourceState::ShaderRead,
+                        ))
+                        .write(PassOutput::color_load(BLOOM_MIP_RESOURCES[target_index])),
+                );
+            }
+        }
+        let god_ray_history_write_index = god_ray_history_write_index % GOD_RAY_HISTORY_COUNT;
+        let god_ray_history_read_index = 1 - god_ray_history_write_index;
+        if god_rays {
+            builder = builder
+                .pass(
+                    GraphPass::new(GOD_RAY_MASK_PASS)
+                        .read(PassInput::read(
+                            GraphResource::SceneColor,
+                            ResourceState::ShaderRead,
+                        ))
+                        .read(PassInput::read(
+                            GraphResource::SceneDepth,
+                            ResourceState::ShaderRead,
+                        ))
+                        .read(PassInput::read(
+                            GraphResource::SceneTransparentNormalRoughness,
+                            ResourceState::ShaderRead,
+                        ))
+                        .write(PassOutput::color_load(GraphResource::GodRayMask)),
+                )
+                .pass(
+                    GraphPass::new(GOD_RAY_PREFILTER_PASS)
+                        .read(PassInput::read(
+                            GraphResource::GodRayMask,
+                            ResourceState::ShaderRead,
+                        ))
+                        .write(PassOutput::color_load(GraphResource::GodRayPrefilter)),
+                )
+                .pass(
+                    GraphPass::new(GOD_RAY_RADIAL_PASS)
+                        .read(PassInput::read(
+                            GraphResource::GodRayPrefilter,
+                            ResourceState::ShaderRead,
+                        ))
+                        .write(PassOutput::color_load(GraphResource::GodRayBlur)),
+                )
+                .pass(
+                    GraphPass::new(GOD_RAY_TEMPORAL_PASS)
+                        .read(PassInput::read(
+                            GraphResource::GodRayBlur,
+                            ResourceState::ShaderRead,
+                        ))
+                        .read(PassInput::read(
+                            GOD_RAY_HISTORY_RESOURCES[god_ray_history_read_index],
+                            ResourceState::ShaderRead,
+                        ))
+                        .write(PassOutput::color_load(
+                            GOD_RAY_HISTORY_RESOURCES[god_ray_history_write_index],
+                        )),
+                );
+        }
+
+        let mut post_pass = GraphPass::new(POST_PASS)
+            .read(PassInput::read(
+                GraphResource::SceneColor,
+                ResourceState::ShaderRead,
+            ))
+            .read(PassInput::read(
+                GraphResource::SceneNormalRoughness,
+                ResourceState::ShaderRead,
+            ))
+            .read(PassInput::read(
+                GraphResource::SceneTransparentNormalRoughness,
+                ResourceState::ShaderRead,
+            ))
+            .read(PassInput::read(
+                GraphResource::SceneDepth,
+                ResourceState::ShaderRead,
+            ))
+            .write(PassOutput::color_load(GraphResource::SwapchainImage));
+        post_pass = post_pass.read(PassInput::read(
+            GraphResource::BloomMip0,
+            ResourceState::ShaderRead,
+        ));
+        for resource in GOD_RAY_HISTORY_RESOURCES {
+            post_pass = post_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
+        }
+        builder = builder.pass(post_pass);
 
         if framebuffer_readback {
             builder = builder.pass(
@@ -1530,7 +1837,7 @@ mod tests {
         expected.extend([SCENE_PASS, POST_PASS, PRESENT_PASS]);
 
         assert_eq!(names, expected);
-        assert_eq!(graph.resource_count(), 21);
+        assert_eq!(graph.resource_count(), 24);
         assert!(graph.transition_count() >= 10);
         assert!(graph.barrier_count() >= 6);
     }
@@ -1763,7 +2070,7 @@ mod tests {
         expected.extend([SCENE_PASS, POST_PASS, PRESENT_PASS]);
 
         assert_eq!(names, expected);
-        assert_eq!(graph.resource_count(), 17);
+        assert_eq!(graph.resource_count(), 20);
         assert_eq!(
             graph.final_state_for(GraphResource::TranslucentShadow0),
             None
@@ -1804,12 +2111,143 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, [SCENE_PASS, POST_PASS, PRESENT_PASS]);
-        assert_eq!(graph.resource_count(), 5);
+        assert_eq!(graph.resource_count(), 8);
         assert_eq!(graph.final_state_for(GraphResource::ShadowCascade0), None);
         assert_eq!(
             graph.final_state_for(GraphResource::TranslucentShadow0),
             None
         );
+    }
+
+    #[test]
+    fn standard_frame_graph_inserts_bloom_mip_chain_before_post() {
+        let graph = FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_and_bloom(
+            [0.0, 0.1, 0.2, 1.0],
+            FrameGraphInitialStates::new(
+                ResourceState::Undefined,
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+            ),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect("bloom graph should compile");
+        let names = graph
+            .passes()
+            .iter()
+            .map(GraphPass::name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                SCENE_PASS,
+                "bloom_downsample_0",
+                "bloom_downsample_1",
+                "bloom_downsample_2",
+                "bloom_downsample_3",
+                "bloom_downsample_4",
+                "bloom_upsample_3",
+                "bloom_upsample_2",
+                "bloom_upsample_1",
+                "bloom_upsample_0",
+                POST_PASS,
+                PRESENT_PASS,
+            ]
+        );
+        assert_eq!(
+            graph.final_state_for(GraphResource::BloomMip0),
+            Some(ResourceState::ShaderRead)
+        );
+        assert!(graph.passes().iter().any(|pass| {
+            pass.name() == POST_PASS
+                && pass
+                    .reads()
+                    .iter()
+                    .any(|input| input.resource() == GraphResource::BloomMip0)
+        }));
+    }
+
+    #[test]
+    fn standard_frame_graph_inserts_god_ray_chain_before_post() {
+        let graph =
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
+                [0.0, 0.1, 0.2, 1.0],
+                FrameGraphInitialStates::new(
+                    ResourceState::Undefined,
+                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                ),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                1,
+            )
+            .expect("god-ray graph should compile");
+        let names = graph
+            .passes()
+            .iter()
+            .map(GraphPass::name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                SCENE_PASS,
+                GOD_RAY_MASK_PASS,
+                GOD_RAY_PREFILTER_PASS,
+                GOD_RAY_RADIAL_PASS,
+                GOD_RAY_TEMPORAL_PASS,
+                POST_PASS,
+                PRESENT_PASS,
+            ]
+        );
+        let temporal = graph
+            .passes()
+            .iter()
+            .find(|pass| pass.name() == GOD_RAY_TEMPORAL_PASS)
+            .expect("temporal pass should be retained");
+        assert!(temporal.reads().iter().any(|input| {
+            input.resource() == GraphResource::GodRayHistory0
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(temporal.writes().iter().any(|output| {
+            output.resource() == GraphResource::GodRayHistory1
+                && output.state() == ResourceState::ColorAttachment
+        }));
+        let post = graph
+            .passes()
+            .iter()
+            .find(|pass| pass.name() == POST_PASS)
+            .expect("post pass should be retained");
+        assert!(post.reads().iter().any(|input| {
+            input.resource() == GraphResource::GodRayHistory0
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(post.reads().iter().any(|input| {
+            input.resource() == GraphResource::GodRayHistory1
+                && input.state() == ResourceState::ShaderRead
+        }));
     }
 
     // Verifies that stale persistent shadow states do not keep shadow resources alive.

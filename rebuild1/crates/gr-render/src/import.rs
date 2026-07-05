@@ -7,7 +7,9 @@ use thiserror::Error;
 
 use crate::{
     math::{add3, cross3, dot3, normalize_or, sub3},
-    protocol::{MaterialAlphaMode, MaterialTextureSlot, SceneBounds, TextureDescriptor},
+    protocol::{
+        LocalLightPacket, MaterialAlphaMode, MaterialTextureSlot, SceneBounds, TextureDescriptor,
+    },
 };
 
 const REBUILD1_SCENE_EXTENSION: &str = "r1scene";
@@ -24,6 +26,7 @@ pub struct ImportedScene {
     meshes: Vec<ImportedMesh>,
     materials: Vec<ImportedMaterial>,
     textures: Vec<ImportedTexture>,
+    local_lights: Vec<LocalLightPacket>,
     bounds: Option<SceneBounds>,
 }
 
@@ -39,7 +42,7 @@ impl ImportedScene {
         let materials = vec![ImportedMaterial::opaque(); material_count];
         let textures = vec![ImportedTexture::solid([255, 255, 255, 255]); texture_count];
 
-        Self::from_parts(source, meshes, materials, textures)
+        Self::from_parts(source, meshes, materials, textures, Vec::new())
     }
 
     /// Creates imported scene metadata from explicit intermediate scene parts.
@@ -48,14 +51,17 @@ impl ImportedScene {
         meshes: Vec<ImportedMesh>,
         materials: Vec<ImportedMaterial>,
         textures: Vec<ImportedTexture>,
+        mut local_lights: Vec<LocalLightPacket>,
     ) -> Self {
         let bounds = scene_bounds_from_meshes(&meshes);
+        local_lights.extend(emissive_mesh_local_lights(&meshes, &materials));
 
         Self {
             source,
             meshes,
             materials,
             textures,
+            local_lights,
             bounds,
         }
     }
@@ -93,6 +99,11 @@ impl ImportedScene {
     /// Returns imported texture records in file order.
     pub fn textures(&self) -> &[ImportedTexture] {
         &self.textures
+    }
+
+    /// Returns local lights imported from scene-level light objects.
+    pub fn local_lights(&self) -> &[LocalLightPacket] {
+        &self.local_lights
     }
 
     /// Returns imported scene bounds when at least one mesh has finite positions.
@@ -527,6 +538,7 @@ fn parse_rebuild1_scene(path: &Path, text: &str) -> Result<ImportedScene, Import
         meshes,
         materials,
         textures,
+        Vec::new(),
     ))
 }
 
@@ -546,6 +558,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
         gltf::import(path).map_err(|source| gltf_error(path, source))?;
     let mut meshes = Vec::new();
     let mut materials = Vec::new();
+    let mut local_lights = Vec::new();
     let texture_import = import_gltf_textures(path, &document, &images)?;
     let transforms = gltf_scene_transforms(&document, &buffers)?;
 
@@ -560,6 +573,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
                 &texture_import,
                 &mut meshes,
                 &mut materials,
+                &mut local_lights,
             )?;
         }
     } else {
@@ -574,6 +588,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
                     &texture_import,
                     &mut meshes,
                     &mut materials,
+                    &mut local_lights,
                 )?;
             }
         }
@@ -606,6 +621,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
         source = %path.display(),
         meshes = meshes.len(),
         materials = materials.len(),
+        local_lights = local_lights.len(),
         bounds = ?scene_bounds_from_meshes(&meshes),
         "imported glTF asset"
     );
@@ -615,6 +631,7 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
         meshes,
         materials,
         texture_import.into_textures(),
+        local_lights,
     ))
 }
 
@@ -760,6 +777,7 @@ fn import_gltf_node(
     textures: &GltfImportedTextures,
     meshes: &mut Vec<ImportedMesh>,
     materials: &mut Vec<ImportedMaterial>,
+    local_lights: &mut Vec<LocalLightPacket>,
 ) -> Result<(), ImportError> {
     let transform = mat4_mul(
         parent_transform,
@@ -769,6 +787,8 @@ fn import_gltf_node(
             .copied()
             .unwrap_or_else(|| gltf_matrix(node.transform().matrix())),
     );
+
+    import_gltf_node_light(&node, transform, local_lights);
 
     if let Some(mesh) = node.mesh() {
         import_gltf_mesh(
@@ -786,11 +806,84 @@ fn import_gltf_node(
 
     for child in node.children() {
         import_gltf_node(
-            path, child, transform, transforms, buffers, textures, meshes, materials,
+            path,
+            child,
+            transform,
+            transforms,
+            buffers,
+            textures,
+            meshes,
+            materials,
+            local_lights,
         )?;
     }
 
     Ok(())
+}
+
+/// Imports a glTF punctual light attached to a node as a renderer local light.
+fn import_gltf_node_light(
+    node: &gltf::Node<'_>,
+    transform: [f32; 16],
+    local_lights: &mut Vec<LocalLightPacket>,
+) {
+    let Some(light) = node.light() else {
+        return;
+    };
+    let position = transform_position(transform, [0.0, 0.0, 0.0]);
+    let direction = transform_direction(transform, [0.0, 0.0, -1.0]);
+    let color = light.color();
+    let intensity = gltf_light_intensity(light.intensity());
+    let default_range = match light.kind() {
+        gltf::khr_lights_punctual::Kind::Directional => 96.0,
+        gltf::khr_lights_punctual::Kind::Point => 24.0,
+        gltf::khr_lights_punctual::Kind::Spot { .. } => 36.0,
+    };
+    let inferred_range = default_range * (0.85 + intensity.sqrt() * 0.28);
+    let range = light
+        .range()
+        .unwrap_or(default_range)
+        .max(inferred_range)
+        .max(1.0);
+    let source_radius = (range * 0.04).clamp(0.08, 4.0);
+
+    let packet = match light.kind() {
+        gltf::khr_lights_punctual::Kind::Directional => LocalLightPacket::rectangle(
+            position,
+            color,
+            intensity,
+            range,
+            direction,
+            [range * 0.18, range * 0.18],
+        ),
+        gltf::khr_lights_punctual::Kind::Point => {
+            LocalLightPacket::sphere(position, color, intensity, range, source_radius)
+        }
+        gltf::khr_lights_punctual::Kind::Spot {
+            inner_cone_angle,
+            outer_cone_angle,
+        } => LocalLightPacket::spot(
+            position,
+            color,
+            intensity,
+            range,
+            direction,
+            inner_cone_angle,
+            outer_cone_angle,
+        ),
+    };
+
+    if let Some(packet) = packet {
+        local_lights.push(packet);
+    }
+}
+
+fn gltf_light_intensity(intensity: f32) -> f32 {
+    if !intensity.is_finite() || intensity <= 0.0 {
+        return 0.0;
+    }
+
+    intensity.sqrt().clamp(0.08, 48.0)
 }
 
 /// Imports every triangle primitive from one glTF mesh with one shared node skin.
@@ -1463,6 +1556,130 @@ fn scene_bounds_from_meshes(meshes: &[ImportedMesh]) -> Option<SceneBounds> {
     let radius = mesh_radius(meshes, center)?;
 
     SceneBounds::new(center, radius)
+}
+
+/// Converts emissive mesh primitives into explicit local lights for loaded model assets.
+fn emissive_mesh_local_lights(
+    meshes: &[ImportedMesh],
+    materials: &[ImportedMaterial],
+) -> Vec<LocalLightPacket> {
+    const MIN_EMISSIVE_BRIGHTNESS: f32 = 0.02;
+    const EMISSIVE_LIGHT_COLOR_SCALE: f32 = 1.35;
+    const EMISSIVE_LIGHT_RADIUS_SCALE: f32 = 10.0;
+    const EMISSIVE_LIGHT_BRIGHTNESS_RANGE_SCALE: f32 = 6.0;
+    const EMISSIVE_LIGHT_MIN_RADIUS: f32 = 4.0;
+    const EMISSIVE_LIGHT_MAX_RADIUS: f32 = 192.0;
+    const EMISSIVE_SPOT_INNER_ANGLE: f32 = 1.05;
+    const EMISSIVE_SPOT_OUTER_ANGLE: f32 = 1.48;
+
+    meshes
+        .iter()
+        .zip(materials.iter())
+        .filter_map(|(mesh, material)| {
+            let emissive = material.emissive_factor();
+            let brightness = max3(emissive);
+            if brightness <= MIN_EMISSIVE_BRIGHTNESS {
+                return None;
+            }
+
+            let bounds = mesh_bounds(mesh)?;
+            let center = bounds.center();
+            let source_radius = bounds.radius();
+            let brightness_gain = brightness.sqrt();
+            let range = (source_radius * (EMISSIVE_LIGHT_RADIUS_SCALE + brightness_gain * 2.0)
+                + brightness_gain * EMISSIVE_LIGHT_BRIGHTNESS_RANGE_SCALE)
+                .clamp(EMISSIVE_LIGHT_MIN_RADIUS, EMISSIVE_LIGHT_MAX_RADIUS);
+            let color = [
+                emissive[0] * EMISSIVE_LIGHT_COLOR_SCALE,
+                emissive[1] * EMISSIVE_LIGHT_COLOR_SCALE,
+                emissive[2] * EMISSIVE_LIGHT_COLOR_SCALE,
+            ];
+
+            if let Some(direction) = mesh_emission_direction(mesh) {
+                let offset = (source_radius * 0.35).clamp(0.03, range * 0.08);
+                let position = [
+                    center[0] + direction[0] * offset,
+                    center[1] + direction[1] * offset,
+                    center[2] + direction[2] * offset,
+                ];
+                LocalLightPacket::spot(
+                    position,
+                    color,
+                    1.0,
+                    range,
+                    direction,
+                    EMISSIVE_SPOT_INNER_ANGLE,
+                    EMISSIVE_SPOT_OUTER_ANGLE,
+                )
+            } else {
+                LocalLightPacket::sphere(
+                    center,
+                    color,
+                    1.0,
+                    range,
+                    source_radius.clamp(0.05, range * 0.45),
+                )
+            }
+        })
+        .collect()
+}
+
+fn mesh_emission_direction(mesh: &ImportedMesh) -> Option<[f32; 3]> {
+    const MIN_COHERENCE: f32 = 0.25;
+
+    match mesh {
+        ImportedMesh::Plane => Some([0.0, 0.0, 1.0]),
+        ImportedMesh::Indexed(data) => {
+            let mut normal_sum = [0.0; 3];
+            let mut normal_count = 0usize;
+            for vertex in data.vertices() {
+                let normal = vertex.normal();
+                if !normal.iter().all(|value| value.is_finite()) {
+                    continue;
+                }
+                normal_sum = add3(normal_sum, normal);
+                normal_count += 1;
+            }
+            if normal_count == 0 {
+                return None;
+            }
+
+            let coherence = dot3(normal_sum, normal_sum).sqrt() / normal_count as f32;
+            (coherence >= MIN_COHERENCE).then(|| normalize_or(normal_sum, [0.0, 1.0, 0.0]))
+        }
+    }
+}
+
+fn mesh_bounds(mesh: &ImportedMesh) -> Option<SceneBounds> {
+    let positions = mesh_positions(mesh);
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut found = false;
+    for position in positions {
+        if !position.iter().all(|value| value.is_finite()) {
+            continue;
+        }
+        for axis in 0..3 {
+            min[axis] = min[axis].min(position[axis]);
+            max[axis] = max[axis].max(position[axis]);
+        }
+        found = true;
+    }
+    if !found {
+        return None;
+    }
+
+    let center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    let radius = mesh_radius(std::slice::from_ref(mesh), center)?;
+    SceneBounds::new(center, radius)
+}
+
+fn max3(value: [f32; 3]) -> f32 {
+    value[0].max(value[1]).max(value[2])
 }
 
 /// Returns aggregate min/max bounds for imported mesh positions.
@@ -2216,6 +2433,55 @@ mod tests {
         assert_eq!(texture.width(), 2);
         assert_eq!(texture.height(), 2);
         assert_eq!(texture.pixels().len(), 16);
+    }
+
+    // Verifies that emissive model geometry becomes an explicit local light on load.
+    #[test]
+    fn emissive_meshes_create_local_lights() {
+        let material = ImportedMaterial::with_pbr(
+            MaterialAlphaMode::Opaque,
+            500,
+            [1.0, 1.0, 1.0, 1.0],
+            0,
+            1000,
+            [4.0, 2.0, 1.0],
+            1000,
+            1000,
+            false,
+            Vec::new(),
+        );
+
+        let scene = ImportedScene::from_parts(
+            "emissive.r1scene".into(),
+            vec![ImportedMesh::Plane],
+            vec![material],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(scene.local_lights().len(), 1);
+        let light = scene.local_lights()[0];
+        assert_eq!(light.kind, crate::protocol::LocalLightKind::Spot);
+        assert_eq!(light.color, [5.4, 2.7, 1.35]);
+        assert_eq!(light.intensity, 1.0);
+        assert_eq!(light.direction, [0.0, 0.0, 1.0]);
+        assert!(light.position[2] > 0.0);
+        assert!(light.range > 16.0);
+        assert!(light.casts_shadow);
+    }
+
+    // Verifies that non-emissive geometry does not inflate the local light list.
+    #[test]
+    fn non_emissive_meshes_do_not_create_local_lights() {
+        let scene = ImportedScene::from_parts(
+            "plain.r1scene".into(),
+            vec![ImportedMesh::Plane],
+            vec![ImportedMaterial::opaque()],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(scene.local_lights().is_empty());
     }
 
     // Verifies that negative-scale glTF nodes keep their front-face winding after import.

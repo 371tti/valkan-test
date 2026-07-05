@@ -19,6 +19,8 @@ layout(set = 0, binding = 0) uniform FrameCamera {
     vec4 light_color;
     vec4 ambient_color;
     vec4 contact_shadow;
+    mat4 local_shadow_view_proj[24];
+    vec4 local_shadow_params[4];
 } frame_camera;
 
 layout(push_constant) uniform ShadowCascade {
@@ -26,8 +28,11 @@ layout(push_constant) uniform ShadowCascade {
 } shadow_cascade;
 
 void main() {
-    uint index = min(shadow_cascade.cascade_index, 3u);
-    gl_Position = frame_camera.shadow_view_proj[index] * vec4(in_position, 1.0);
+    uint index = shadow_cascade.cascade_index;
+    mat4 shadow_view_proj = index >= 4u
+        ? frame_camera.local_shadow_view_proj[min(index - 4u, 23u)]
+        : frame_camera.shadow_view_proj[min(index, 3u)];
+    gl_Position = shadow_view_proj * vec4(in_position, 1.0);
     frag_uv = in_uv;
     frag_color = in_color;
 }

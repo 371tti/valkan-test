@@ -1,0 +1,1077 @@
+use std::{ffi::CStr, io::Cursor, mem::size_of};
+
+use ash::{Device, util, vk};
+
+use crate::{
+    math::{cross3, dot3, normalize_or, sub3},
+    protocol::{BloomQualitySettings, CameraSnapshot, RenderQualitySettings},
+    renderer::{
+        DEFAULT_DIRECTIONAL_LIGHT_COLOR, DEFAULT_DIRECTIONAL_LIGHT_DIR, pipeline::shader_interface,
+    },
+};
+
+use super::{
+    VulkanError,
+    mesh::{EmissiveLightUniforms, MAX_LOCAL_LIGHTS},
+};
+
+const SHADER_ENTRY: &CStr = c"main";
+const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.vert.spv"));
+const MASK_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post_god_ray_mask.frag.spv"));
+const PREFILTER_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/post_god_ray_prefilter.frag.spv"));
+const RADIAL_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/post_god_ray_radial.frag.spv"));
+const TEMPORAL_SHADER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/post_god_ray_temporal.frag.spv"));
+
+const MASK_SCENE_COLOR_BINDING: u32 = 0;
+const MASK_SCENE_DEPTH_BINDING: u32 = 1;
+const MASK_TRANSPARENT_METADATA_BINDING: u32 = 2;
+const SOURCE_BINDING: u32 = 0;
+const TEMPORAL_CURRENT_BINDING: u32 = 0;
+const TEMPORAL_HISTORY_BINDING: u32 = 1;
+const GOD_RAY_SOURCE_COUNT: usize = 2;
+
+#[derive(Clone, Copy, Default)]
+struct GodRaySource {
+    source: [f32; 4],
+    color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct GodRayPushConstants {
+    depth: [f32; 4],
+    target: [f32; 4],
+    bloom: [f32; 4],
+    features: [f32; 4],
+    source0: [f32; 4],
+    color0: [f32; 4],
+    source1: [f32; 4],
+    color1: [f32; 4],
+}
+
+impl GodRayPushConstants {
+    pub(super) fn new(
+        camera: CameraSnapshot,
+        target_extent: vk::Extent2D,
+        quality: RenderQualitySettings,
+        directional_light_intensity: f32,
+        emissive_lights: EmissiveLightUniforms,
+        has_transparent_scene_items: bool,
+        history_valid: bool,
+    ) -> Self {
+        let bloom = quality.bloom();
+        let camera_params = camera_params(camera, target_extent);
+        let sources = god_ray_sources(
+            camera,
+            camera_params,
+            bloom,
+            directional_light_intensity,
+            emissive_lights,
+        );
+
+        Self {
+            depth: depth_params(camera),
+            target: target_params(target_extent),
+            bloom: bloom_params(bloom),
+            features: [
+                if has_transparent_scene_items {
+                    1.0
+                } else {
+                    0.0
+                },
+                if history_valid { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
+            source0: sources[0].source,
+            color0: sources[0].color,
+            source1: sources[1].source,
+            color1: sources[1].color,
+        }
+    }
+}
+
+pub(super) struct GodRaysPipeline {
+    mask_pipeline: vk::Pipeline,
+    prefilter_pipeline: vk::Pipeline,
+    radial_pipeline: vk::Pipeline,
+    temporal_pipeline: vk::Pipeline,
+    mask_pipeline_layout: vk::PipelineLayout,
+    source_pipeline_layout: vk::PipelineLayout,
+    temporal_pipeline_layout: vk::PipelineLayout,
+    mask_set_layout: vk::DescriptorSetLayout,
+    source_set_layout: vk::DescriptorSetLayout,
+    temporal_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    mask_set: vk::DescriptorSet,
+    prefilter_set: vk::DescriptorSet,
+    radial_set: vk::DescriptorSet,
+    temporal_sets: [vk::DescriptorSet; 2],
+    color_sampler: vk::Sampler,
+    data_sampler: vk::Sampler,
+}
+
+struct GodRaysBuild<'a> {
+    device: &'a Device,
+    mask_pipeline: Option<vk::Pipeline>,
+    prefilter_pipeline: Option<vk::Pipeline>,
+    radial_pipeline: Option<vk::Pipeline>,
+    temporal_pipeline: Option<vk::Pipeline>,
+    mask_pipeline_layout: Option<vk::PipelineLayout>,
+    source_pipeline_layout: Option<vk::PipelineLayout>,
+    temporal_pipeline_layout: Option<vk::PipelineLayout>,
+    mask_set_layout: Option<vk::DescriptorSetLayout>,
+    source_set_layout: Option<vk::DescriptorSetLayout>,
+    temporal_set_layout: Option<vk::DescriptorSetLayout>,
+    descriptor_pool: Option<vk::DescriptorPool>,
+    mask_set: Option<vk::DescriptorSet>,
+    prefilter_set: Option<vk::DescriptorSet>,
+    radial_set: Option<vk::DescriptorSet>,
+    temporal_sets: Vec<vk::DescriptorSet>,
+    color_sampler: Option<vk::Sampler>,
+    data_sampler: Option<vk::Sampler>,
+    finished: bool,
+}
+
+impl<'a> GodRaysBuild<'a> {
+    fn new(device: &'a Device) -> Self {
+        Self {
+            device,
+            mask_pipeline: None,
+            prefilter_pipeline: None,
+            radial_pipeline: None,
+            temporal_pipeline: None,
+            mask_pipeline_layout: None,
+            source_pipeline_layout: None,
+            temporal_pipeline_layout: None,
+            mask_set_layout: None,
+            source_set_layout: None,
+            temporal_set_layout: None,
+            descriptor_pool: None,
+            mask_set: None,
+            prefilter_set: None,
+            radial_set: None,
+            temporal_sets: Vec::new(),
+            color_sampler: None,
+            data_sampler: None,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) -> GodRaysPipeline {
+        let temporal_sets = [
+            self.temporal_sets
+                .first()
+                .copied()
+                .expect("god-ray temporal set 0 was not allocated"),
+            self.temporal_sets
+                .get(1)
+                .copied()
+                .expect("god-ray temporal set 1 was not allocated"),
+        ];
+        let pipeline = GodRaysPipeline {
+            mask_pipeline: take_created(&mut self.mask_pipeline, "god-ray mask pipeline"),
+            prefilter_pipeline: take_created(
+                &mut self.prefilter_pipeline,
+                "god-ray prefilter pipeline",
+            ),
+            radial_pipeline: take_created(&mut self.radial_pipeline, "god-ray radial pipeline"),
+            temporal_pipeline: take_created(
+                &mut self.temporal_pipeline,
+                "god-ray temporal pipeline",
+            ),
+            mask_pipeline_layout: take_created(
+                &mut self.mask_pipeline_layout,
+                "god-ray mask pipeline layout",
+            ),
+            source_pipeline_layout: take_created(
+                &mut self.source_pipeline_layout,
+                "god-ray source pipeline layout",
+            ),
+            temporal_pipeline_layout: take_created(
+                &mut self.temporal_pipeline_layout,
+                "god-ray temporal pipeline layout",
+            ),
+            mask_set_layout: take_created(&mut self.mask_set_layout, "god-ray mask set layout"),
+            source_set_layout: take_created(
+                &mut self.source_set_layout,
+                "god-ray source set layout",
+            ),
+            temporal_set_layout: take_created(
+                &mut self.temporal_set_layout,
+                "god-ray temporal set layout",
+            ),
+            descriptor_pool: take_created(&mut self.descriptor_pool, "god-ray descriptor pool"),
+            mask_set: take_created(&mut self.mask_set, "god-ray mask set"),
+            prefilter_set: take_created(&mut self.prefilter_set, "god-ray prefilter set"),
+            radial_set: take_created(&mut self.radial_set, "god-ray radial set"),
+            temporal_sets,
+            color_sampler: take_created(&mut self.color_sampler, "god-ray color sampler"),
+            data_sampler: take_created(&mut self.data_sampler, "god-ray data sampler"),
+        };
+        self.finished = true;
+        pipeline
+    }
+}
+
+impl Drop for GodRaysBuild<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+
+        for pipeline in [
+            self.temporal_pipeline.take(),
+            self.radial_pipeline.take(),
+            self.prefilter_pipeline.take(),
+            self.mask_pipeline.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            destroy_pipeline(self.device, pipeline);
+        }
+        if let Some(pool) = self.descriptor_pool.take() {
+            destroy_descriptor_pool(self.device, pool);
+        }
+        if let Some(sampler) = self.data_sampler.take() {
+            destroy_sampler(self.device, sampler);
+        }
+        if let Some(sampler) = self.color_sampler.take() {
+            destroy_sampler(self.device, sampler);
+        }
+        for layout in [
+            self.temporal_pipeline_layout.take(),
+            self.source_pipeline_layout.take(),
+            self.mask_pipeline_layout.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            destroy_pipeline_layout(self.device, layout);
+        }
+        for layout in [
+            self.temporal_set_layout.take(),
+            self.source_set_layout.take(),
+            self.mask_set_layout.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            destroy_descriptor_set_layout(self.device, layout);
+        }
+    }
+}
+
+impl GodRaysPipeline {
+    pub(super) fn create(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        scene_color_view: vk::ImageView,
+        scene_depth_view: vk::ImageView,
+        scene_transparent_normal_roughness_view: vk::ImageView,
+        mask_view: vk::ImageView,
+        prefilter_view: vk::ImageView,
+        blur_view: vk::ImageView,
+        history_views: [vk::ImageView; 2],
+    ) -> Result<Self, VulkanError> {
+        let mut build = GodRaysBuild::new(device);
+        build.mask_set_layout = Some(create_mask_set_layout(device)?);
+        build.source_set_layout = Some(create_source_set_layout(device)?);
+        build.temporal_set_layout = Some(create_temporal_set_layout(device)?);
+        build.mask_pipeline_layout = Some(create_pipeline_layout(
+            device,
+            take_created_ref(build.mask_set_layout)?,
+        )?);
+        build.source_pipeline_layout = Some(create_pipeline_layout(
+            device,
+            take_created_ref(build.source_set_layout)?,
+        )?);
+        build.temporal_pipeline_layout = Some(create_pipeline_layout(
+            device,
+            take_created_ref(build.temporal_set_layout)?,
+        )?);
+        build.color_sampler = Some(create_sampler(device, vk::Filter::LINEAR)?);
+        build.data_sampler = Some(create_sampler(device, vk::Filter::NEAREST)?);
+        build.descriptor_pool = Some(create_descriptor_pool(device)?);
+        build.mask_set = Some(allocate_descriptor_set(
+            device,
+            take_created_ref(build.descriptor_pool)?,
+            take_created_ref(build.mask_set_layout)?,
+        )?);
+        build.prefilter_set = Some(allocate_descriptor_set(
+            device,
+            take_created_ref(build.descriptor_pool)?,
+            take_created_ref(build.source_set_layout)?,
+        )?);
+        build.radial_set = Some(allocate_descriptor_set(
+            device,
+            take_created_ref(build.descriptor_pool)?,
+            take_created_ref(build.source_set_layout)?,
+        )?);
+        build.temporal_sets = allocate_descriptor_sets(
+            device,
+            take_created_ref(build.descriptor_pool)?,
+            take_created_ref(build.temporal_set_layout)?,
+            2,
+        )?;
+
+        update_mask_descriptor(
+            device,
+            take_created_ref(build.mask_set)?,
+            take_created_ref(build.color_sampler)?,
+            take_created_ref(build.data_sampler)?,
+            scene_color_view,
+            scene_depth_view,
+            scene_transparent_normal_roughness_view,
+        );
+        update_source_descriptor(
+            device,
+            take_created_ref(build.prefilter_set)?,
+            take_created_ref(build.color_sampler)?,
+            mask_view,
+        );
+        update_source_descriptor(
+            device,
+            take_created_ref(build.radial_set)?,
+            take_created_ref(build.color_sampler)?,
+            prefilter_view,
+        );
+        update_temporal_descriptors(
+            device,
+            &build.temporal_sets,
+            take_created_ref(build.color_sampler)?,
+            blur_view,
+            history_views,
+        );
+
+        build.mask_pipeline = Some(create_god_ray_pipeline(
+            device,
+            take_created_ref(build.mask_pipeline_layout)?,
+            render_pass,
+            MASK_SHADER,
+        )?);
+        build.prefilter_pipeline = Some(create_god_ray_pipeline(
+            device,
+            take_created_ref(build.source_pipeline_layout)?,
+            render_pass,
+            PREFILTER_SHADER,
+        )?);
+        build.radial_pipeline = Some(create_god_ray_pipeline(
+            device,
+            take_created_ref(build.source_pipeline_layout)?,
+            render_pass,
+            RADIAL_SHADER,
+        )?);
+        build.temporal_pipeline = Some(create_god_ray_pipeline(
+            device,
+            take_created_ref(build.temporal_pipeline_layout)?,
+            render_pass,
+            TEMPORAL_SHADER,
+        )?);
+
+        tracing::info!("created Vulkan god-ray low-resolution pipeline");
+        Ok(build.finish())
+    }
+
+    pub(super) fn draw_mask(
+        &self,
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+        target_extent: vk::Extent2D,
+        push: GodRayPushConstants,
+    ) {
+        self.draw(
+            device,
+            command_buffer,
+            self.mask_pipeline,
+            self.mask_pipeline_layout,
+            self.mask_set,
+            target_extent,
+            push,
+        );
+    }
+
+    pub(super) fn draw_prefilter(
+        &self,
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+        target_extent: vk::Extent2D,
+        push: GodRayPushConstants,
+    ) {
+        self.draw(
+            device,
+            command_buffer,
+            self.prefilter_pipeline,
+            self.source_pipeline_layout,
+            self.prefilter_set,
+            target_extent,
+            push,
+        );
+    }
+
+    pub(super) fn draw_radial(
+        &self,
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+        target_extent: vk::Extent2D,
+        push: GodRayPushConstants,
+    ) {
+        self.draw(
+            device,
+            command_buffer,
+            self.radial_pipeline,
+            self.source_pipeline_layout,
+            self.radial_set,
+            target_extent,
+            push,
+        );
+    }
+
+    pub(super) fn draw_temporal(
+        &self,
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+        target_extent: vk::Extent2D,
+        write_history_index: usize,
+        push: GodRayPushConstants,
+    ) -> Result<(), VulkanError> {
+        let descriptor_set = self.temporal_sets.get(write_history_index).copied().ok_or(
+            VulkanError::SwapchainImageIndexOutOfRange {
+                index: write_history_index,
+                count: self.temporal_sets.len(),
+            },
+        )?;
+        self.draw(
+            device,
+            command_buffer,
+            self.temporal_pipeline,
+            self.temporal_pipeline_layout,
+            descriptor_set,
+            target_extent,
+            push,
+        );
+        Ok(())
+    }
+
+    fn draw(
+        &self,
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+        pipeline: vk::Pipeline,
+        pipeline_layout: vk::PipelineLayout,
+        descriptor_set: vk::DescriptorSet,
+        target_extent: vk::Extent2D,
+        push: GodRayPushConstants,
+    ) {
+        let viewports = [vk::Viewport::default()
+            .x(0.0)
+            .y(0.0)
+            .width(target_extent.width as f32)
+            .height(target_extent.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0)];
+        let scissors = [vk::Rect2D::default()
+            .offset(vk::Offset2D { x: 0, y: 0 })
+            .extent(target_extent)];
+        let descriptor_sets = [descriptor_set];
+        let push_bytes = push_constant_bytes(&push);
+
+        unsafe {
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_set_viewport(command_buffer, 0, &viewports);
+            device.cmd_set_scissor(command_buffer, 0, &scissors);
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                shader_interface::FRAME_SET,
+                &descriptor_sets,
+                &[],
+            );
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push_bytes,
+            );
+            device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        }
+    }
+
+    pub(super) fn destroy(self, device: &Device) {
+        destroy_pipeline(device, self.temporal_pipeline);
+        destroy_pipeline(device, self.radial_pipeline);
+        destroy_pipeline(device, self.prefilter_pipeline);
+        destroy_pipeline(device, self.mask_pipeline);
+        destroy_descriptor_pool(device, self.descriptor_pool);
+        destroy_sampler(device, self.data_sampler);
+        destroy_sampler(device, self.color_sampler);
+        destroy_pipeline_layout(device, self.temporal_pipeline_layout);
+        destroy_pipeline_layout(device, self.source_pipeline_layout);
+        destroy_pipeline_layout(device, self.mask_pipeline_layout);
+        destroy_descriptor_set_layout(device, self.temporal_set_layout);
+        destroy_descriptor_set_layout(device, self.source_set_layout);
+        destroy_descriptor_set_layout(device, self.mask_set_layout);
+    }
+}
+
+fn camera_params(camera: CameraSnapshot, extent: vk::Extent2D) -> [f32; 4] {
+    let aspect = (extent.width as f32 / extent.height.max(1) as f32).max(0.0001);
+    let tan_half_fov = (camera.fov_y_radians * 0.5).tan();
+    let tan_half_fov = if tan_half_fov.is_finite() && tan_half_fov > 0.0001 {
+        tan_half_fov
+    } else {
+        0.57735026
+    };
+    let f = 1.0 / tan_half_fov;
+    let focal_x = f / aspect;
+    let focal_y = -f;
+
+    [focal_x, focal_y, 1.0 / focal_x, 1.0 / focal_y]
+}
+
+fn depth_params(camera: CameraSnapshot) -> [f32; 4] {
+    let near = camera.near.max(0.0001);
+    let far = camera.far.max(near + 0.001);
+    [near, far, near * far, far - near]
+}
+
+fn target_params(extent: vk::Extent2D) -> [f32; 4] {
+    let width = extent.width.max(1) as f32;
+    let height = extent.height.max(1) as f32;
+    [1.0 / width, 1.0 / height, height / width, 0.0]
+}
+
+fn bloom_params(bloom: BloomQualitySettings) -> [f32; 4] {
+    [
+        bloom.intensity(),
+        bloom.threshold(),
+        bloom.radius_pixels(),
+        bloom.god_rays_intensity(),
+    ]
+}
+
+fn god_ray_sources(
+    camera: CameraSnapshot,
+    camera_params: [f32; 4],
+    bloom: BloomQualitySettings,
+    directional_light_intensity: f32,
+    emissive_lights: EmissiveLightUniforms,
+) -> [GodRaySource; GOD_RAY_SOURCE_COUNT] {
+    let mut sources = [GodRaySource::default(); GOD_RAY_SOURCE_COUNT];
+    if bloom.god_rays_intensity() <= 0.0 {
+        return sources;
+    }
+
+    let forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
+    let right = normalize_or(cross3(forward, camera.up), [1.0, 0.0, 0.0]);
+    let up = cross3(right, forward);
+
+    if let Some(source) = directional_god_ray_source(
+        camera_params,
+        forward,
+        right,
+        up,
+        directional_light_intensity,
+    ) {
+        push_god_ray_source(&mut sources, source);
+    }
+
+    let light_count = (emissive_lights.count[0] as usize).min(MAX_LOCAL_LIGHTS);
+    let focal = camera_params[0]
+        .abs()
+        .max(camera_params[1].abs())
+        .max(0.0001);
+    let near = camera.near.max(0.001);
+    for index in 0..light_count {
+        if let Some(source) = local_god_ray_source(
+            camera,
+            camera_params,
+            forward,
+            right,
+            up,
+            focal,
+            near,
+            emissive_lights,
+            index,
+        ) {
+            push_god_ray_source(&mut sources, source);
+        }
+    }
+
+    sources
+}
+
+fn directional_god_ray_source(
+    camera_params: [f32; 4],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    directional_light_intensity: f32,
+) -> Option<GodRaySource> {
+    let light_dir = normalize_or(DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
+    let sun_dir = [-light_dir[0], -light_dir[1], -light_dir[2]];
+    let forward_alignment = dot3(forward, sun_dir);
+    let visibility = smoothstep(-0.08, 0.24, forward_alignment);
+    if visibility <= 0.001 {
+        return None;
+    }
+
+    let inv_depth = 1.0 / forward_alignment.max(0.0001);
+    let ndc_x = dot3(right, sun_dir) * camera_params[0] * inv_depth;
+    let ndc_y = dot3(up, sun_dir) * camera_params[1] * inv_depth;
+    let uv = [ndc_x * 0.5 + 0.5, ndc_y * 0.5 + 0.5];
+    let screen_fade = screen_presence(uv, 1.15);
+    if screen_fade <= 0.001 {
+        return None;
+    }
+
+    let color = [
+        DEFAULT_DIRECTIONAL_LIGHT_COLOR[0] * directional_light_intensity,
+        DEFAULT_DIRECTIONAL_LIGHT_COLOR[1] * directional_light_intensity,
+        DEFAULT_DIRECTIONAL_LIGHT_COLOR[2] * directional_light_intensity,
+    ];
+    let brightness = max3(color).sqrt().clamp(0.0, 1.35);
+    let chroma = chroma3(color, [1.0, 0.88, 0.72]);
+
+    Some(GodRaySource {
+        source: [
+            uv[0],
+            uv[1],
+            0.018,
+            visibility * screen_fade * brightness * 0.55,
+        ],
+        color: [chroma[0], chroma[1], chroma[2], 1.0],
+    })
+}
+
+fn local_god_ray_source(
+    camera: CameraSnapshot,
+    camera_params: [f32; 4],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    focal: f32,
+    near: f32,
+    emissive_lights: EmissiveLightUniforms,
+    index: usize,
+) -> Option<GodRaySource> {
+    let position_radius = emissive_lights.position_radius[index];
+    let color = emissive_lights.color[index];
+    let position = [position_radius[0], position_radius[1], position_radius[2]];
+    let delta = sub3(position, camera.eye);
+    let depth = dot3(forward, delta);
+    if !depth.is_finite() || depth <= near {
+        return None;
+    }
+
+    let inv_depth = 1.0 / depth;
+    let ndc_x = dot3(right, delta) * camera_params[0] * inv_depth;
+    let ndc_y = dot3(up, delta) * camera_params[1] * inv_depth;
+    let uv = [ndc_x * 0.5 + 0.5, ndc_y * 0.5 + 0.5];
+    let screen_fade = screen_presence(uv, 0.18);
+    if screen_fade <= 0.001 {
+        return None;
+    }
+
+    let range = position_radius[3].max(0.001);
+    let distance = dot3(delta, delta).sqrt();
+    let distance_fade = 1.0 - smoothstep(range * 0.72, range * 1.20, distance);
+    let light_color = [color[0], color[1], color[2]];
+    let brightness = color[3].max(max3(light_color)).max(0.0);
+    let strength = (brightness * 0.20).sqrt().clamp(0.0, 1.4) * distance_fade * screen_fade;
+    if strength <= 0.001 || !strength.is_finite() {
+        return None;
+    }
+
+    let source_radius = emissive_lights.direction_radius[index][3]
+        .max(emissive_lights.size_kind[index][0].max(emissive_lights.size_kind[index][1]))
+        .max(range * 0.010)
+        .min(range * 0.28);
+    let screen_radius = (source_radius * focal * 0.5 * inv_depth).clamp(0.0045, 0.070);
+    let chroma = chroma3(light_color, [1.0, 0.82, 0.55]);
+
+    Some(GodRaySource {
+        source: [uv[0], uv[1], screen_radius, strength],
+        color: [chroma[0], chroma[1], chroma[2], 0.0],
+    })
+}
+
+fn push_god_ray_source(sources: &mut [GodRaySource; GOD_RAY_SOURCE_COUNT], source: GodRaySource) {
+    if source.source[3] <= 0.0 {
+        return;
+    }
+    if source.source[3] > sources[0].source[3] {
+        sources[1] = sources[0];
+        sources[0] = source;
+    } else if source.source[3] > sources[1].source[3] {
+        sources[1] = source;
+    }
+}
+
+fn screen_presence(uv: [f32; 2], margin: f32) -> f32 {
+    let offscreen_x = ((uv[0] - 0.5).abs() - (0.5 + margin)).max(0.0);
+    let offscreen_y = ((uv[1] - 0.5).abs() - (0.5 + margin)).max(0.0);
+
+    1.0 - smoothstep(0.02, 0.42 + margin, offscreen_x.hypot(offscreen_y))
+}
+
+fn chroma3(color: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let peak = max3(color);
+    if !peak.is_finite() || peak <= 0.0001 {
+        return fallback;
+    }
+
+    [color[0] / peak, color[1] / peak, color[2] / peak]
+}
+
+fn max3(value: [f32; 3]) -> f32 {
+    value[0].max(value[1]).max(value[2])
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0).max(0.0001)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn create_mask_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, VulkanError> {
+    let bindings = [
+        sampler_binding(MASK_SCENE_COLOR_BINDING),
+        sampler_binding(MASK_SCENE_DEPTH_BINDING),
+        sampler_binding(MASK_TRANSPARENT_METADATA_BINDING),
+    ];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+    unsafe { device.create_descriptor_set_layout(&create_info, None) }.map_err(VulkanError::Vk)
+}
+
+fn create_source_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, VulkanError> {
+    let bindings = [sampler_binding(SOURCE_BINDING)];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+    unsafe { device.create_descriptor_set_layout(&create_info, None) }.map_err(VulkanError::Vk)
+}
+
+fn create_temporal_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, VulkanError> {
+    let bindings = [
+        sampler_binding(TEMPORAL_CURRENT_BINDING),
+        sampler_binding(TEMPORAL_HISTORY_BINDING),
+    ];
+    let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+    unsafe { device.create_descriptor_set_layout(&create_info, None) }.map_err(VulkanError::Vk)
+}
+
+fn sampler_binding(binding: u32) -> vk::DescriptorSetLayoutBinding<'static> {
+    vk::DescriptorSetLayoutBinding::default()
+        .binding(binding)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+}
+
+fn create_pipeline_layout(
+    device: &Device,
+    set_layout: vk::DescriptorSetLayout,
+) -> Result<vk::PipelineLayout, VulkanError> {
+    let set_layouts = [set_layout];
+    let push_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(size_of::<GodRayPushConstants>() as u32);
+    let push_ranges = [push_range];
+    let create_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(&push_ranges);
+
+    unsafe { device.create_pipeline_layout(&create_info, None) }.map_err(VulkanError::Vk)
+}
+
+fn create_sampler(device: &Device, filter: vk::Filter) -> Result<vk::Sampler, VulkanError> {
+    let create_info = vk::SamplerCreateInfo::default()
+        .mag_filter(filter)
+        .min_filter(filter)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .min_lod(0.0)
+        .max_lod(0.0);
+
+    unsafe { device.create_sampler(&create_info, None) }.map_err(VulkanError::Vk)
+}
+
+fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, VulkanError> {
+    let pool_size = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(9);
+    let pool_sizes = [pool_size];
+    let create_info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(5)
+        .pool_sizes(&pool_sizes);
+
+    unsafe { device.create_descriptor_pool(&create_info, None) }.map_err(VulkanError::Vk)
+}
+
+fn allocate_descriptor_set(
+    device: &Device,
+    descriptor_pool: vk::DescriptorPool,
+    set_layout: vk::DescriptorSetLayout,
+) -> Result<vk::DescriptorSet, VulkanError> {
+    let mut sets = allocate_descriptor_sets(device, descriptor_pool, set_layout, 1)?;
+    Ok(sets.remove(0))
+}
+
+fn allocate_descriptor_sets(
+    device: &Device,
+    descriptor_pool: vk::DescriptorPool,
+    set_layout: vk::DescriptorSetLayout,
+    count: u32,
+) -> Result<Vec<vk::DescriptorSet>, VulkanError> {
+    let layouts = vec![set_layout; count as usize];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(descriptor_pool)
+        .set_layouts(&layouts);
+
+    unsafe { device.allocate_descriptor_sets(&allocate_info) }.map_err(VulkanError::Vk)
+}
+
+fn update_mask_descriptor(
+    device: &Device,
+    descriptor_set: vk::DescriptorSet,
+    color_sampler: vk::Sampler,
+    data_sampler: vk::Sampler,
+    scene_color_view: vk::ImageView,
+    scene_depth_view: vk::ImageView,
+    transparent_view: vk::ImageView,
+) {
+    let color_info = [image_info(color_sampler, scene_color_view)];
+    let depth_info = [image_info(data_sampler, scene_depth_view)];
+    let transparent_info = [image_info(data_sampler, transparent_view)];
+    let writes = [
+        descriptor_write(descriptor_set, MASK_SCENE_COLOR_BINDING, &color_info),
+        descriptor_write(descriptor_set, MASK_SCENE_DEPTH_BINDING, &depth_info),
+        descriptor_write(
+            descriptor_set,
+            MASK_TRANSPARENT_METADATA_BINDING,
+            &transparent_info,
+        ),
+    ];
+
+    unsafe {
+        device.update_descriptor_sets(&writes, &[]);
+    }
+}
+
+fn update_source_descriptor(
+    device: &Device,
+    descriptor_set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    image_view: vk::ImageView,
+) {
+    let info = [image_info(sampler, image_view)];
+    let writes = [descriptor_write(descriptor_set, SOURCE_BINDING, &info)];
+
+    unsafe {
+        device.update_descriptor_sets(&writes, &[]);
+    }
+}
+
+fn update_temporal_descriptors(
+    device: &Device,
+    descriptor_sets: &[vk::DescriptorSet],
+    sampler: vk::Sampler,
+    blur_view: vk::ImageView,
+    history_views: [vk::ImageView; 2],
+) {
+    for (write_index, &set) in descriptor_sets.iter().enumerate() {
+        let read_index = 1 - write_index;
+        let current_info = [image_info(sampler, blur_view)];
+        let history_info = [image_info(sampler, history_views[read_index])];
+        let writes = [
+            descriptor_write(set, TEMPORAL_CURRENT_BINDING, &current_info),
+            descriptor_write(set, TEMPORAL_HISTORY_BINDING, &history_info),
+        ];
+
+        unsafe {
+            device.update_descriptor_sets(&writes, &[]);
+        }
+    }
+}
+
+fn descriptor_write<'a>(
+    descriptor_set: vk::DescriptorSet,
+    binding: u32,
+    image_info: &'a [vk::DescriptorImageInfo],
+) -> vk::WriteDescriptorSet<'a> {
+    vk::WriteDescriptorSet::default()
+        .dst_set(descriptor_set)
+        .dst_binding(binding)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(image_info)
+}
+
+fn image_info(sampler: vk::Sampler, image_view: vk::ImageView) -> vk::DescriptorImageInfo {
+    vk::DescriptorImageInfo::default()
+        .sampler(sampler)
+        .image_view(image_view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+}
+
+fn create_god_ray_pipeline(
+    device: &Device,
+    pipeline_layout: vk::PipelineLayout,
+    render_pass: vk::RenderPass,
+    fragment_shader_bytes: &[u8],
+) -> Result<vk::Pipeline, VulkanError> {
+    let vertex_shader = create_shader_module(device, VERTEX_SHADER)?;
+    let fragment_shader = match create_shader_module(device, fragment_shader_bytes) {
+        Ok(shader) => shader,
+        Err(error) => {
+            destroy_shader_module(device, vertex_shader);
+            return Err(error);
+        }
+    };
+    let pipeline = create_graphics_pipeline(
+        device,
+        pipeline_layout,
+        render_pass,
+        vertex_shader,
+        fragment_shader,
+    );
+
+    destroy_shader_module(device, fragment_shader);
+    destroy_shader_module(device, vertex_shader);
+    pipeline
+}
+
+fn create_shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, VulkanError> {
+    let code = util::read_spv(&mut Cursor::new(bytes)).map_err(VulkanError::ShaderCodeRead)?;
+    let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
+
+    unsafe { device.create_shader_module(&create_info, None) }.map_err(VulkanError::Vk)
+}
+
+fn create_graphics_pipeline(
+    device: &Device,
+    pipeline_layout: vk::PipelineLayout,
+    render_pass: vk::RenderPass,
+    vertex_shader: vk::ShaderModule,
+    fragment_shader: vk::ShaderModule,
+) -> Result<vk::Pipeline, VulkanError> {
+    let shader_stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex_shader)
+            .name(SHADER_ENTRY),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fragment_shader)
+            .name(SHADER_ENTRY),
+    ];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+        .viewport_count(1)
+        .scissor_count(1);
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .line_width(1.0);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default().color_write_mask(
+        vk::ColorComponentFlags::R
+            | vk::ColorComponentFlags::G
+            | vk::ColorComponentFlags::B
+            | vk::ColorComponentFlags::A,
+    );
+    let color_blend_attachments = [color_blend_attachment];
+    let color_blend =
+        vk::PipelineColorBlendStateCreateInfo::default().attachments(&color_blend_attachments);
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&shader_stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .dynamic_state(&dynamic_state)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0);
+    let pipeline_infos = [pipeline_info];
+
+    match unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
+    } {
+        Ok(mut pipelines) => Ok(pipelines.remove(0)),
+        Err((pipelines, error)) => {
+            for pipeline in pipelines {
+                destroy_pipeline(device, pipeline);
+            }
+            Err(VulkanError::Vk(error))
+        }
+    }
+}
+
+fn take_created_ref<T: Copy>(value: Option<T>) -> Result<T, VulkanError> {
+    value.ok_or_else(|| VulkanError::GraphCompile("god-ray build order is invalid".to_string()))
+}
+
+fn take_created<T>(value: &mut Option<T>, label: &'static str) -> T {
+    value
+        .take()
+        .unwrap_or_else(|| panic!("{label} was not created"))
+}
+
+fn push_constant_bytes<T>(value: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn destroy_descriptor_set_layout(device: &Device, layout: vk::DescriptorSetLayout) {
+    if layout != vk::DescriptorSetLayout::null() {
+        unsafe { device.destroy_descriptor_set_layout(layout, None) };
+    }
+}
+
+fn destroy_pipeline_layout(device: &Device, layout: vk::PipelineLayout) {
+    if layout != vk::PipelineLayout::null() {
+        unsafe { device.destroy_pipeline_layout(layout, None) };
+    }
+}
+
+fn destroy_descriptor_pool(device: &Device, pool: vk::DescriptorPool) {
+    if pool != vk::DescriptorPool::null() {
+        unsafe { device.destroy_descriptor_pool(pool, None) };
+    }
+}
+
+fn destroy_sampler(device: &Device, sampler: vk::Sampler) {
+    if sampler != vk::Sampler::null() {
+        unsafe { device.destroy_sampler(sampler, None) };
+    }
+}
+
+fn destroy_pipeline(device: &Device, pipeline: vk::Pipeline) {
+    if pipeline != vk::Pipeline::null() {
+        unsafe { device.destroy_pipeline(pipeline, None) };
+    }
+}
+
+fn destroy_shader_module(device: &Device, shader: vk::ShaderModule) {
+    if shader != vk::ShaderModule::null() {
+        unsafe { device.destroy_shader_module(shader, None) };
+    }
+}

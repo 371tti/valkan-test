@@ -68,7 +68,14 @@ impl GpuAssetStore {
             "registered imported asset handles"
         );
 
-        LoadedAsset::new(Some(scene), meshes, materials, textures, imported.bounds())
+        LoadedAsset::new(
+            Some(scene),
+            meshes,
+            materials,
+            textures,
+            imported.local_lights().to_vec(),
+            imported.bounds(),
+        )
     }
 
     /// Invalidates one asset handle and defers destruction until GPU lifetime retirement.
@@ -335,6 +342,7 @@ mod tests {
             vec![crate::import::ImportedMesh::Plane],
             vec![material],
             vec![texture],
+            Vec::new(),
         );
         let mut store = GpuAssetStore::default();
 
@@ -361,11 +369,15 @@ mod tests {
     // Verifies that Stage 7 starts storing real mesh geometry for future Vulkan upload.
     #[test]
     fn upload_plane_scene_keeps_mesh_geometry() {
+        let light =
+            crate::protocol::LocalLightPacket::point([1.0, 2.0, 3.0], [1.0, 0.8, 0.6], 2.0, 8.0)
+                .expect("test light is valid");
         let imported = ImportedScene::from_parts(
             "scene.r1scene".into(),
             vec![crate::import::ImportedMesh::Plane],
             Vec::new(),
             Vec::new(),
+            vec![light],
         );
         let mut store = GpuAssetStore::default();
 
@@ -376,5 +388,6 @@ mod tests {
         assert_eq!(stored.geometry().vertex_count(), 4);
         assert_eq!(stored.geometry().index_count(), 6);
         assert!(stored.is_draw_ready());
+        assert_eq!(loaded.local_lights, vec![light]);
     }
 }

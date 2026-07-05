@@ -102,6 +102,11 @@ bool post_aa_enabled() {
     return params.aa.w > 0.0;
 }
 
+bool post_bloom_enabled() {
+    return params.bloom.x > 0.0 ||
+        params.bloom.w > 0.0;
+}
+
 bool post_transparent_metadata_enabled() {
     return params.features.x > 0.5;
 }

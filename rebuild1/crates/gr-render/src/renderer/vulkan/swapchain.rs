@@ -6,23 +6,30 @@ use crate::protocol::NonZeroExtent;
 
 use super::{
     VulkanDevice, VulkanError,
-    mesh::{MeshPassResources, MeshPipelineSet, VulkanMeshStore},
+    bloom::BloomPipeline,
+    god_rays::GodRaysPipeline,
+    mesh::{MAX_LOCAL_LIGHTS, MeshPassResources, MeshPipelineSet, VulkanMeshStore},
     post::PostPipeline,
     shadow_blur::ShadowMomentBlurPipeline,
     swapchain_pass::{
-        create_post_framebuffer, create_post_render_pass, create_scene_fast_framebuffer,
-        create_scene_fast_render_pass, create_scene_framebuffer, create_scene_render_pass,
-        create_shadow_blur_render_pass, create_shadow_framebuffer, create_shadow_render_pass,
-        create_translucent_shadow_framebuffer, create_translucent_shadow_render_pass,
-        destroy_framebuffer, destroy_render_pass,
+        create_bloom_downsample_render_pass, create_bloom_upsample_render_pass,
+        create_god_ray_render_pass, create_local_shadow_framebuffer,
+        create_local_shadow_render_pass, create_post_framebuffer, create_post_render_pass,
+        create_scene_fast_framebuffer, create_scene_fast_render_pass, create_scene_framebuffer,
+        create_scene_render_pass, create_shadow_blur_render_pass, create_shadow_framebuffer,
+        create_shadow_render_pass, create_translucent_shadow_framebuffer,
+        create_translucent_shadow_render_pass, destroy_framebuffer, destroy_render_pass,
     },
     swapchain_target::{
-        ColorTarget, DepthTarget, create_color_target, create_depth_target, destroy_color_target,
-        destroy_depth_target, destroy_image_view, initialize_shadow_sampler_fallback_images,
+        ColorTarget, DepthCubeTarget, DepthTarget, create_color_target, create_depth_cube_target,
+        create_depth_target, destroy_color_target, destroy_depth_cube_target, destroy_depth_target,
+        destroy_image_view, initialize_depth_cube_shader_read_image,
+        initialize_shadow_sampler_fallback_images,
     },
 };
 use crate::renderer::graph::{
-    FrameGraphInitialStates, GraphResource, ResourceState, SHADOW_CASCADE_COUNT,
+    BLOOM_MIP_COUNT, FrameGraphInitialStates, GOD_RAY_HISTORY_COUNT, GOD_RAY_HISTORY_RESOURCES,
+    GOD_RAY_TEMPORAL_PASS, GraphResource, ResourceState, SHADOW_CASCADE_COUNT,
     SHADOW_CASCADE_RESOURCES, SHADOW_MOMENT_BLUR_RESOURCES, SHADOW_MOMENT_RAW_RESOURCES,
     TRANSLUCENT_SHADOW_RESOURCES,
 };
@@ -79,25 +86,38 @@ pub(super) struct VulkanSwapchain {
     scene: SceneTargets,
     scene_render_pass: vk::RenderPass,
     scene_fast_render_pass: vk::RenderPass,
+    bloom_downsample_render_pass: vk::RenderPass,
+    bloom_upsample_render_pass: vk::RenderPass,
+    god_ray_render_pass: vk::RenderPass,
     post_render_pass: vk::RenderPass,
     mesh_pipeline: MeshPipelineSet,
     mesh_fast_pipeline: MeshPipelineSet,
     transparent_mesh_pipeline: MeshPipelineSet,
     transparent_mesh_fast_pipeline: MeshPipelineSet,
+    bloom_pipeline: BloomPipeline,
+    god_rays_pipeline: GodRaysPipeline,
     post_pipeline: PostPipeline,
     scene_framebuffer: vk::Framebuffer,
     scene_fast_framebuffer: vk::Framebuffer,
+    bloom: BloomTargets,
+    god_rays: GodRayTargets,
+    bloom_downsample_framebuffers: Vec<vk::Framebuffer>,
+    bloom_upsample_framebuffers: Vec<vk::Framebuffer>,
+    god_ray_framebuffers: GodRayFramebuffers,
     post_framebuffers: Vec<vk::Framebuffer>,
 }
 
 pub(super) struct ShadowResources {
     cascades: [ShadowCascade; SHADOW_CASCADE_COUNT],
+    local: Vec<LocalShadowCube>,
     shadow_render_pass: vk::RenderPass,
+    local_shadow_render_pass: vk::RenderPass,
     blur_render_pass: vk::RenderPass,
     translucent_render_pass: vk::RenderPass,
     mesh_pass_resources: MeshPassResources,
     translucent_pass_resources: MeshPassResources,
     shadow_pipeline: MeshPipelineSet,
+    local_shadow_pipeline: MeshPipelineSet,
     blur_pipeline: ShadowMomentBlurPipeline,
     translucent_pipeline: MeshPipelineSet,
 }
@@ -105,6 +125,7 @@ pub(super) struct ShadowResources {
 pub(super) struct ShadowSamplerFallback {
     moments: ColorTarget,
     transmittance: ColorTarget,
+    local_depth: DepthCubeTarget,
     mesh_pass_resources: MeshPassResources,
 }
 
@@ -125,6 +146,12 @@ struct ShadowCascade {
     extent: NonZeroExtent,
 }
 
+struct LocalShadowCube {
+    depth: DepthCubeTarget,
+    framebuffers: [vk::Framebuffer; 6],
+    extent: NonZeroExtent,
+}
+
 struct SceneTargets {
     color: ColorTarget,
     normal_roughness: ColorTarget,
@@ -134,6 +161,46 @@ struct SceneTargets {
     normal_roughness_state: ResourceState,
     transparent_normal_roughness_state: ResourceState,
     depth_state: ResourceState,
+}
+
+struct BloomLevelTarget {
+    color: ColorTarget,
+    extent: NonZeroExtent,
+    state: ResourceState,
+}
+
+struct BloomTargets {
+    levels: Vec<BloomLevelTarget>,
+}
+
+struct GodRayTargets {
+    mask: GodRayTarget,
+    prefilter: GodRayTarget,
+    blur: GodRayTarget,
+    histories: Vec<GodRayTarget>,
+    history_write_index: usize,
+    history_valid: bool,
+}
+
+struct GodRayTarget {
+    color: ColorTarget,
+    extent: NonZeroExtent,
+    state: ResourceState,
+}
+
+struct GodRayTargetSet {
+    mask: GodRayTarget,
+    prefilter: GodRayTarget,
+    blur: GodRayTarget,
+    histories: Vec<GodRayTarget>,
+}
+
+#[derive(Default)]
+struct GodRayFramebuffers {
+    mask: vk::Framebuffer,
+    prefilter: vk::Framebuffer,
+    radial: vk::Framebuffer,
+    histories: Vec<vk::Framebuffer>,
 }
 
 impl SceneTargets {
@@ -207,6 +274,162 @@ impl SceneTargets {
     }
 }
 
+impl BloomTargets {
+    fn new(levels: Vec<BloomLevelTarget>) -> Self {
+        assert_eq!(
+            levels.len(),
+            BLOOM_MIP_COUNT,
+            "bloom target chain must match graph resource count"
+        );
+        Self { levels }
+    }
+
+    fn graph_states(&self) -> [ResourceState; BLOOM_MIP_COUNT] {
+        std::array::from_fn(|index| self.levels[index].state)
+    }
+
+    fn apply_graph_final_states(&mut self, plan: &crate::renderer::graph::FrameGraphPlan) {
+        for (index, level) in self.levels.iter_mut().enumerate() {
+            if let Some(state) =
+                plan.final_state_for(crate::renderer::graph::BLOOM_MIP_RESOURCES[index])
+            {
+                level.state = state;
+            }
+        }
+    }
+
+    fn graph_image(&self, resource: GraphResource) -> Option<(vk::Image, vk::ImageAspectFlags)> {
+        let index = resource.bloom_mip()?;
+        self.levels
+            .get(index)
+            .map(|level| (level.color.image, vk::ImageAspectFlags::COLOR))
+    }
+
+    fn extent_2d(&self, mip_index: usize) -> Result<vk::Extent2D, VulkanError> {
+        let level =
+            self.levels
+                .get(mip_index)
+                .ok_or(VulkanError::SwapchainImageIndexOutOfRange {
+                    index: mip_index,
+                    count: self.levels.len(),
+                })?;
+        Ok(vk::Extent2D {
+            width: level.extent.width(),
+            height: level.extent.height(),
+        })
+    }
+
+    fn destroy(self, device: &Device) {
+        for level in self.levels.into_iter().rev() {
+            destroy_color_target(device, level.color);
+        }
+    }
+}
+
+impl GodRayTargets {
+    fn new(
+        mask: GodRayTarget,
+        prefilter: GodRayTarget,
+        blur: GodRayTarget,
+        histories: Vec<GodRayTarget>,
+    ) -> Self {
+        assert_eq!(
+            histories.len(),
+            GOD_RAY_HISTORY_COUNT,
+            "god-ray history target count must match graph resource count"
+        );
+        Self {
+            mask,
+            prefilter,
+            blur,
+            histories,
+            history_write_index: 0,
+            history_valid: false,
+        }
+    }
+
+    fn history_states(&self) -> [ResourceState; GOD_RAY_HISTORY_COUNT] {
+        std::array::from_fn(|index| self.histories[index].state)
+    }
+
+    fn apply_graph_final_states(&mut self, plan: &crate::renderer::graph::FrameGraphPlan) {
+        if let Some(state) = plan.final_state_for(GraphResource::GodRayMask) {
+            self.mask.state = state;
+        }
+        if let Some(state) = plan.final_state_for(GraphResource::GodRayPrefilter) {
+            self.prefilter.state = state;
+        }
+        if let Some(state) = plan.final_state_for(GraphResource::GodRayBlur) {
+            self.blur.state = state;
+        }
+        for (index, history) in self.histories.iter_mut().enumerate() {
+            if let Some(state) = plan.final_state_for(GOD_RAY_HISTORY_RESOURCES[index]) {
+                history.state = state;
+            }
+        }
+        if plan
+            .passes()
+            .iter()
+            .any(|pass| pass.name() == GOD_RAY_TEMPORAL_PASS)
+        {
+            self.history_valid = true;
+            self.history_write_index = 1 - self.history_write_index;
+        }
+    }
+
+    fn graph_image(&self, resource: GraphResource) -> Option<(vk::Image, vk::ImageAspectFlags)> {
+        let color = match resource {
+            GraphResource::GodRayMask => Some(&self.mask.color),
+            GraphResource::GodRayPrefilter => Some(&self.prefilter.color),
+            GraphResource::GodRayBlur => Some(&self.blur.color),
+            _ => resource
+                .god_ray_history()
+                .and_then(|index| self.histories.get(index).map(|target| &target.color)),
+        }?;
+
+        Some((color.image, vk::ImageAspectFlags::COLOR))
+    }
+
+    fn extent_2d(&self) -> vk::Extent2D {
+        vk::Extent2D {
+            width: self.mask.extent.width(),
+            height: self.mask.extent.height(),
+        }
+    }
+
+    fn history_write_index(&self) -> usize {
+        self.history_write_index
+    }
+
+    fn history_valid(&self) -> bool {
+        self.history_valid
+    }
+
+    fn destroy(self, device: &Device) {
+        for history in self.histories.into_iter().rev() {
+            destroy_color_target(device, history.color);
+        }
+        destroy_color_target(device, self.blur.color);
+        destroy_color_target(device, self.prefilter.color);
+        destroy_color_target(device, self.mask.color);
+    }
+}
+
+impl GodRayFramebuffers {
+    fn count(&self) -> usize {
+        3 + self.histories.len()
+    }
+
+    fn destroy(self, device: &Device) {
+        for framebuffer in self.histories {
+            destroy_framebuffer(device, framebuffer);
+        }
+        destroy_framebuffer(device, self.radial);
+        destroy_framebuffer(device, self.prefilter);
+        destroy_framebuffer(device, self.mask);
+    }
+}
+
 pub(super) struct SwapchainSupport {
     capabilities: vk::SurfaceCapabilitiesKHR,
     formats: Vec<vk::SurfaceFormatKHR>,
@@ -239,16 +462,29 @@ struct SwapchainBuild<'a> {
     scene_normal_roughness: Option<ColorTarget>,
     scene_transparent_normal_roughness: Option<ColorTarget>,
     scene_depth: Option<DepthTarget>,
+    bloom_levels: Vec<BloomLevelTarget>,
+    god_ray_mask: Option<GodRayTarget>,
+    god_ray_prefilter: Option<GodRayTarget>,
+    god_ray_blur: Option<GodRayTarget>,
+    god_ray_histories: Vec<GodRayTarget>,
     scene_render_pass: Option<vk::RenderPass>,
     scene_fast_render_pass: Option<vk::RenderPass>,
+    bloom_downsample_render_pass: Option<vk::RenderPass>,
+    bloom_upsample_render_pass: Option<vk::RenderPass>,
+    god_ray_render_pass: Option<vk::RenderPass>,
     post_render_pass: Option<vk::RenderPass>,
     mesh_pipeline: Option<MeshPipelineSet>,
     mesh_fast_pipeline: Option<MeshPipelineSet>,
     transparent_mesh_pipeline: Option<MeshPipelineSet>,
     transparent_mesh_fast_pipeline: Option<MeshPipelineSet>,
+    bloom_pipeline: Option<BloomPipeline>,
+    god_rays_pipeline: Option<GodRaysPipeline>,
     post_pipeline: Option<PostPipeline>,
     scene_framebuffer: Option<vk::Framebuffer>,
     scene_fast_framebuffer: Option<vk::Framebuffer>,
+    bloom_downsample_framebuffers: Vec<vk::Framebuffer>,
+    bloom_upsample_framebuffers: Vec<vk::Framebuffer>,
+    god_ray_framebuffers: GodRayFramebuffers,
     post_framebuffers: Vec<vk::Framebuffer>,
     finished: bool,
 }
@@ -276,16 +512,29 @@ impl<'a> SwapchainBuild<'a> {
             scene_normal_roughness: None,
             scene_transparent_normal_roughness: None,
             scene_depth: None,
+            bloom_levels: Vec::new(),
+            god_ray_mask: None,
+            god_ray_prefilter: None,
+            god_ray_blur: None,
+            god_ray_histories: Vec::new(),
             scene_render_pass: None,
             scene_fast_render_pass: None,
+            bloom_downsample_render_pass: None,
+            bloom_upsample_render_pass: None,
+            god_ray_render_pass: None,
             post_render_pass: None,
             mesh_pipeline: None,
             mesh_fast_pipeline: None,
             transparent_mesh_pipeline: None,
             transparent_mesh_fast_pipeline: None,
+            bloom_pipeline: None,
+            god_rays_pipeline: None,
             post_pipeline: None,
             scene_framebuffer: None,
             scene_fast_framebuffer: None,
+            bloom_downsample_framebuffers: Vec::new(),
+            bloom_upsample_framebuffers: Vec::new(),
+            god_ray_framebuffers: GodRayFramebuffers::default(),
             post_framebuffers: Vec::new(),
             finished: false,
         }
@@ -318,6 +567,15 @@ impl<'a> SwapchainBuild<'a> {
                 &mut self.scene_fast_render_pass,
                 "fast scene render pass",
             ),
+            bloom_downsample_render_pass: take_created(
+                &mut self.bloom_downsample_render_pass,
+                "bloom downsample render pass",
+            ),
+            bloom_upsample_render_pass: take_created(
+                &mut self.bloom_upsample_render_pass,
+                "bloom upsample render pass",
+            ),
+            god_ray_render_pass: take_created(&mut self.god_ray_render_pass, "god-ray render pass"),
             post_render_pass: take_created(&mut self.post_render_pass, "post render pass"),
             mesh_pipeline: take_created(&mut self.mesh_pipeline, "mesh pipeline"),
             mesh_fast_pipeline: take_created(&mut self.mesh_fast_pipeline, "fast mesh pipeline"),
@@ -329,12 +587,24 @@ impl<'a> SwapchainBuild<'a> {
                 &mut self.transparent_mesh_fast_pipeline,
                 "fast transparent mesh pipeline",
             ),
+            bloom_pipeline: take_created(&mut self.bloom_pipeline, "bloom pipeline"),
+            god_rays_pipeline: take_created(&mut self.god_rays_pipeline, "god-ray pipeline"),
             post_pipeline: take_created(&mut self.post_pipeline, "post pipeline"),
             scene_framebuffer: take_created(&mut self.scene_framebuffer, "scene framebuffer"),
             scene_fast_framebuffer: take_created(
                 &mut self.scene_fast_framebuffer,
                 "fast scene framebuffer",
             ),
+            bloom: BloomTargets::new(std::mem::take(&mut self.bloom_levels)),
+            god_rays: GodRayTargets::new(
+                take_created(&mut self.god_ray_mask, "god-ray mask target"),
+                take_created(&mut self.god_ray_prefilter, "god-ray prefilter target"),
+                take_created(&mut self.god_ray_blur, "god-ray blur target"),
+                std::mem::take(&mut self.god_ray_histories),
+            ),
+            bloom_downsample_framebuffers: std::mem::take(&mut self.bloom_downsample_framebuffers),
+            bloom_upsample_framebuffers: std::mem::take(&mut self.bloom_upsample_framebuffers),
+            god_ray_framebuffers: std::mem::take(&mut self.god_ray_framebuffers),
             post_framebuffers: std::mem::take(&mut self.post_framebuffers),
         };
         self.finished = true;
@@ -351,6 +621,11 @@ impl Drop for SwapchainBuild<'_> {
 
         self.device
             .destroy_framebuffers(std::mem::take(&mut self.post_framebuffers));
+        std::mem::take(&mut self.god_ray_framebuffers).destroy(&self.device.device);
+        self.device
+            .destroy_framebuffers(std::mem::take(&mut self.bloom_upsample_framebuffers));
+        self.device
+            .destroy_framebuffers(std::mem::take(&mut self.bloom_downsample_framebuffers));
         if let Some(framebuffer) = self.scene_fast_framebuffer.take() {
             destroy_framebuffer(&self.device.device, framebuffer);
         }
@@ -358,6 +633,12 @@ impl Drop for SwapchainBuild<'_> {
             destroy_framebuffer(&self.device.device, framebuffer);
         }
         if let Some(pipeline) = self.post_pipeline.take() {
+            pipeline.destroy(&self.device.device);
+        }
+        if let Some(pipeline) = self.god_rays_pipeline.take() {
+            pipeline.destroy(&self.device.device);
+        }
+        if let Some(pipeline) = self.bloom_pipeline.take() {
             pipeline.destroy(&self.device.device);
         }
         if let Some(pipeline) = self.mesh_pipeline.take() {
@@ -382,6 +663,9 @@ impl Drop for SwapchainBuild<'_> {
         }
         for render_pass in [
             self.post_render_pass.take(),
+            self.god_ray_render_pass.take(),
+            self.bloom_upsample_render_pass.take(),
+            self.bloom_downsample_render_pass.take(),
             self.scene_fast_render_pass.take(),
             self.scene_render_pass.take(),
         ]
@@ -392,6 +676,24 @@ impl Drop for SwapchainBuild<'_> {
         }
         if let Some(depth) = self.scene_depth.take() {
             destroy_depth_target(&self.device.device, depth);
+        }
+        for level in std::mem::take(&mut self.bloom_levels).into_iter().rev() {
+            destroy_color_target(&self.device.device, level.color);
+        }
+        for target in std::mem::take(&mut self.god_ray_histories)
+            .into_iter()
+            .rev()
+        {
+            destroy_color_target(&self.device.device, target.color);
+        }
+        if let Some(target) = self.god_ray_blur.take() {
+            destroy_color_target(&self.device.device, target.color);
+        }
+        if let Some(target) = self.god_ray_prefilter.take() {
+            destroy_color_target(&self.device.device, target.color);
+        }
+        if let Some(target) = self.god_ray_mask.take() {
+            destroy_color_target(&self.device.device, target.color);
         }
         if let Some(normal_roughness) = self.scene_normal_roughness.take() {
             destroy_color_target(&self.device.device, normal_roughness);
@@ -411,12 +713,15 @@ impl Drop for SwapchainBuild<'_> {
 struct ShadowBuild<'a> {
     device: &'a VulkanDevice,
     cascades: Vec<ShadowCascade>,
+    local: Vec<LocalShadowCube>,
     shadow_render_pass: Option<vk::RenderPass>,
+    local_shadow_render_pass: Option<vk::RenderPass>,
     blur_render_pass: Option<vk::RenderPass>,
     translucent_render_pass: Option<vk::RenderPass>,
     mesh_pass_resources: Option<MeshPassResources>,
     translucent_pass_resources: Option<MeshPassResources>,
     shadow_pipeline: Option<MeshPipelineSet>,
+    local_shadow_pipeline: Option<MeshPipelineSet>,
     blur_pipeline: Option<ShadowMomentBlurPipeline>,
     translucent_pipeline: Option<MeshPipelineSet>,
     finished: bool,
@@ -428,12 +733,15 @@ impl<'a> ShadowBuild<'a> {
         Self {
             device,
             cascades: Vec::with_capacity(SHADOW_CASCADE_COUNT),
+            local: Vec::with_capacity(MAX_LOCAL_LIGHTS),
             shadow_render_pass: None,
+            local_shadow_render_pass: None,
             blur_render_pass: None,
             translucent_render_pass: None,
             mesh_pass_resources: None,
             translucent_pass_resources: None,
             shadow_pipeline: None,
+            local_shadow_pipeline: None,
             blur_pipeline: None,
             translucent_pipeline: None,
             finished: false,
@@ -445,9 +753,17 @@ impl<'a> ShadowBuild<'a> {
         let cascades = std::mem::take(&mut self.cascades)
             .try_into()
             .unwrap_or_else(|_| panic!("all shadow cascades must be created before finish"));
+        if self.local.len() != MAX_LOCAL_LIGHTS {
+            panic!("all local shadow cubemaps must be created before finish");
+        }
         let resources = ShadowResources {
             cascades,
+            local: std::mem::take(&mut self.local),
             shadow_render_pass: take_created(&mut self.shadow_render_pass, "shadow render pass"),
+            local_shadow_render_pass: take_created(
+                &mut self.local_shadow_render_pass,
+                "local shadow render pass",
+            ),
             blur_render_pass: take_created(&mut self.blur_render_pass, "shadow blur render pass"),
             translucent_render_pass: take_created(
                 &mut self.translucent_render_pass,
@@ -462,6 +778,10 @@ impl<'a> ShadowBuild<'a> {
                 "translucent shadow pass resources",
             ),
             shadow_pipeline: take_created(&mut self.shadow_pipeline, "shadow pipeline"),
+            local_shadow_pipeline: take_created(
+                &mut self.local_shadow_pipeline,
+                "local shadow pipeline",
+            ),
             blur_pipeline: take_created(&mut self.blur_pipeline, "shadow blur pipeline"),
             translucent_pipeline: take_created(
                 &mut self.translucent_pipeline,
@@ -499,12 +819,21 @@ impl Drop for ShadowBuild<'_> {
                 .meshes
                 .destroy_pipeline_set(&self.device.device, pipeline);
         }
+        if let Some(pipeline) = self.local_shadow_pipeline.take() {
+            self.device
+                .meshes
+                .destroy_pipeline_set(&self.device.device, pipeline);
+        }
         for cascade in self.cascades.drain(..) {
             destroy_shadow_cascade(&self.device.device, cascade);
+        }
+        for local in self.local.drain(..) {
+            destroy_local_shadow_cube(&self.device.device, local);
         }
         for render_pass in [
             self.translucent_render_pass.take(),
             self.blur_render_pass.take(),
+            self.local_shadow_render_pass.take(),
             self.shadow_render_pass.take(),
         ]
         .into_iter()
@@ -552,6 +881,20 @@ impl ShadowSamplerFallback {
                 return Err(error);
             }
         };
+        let local_depth = match create_depth_cube_target(
+            device,
+            memory_properties,
+            extent,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                destroy_color_target(device, transmittance);
+                destroy_color_target(device, moments);
+                return Err(error);
+            }
+        };
 
         if let Err(error) = initialize_shadow_sampler_fallback_images(
             device,
@@ -560,6 +903,18 @@ impl ShadowSamplerFallback {
             moments.image,
             transmittance.image,
         ) {
+            destroy_depth_cube_target(device, local_depth);
+            destroy_color_target(device, transmittance);
+            destroy_color_target(device, moments);
+            return Err(error);
+        }
+        if let Err(error) = initialize_depth_cube_shader_read_image(
+            device,
+            queue_family_index,
+            queue,
+            local_depth.image,
+        ) {
+            destroy_depth_cube_target(device, local_depth);
             destroy_color_target(device, transmittance);
             destroy_color_target(device, moments);
             return Err(error);
@@ -572,9 +927,11 @@ impl ShadowSamplerFallback {
             shadow_views,
             shadow_views,
             translucent_views,
+            [local_depth.view; MAX_LOCAL_LIGHTS],
         ) {
             Ok(resources) => resources,
             Err(error) => {
+                destroy_depth_cube_target(device, local_depth);
                 destroy_color_target(device, transmittance);
                 destroy_color_target(device, moments);
                 return Err(error);
@@ -585,6 +942,7 @@ impl ShadowSamplerFallback {
         Ok(ShadowSamplerFallback {
             moments,
             transmittance,
+            local_depth,
             mesh_pass_resources,
         })
     }
@@ -600,6 +958,8 @@ impl VulkanDevice {
             moment_format,
             DEPTH_FORMAT,
         )?);
+        build.local_shadow_render_pass =
+            Some(create_local_shadow_render_pass(&self.device, DEPTH_FORMAT)?);
         build.blur_render_pass = Some(create_shadow_blur_render_pass(&self.device, moment_format)?);
         build.translucent_render_pass = Some(create_translucent_shadow_render_pass(
             &self.device,
@@ -609,6 +969,9 @@ impl VulkanDevice {
         let shadow_render_pass = build
             .shadow_render_pass
             .expect("shadow render pass was just created");
+        let local_shadow_render_pass = build
+            .local_shadow_render_pass
+            .expect("local shadow render pass was just created");
         let blur_render_pass = build
             .blur_render_pass
             .expect("shadow blur render pass was just created");
@@ -617,160 +980,32 @@ impl VulkanDevice {
             .expect("translucent shadow render pass was just created");
 
         for cascade_index in 0..SHADOW_CASCADE_COUNT {
-            let extent = shadow_cascade_extent(cascade_index);
-            let moments = create_color_target(
+            build.cascades.push(create_shadow_cascade_target(
                 &self.device,
                 &self.memory_properties,
-                extent,
+                shadow_cascade_extent(cascade_index),
                 moment_format,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-            )?;
-            let blurred_moments = match create_color_target(
-                &self.device,
-                &self.memory_properties,
-                extent,
-                moment_format,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-            ) {
-                Ok(target) => target,
-                Err(error) => {
-                    destroy_color_target(&self.device, moments);
-                    return Err(error);
-                }
-            };
-            let filtered_moments = match create_color_target(
-                &self.device,
-                &self.memory_properties,
-                extent,
-                moment_format,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-            ) {
-                Ok(target) => target,
-                Err(error) => {
-                    destroy_color_target(&self.device, blurred_moments);
-                    destroy_color_target(&self.device, moments);
-                    return Err(error);
-                }
-            };
-            let depth = match create_depth_target(
-                &self.device,
-                &self.memory_properties,
-                extent,
-                DEPTH_FORMAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-            ) {
-                Ok(target) => target,
-                Err(error) => {
-                    destroy_color_target(&self.device, filtered_moments);
-                    destroy_color_target(&self.device, blurred_moments);
-                    destroy_color_target(&self.device, moments);
-                    return Err(error);
-                }
-            };
-            let transmittance = match create_color_target(
-                &self.device,
-                &self.memory_properties,
-                extent,
-                TRANSLUCENT_SHADOW_FORMAT,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-            ) {
-                Ok(target) => target,
-                Err(error) => {
-                    destroy_depth_target(&self.device, depth);
-                    destroy_color_target(&self.device, filtered_moments);
-                    destroy_color_target(&self.device, blurred_moments);
-                    destroy_color_target(&self.device, moments);
-                    return Err(error);
-                }
-            };
-            let shadow_framebuffer = match create_shadow_framebuffer(
-                &self.device,
                 shadow_render_pass,
-                moments.view,
-                depth.view,
-                extent,
-            ) {
-                Ok(framebuffer) => framebuffer,
-                Err(error) => {
-                    destroy_color_target(&self.device, transmittance);
-                    destroy_depth_target(&self.device, depth);
-                    destroy_color_target(&self.device, filtered_moments);
-                    destroy_color_target(&self.device, blurred_moments);
-                    destroy_color_target(&self.device, moments);
-                    return Err(error);
-                }
-            };
-            let blur_h_framebuffer = match create_post_framebuffer(
-                &self.device,
                 blur_render_pass,
-                blurred_moments.view,
-                extent,
-            ) {
-                Ok(framebuffer) => framebuffer,
-                Err(error) => {
-                    destroy_framebuffer(&self.device, shadow_framebuffer);
-                    destroy_color_target(&self.device, transmittance);
-                    destroy_depth_target(&self.device, depth);
-                    destroy_color_target(&self.device, filtered_moments);
-                    destroy_color_target(&self.device, blurred_moments);
-                    destroy_color_target(&self.device, moments);
-                    return Err(error);
-                }
-            };
-            let blur_v_framebuffer = match create_post_framebuffer(
-                &self.device,
-                blur_render_pass,
-                filtered_moments.view,
-                extent,
-            ) {
-                Ok(framebuffer) => framebuffer,
-                Err(error) => {
-                    destroy_framebuffer(&self.device, blur_h_framebuffer);
-                    destroy_framebuffer(&self.device, shadow_framebuffer);
-                    destroy_color_target(&self.device, transmittance);
-                    destroy_depth_target(&self.device, depth);
-                    destroy_color_target(&self.device, filtered_moments);
-                    destroy_color_target(&self.device, blurred_moments);
-                    destroy_color_target(&self.device, moments);
-                    return Err(error);
-                }
-            };
-            let translucent_framebuffer = match create_translucent_shadow_framebuffer(
-                &self.device,
                 translucent_render_pass,
-                transmittance.view,
-                extent,
-            ) {
-                Ok(framebuffer) => framebuffer,
-                Err(error) => {
-                    destroy_framebuffer(&self.device, blur_v_framebuffer);
-                    destroy_framebuffer(&self.device, blur_h_framebuffer);
-                    destroy_framebuffer(&self.device, shadow_framebuffer);
-                    destroy_color_target(&self.device, transmittance);
-                    destroy_depth_target(&self.device, depth);
-                    destroy_color_target(&self.device, filtered_moments);
-                    destroy_color_target(&self.device, blurred_moments);
-                    destroy_color_target(&self.device, moments);
-                    return Err(error);
-                }
-            };
+            )?);
+        }
 
-            build.cascades.push(ShadowCascade {
-                moments,
-                blurred_moments,
-                filtered_moments,
-                depth,
-                transmittance,
-                raw_moment_state: ResourceState::Undefined,
-                blur_moment_state: ResourceState::Undefined,
-                moment_state: ResourceState::Undefined,
-                transmittance_state: ResourceState::Undefined,
-                shadow_framebuffer,
-                blur_h_framebuffer,
-                blur_v_framebuffer,
-                translucent_framebuffer,
-                extent,
-            });
+        for _ in 0..MAX_LOCAL_LIGHTS {
+            build.local.push(create_local_shadow_cube_target(
+                &self.device,
+                &self.memory_properties,
+                local_shadow_extent(),
+                local_shadow_render_pass,
+            )?);
+        }
+        for local in &build.local {
+            initialize_depth_cube_shader_read_image(
+                &self.device,
+                self.queue_family_index,
+                self.graphics_queue,
+                local.depth.image,
+            )?;
         }
 
         let filtered_views =
@@ -779,28 +1014,37 @@ impl VulkanDevice {
         let blur_tmp_views = cascade_views(&build.cascades, |cascade| cascade.blurred_moments.view);
         let translucent_views =
             cascade_views(&build.cascades, |cascade| cascade.transmittance.view);
+        let local_shadow_views = local_shadow_views(&build.local);
 
         build.mesh_pass_resources = Some(self.meshes.create_pass_resources(
             &self.device,
             filtered_views,
             raw_views,
             translucent_views,
+            local_shadow_views,
         )?);
         build.translucent_pass_resources = Some(self.meshes.create_pass_resources(
             &self.device,
             raw_views,
             raw_views,
             translucent_views,
+            local_shadow_views,
         )?);
+        let blur_h_views = Vec::from(raw_views);
+        let blur_v_views = Vec::from(blur_tmp_views);
         build.blur_pipeline = Some(ShadowMomentBlurPipeline::create(
             &self.device,
             blur_render_pass,
-            raw_views,
-            blur_tmp_views,
+            &blur_h_views,
+            &blur_v_views,
         )?);
         build.shadow_pipeline = Some(
             self.meshes
                 .create_shadow_pipeline_set(&self.device, shadow_render_pass)?,
+        );
+        build.local_shadow_pipeline = Some(
+            self.meshes
+                .create_local_shadow_pipeline_set(&self.device, local_shadow_render_pass)?,
         );
         build.translucent_pipeline = Some(
             self.meshes
@@ -813,6 +1057,8 @@ impl VulkanDevice {
             cascade_1_size = build.cascades[1].extent.width(),
             cascade_2_size = build.cascades[2].extent.width(),
             cascade_3_size = build.cascades[3].extent.width(),
+            local_count = build.local.len(),
+            local_size = build.local.first().map(|local| local.extent.width()).unwrap_or(0),
             moment_format = ?moment_format,
             translucent_format = ?TRANSLUCENT_SHADOW_FORMAT,
             "created fixed Vulkan shadow resources"
@@ -908,6 +1154,22 @@ impl VulkanDevice {
             DEPTH_FORMAT,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         )?);
+        build.bloom_levels = create_bloom_targets(
+            &self.device,
+            &self.memory_properties,
+            config.extent,
+            SCENE_COLOR_FORMAT,
+        )?;
+        let god_ray_targets = create_god_ray_targets(
+            &self.device,
+            &self.memory_properties,
+            config.extent,
+            SCENE_COLOR_FORMAT,
+        )?;
+        build.god_ray_mask = Some(god_ray_targets.mask);
+        build.god_ray_prefilter = Some(god_ray_targets.prefilter);
+        build.god_ray_blur = Some(god_ray_targets.blur);
+        build.god_ray_histories = god_ray_targets.histories;
 
         let scene_color = build
             .scene_color
@@ -938,6 +1200,18 @@ impl VulkanDevice {
             scene_color.format,
             scene_depth.format,
         )?);
+        build.bloom_downsample_render_pass = Some(create_bloom_downsample_render_pass(
+            &self.device,
+            SCENE_COLOR_FORMAT,
+        )?);
+        build.bloom_upsample_render_pass = Some(create_bloom_upsample_render_pass(
+            &self.device,
+            SCENE_COLOR_FORMAT,
+        )?);
+        build.god_ray_render_pass = Some(create_god_ray_render_pass(
+            &self.device,
+            SCENE_COLOR_FORMAT,
+        )?);
         build.post_render_pass = Some(create_post_render_pass(&self.device, config.format)?);
 
         let scene_render_pass = build
@@ -946,6 +1220,15 @@ impl VulkanDevice {
         let scene_fast_render_pass = build
             .scene_fast_render_pass
             .expect("fast scene render pass was just created");
+        let bloom_downsample_render_pass = build
+            .bloom_downsample_render_pass
+            .expect("bloom downsample render pass was just created");
+        let bloom_upsample_render_pass = build
+            .bloom_upsample_render_pass
+            .expect("bloom upsample render pass was just created");
+        let god_ray_render_pass = build
+            .god_ray_render_pass
+            .expect("god-ray render pass was just created");
         let post_render_pass = build
             .post_render_pass
             .expect("post render pass was just created");
@@ -966,6 +1249,48 @@ impl VulkanDevice {
             self.meshes
                 .create_scene_transparent_fast_pipeline_set(&self.device, scene_fast_render_pass)?,
         );
+        let bloom_views = build
+            .bloom_levels
+            .iter()
+            .map(|level| level.color.view)
+            .collect::<Vec<_>>();
+        build.bloom_pipeline = Some(BloomPipeline::create(
+            &self.device,
+            bloom_downsample_render_pass,
+            bloom_upsample_render_pass,
+            scene_color.view,
+            &bloom_views,
+        )?);
+        let god_ray_history_views = [
+            build.god_ray_histories[0].color.view,
+            build.god_ray_histories[1].color.view,
+        ];
+        build.god_rays_pipeline = Some(GodRaysPipeline::create(
+            &self.device,
+            god_ray_render_pass,
+            scene_color.view,
+            scene_depth.view,
+            scene_transparent_normal_roughness.view,
+            build
+                .god_ray_mask
+                .as_ref()
+                .expect("god-ray mask target was just created")
+                .color
+                .view,
+            build
+                .god_ray_prefilter
+                .as_ref()
+                .expect("god-ray prefilter target was just created")
+                .color
+                .view,
+            build
+                .god_ray_blur
+                .as_ref()
+                .expect("god-ray blur target was just created")
+                .color
+                .view,
+            god_ray_history_views,
+        )?);
         build.post_pipeline = Some(PostPipeline::create(
             &self.device,
             post_render_pass,
@@ -973,6 +1298,8 @@ impl VulkanDevice {
             scene_depth.view,
             scene_normal_roughness.view,
             scene_transparent_normal_roughness.view,
+            bloom_views[0],
+            god_ray_history_views,
         )?);
 
         build.scene_framebuffer = Some(create_scene_framebuffer(
@@ -991,6 +1318,16 @@ impl VulkanDevice {
             scene_depth.view,
             config.extent,
         )?);
+        build.bloom_downsample_framebuffers = create_bloom_framebuffers(
+            &self.device,
+            bloom_downsample_render_pass,
+            &build.bloom_levels,
+        )?;
+        let upsample_levels = &build.bloom_levels[..BLOOM_MIP_COUNT - 1];
+        build.bloom_upsample_framebuffers =
+            create_bloom_framebuffers(&self.device, bloom_upsample_render_pass, upsample_levels)?;
+        build.god_ray_framebuffers =
+            create_god_ray_framebuffers(&self.device, god_ray_render_pass, &build)?;
         build.post_framebuffers =
             self.create_post_framebuffers(post_render_pass, &build.image_views, config.extent)?;
 
@@ -999,7 +1336,11 @@ impl VulkanDevice {
             height = config.extent.height(),
             image_count = build.images.len(),
             image_view_count = build.image_views.len(),
-            framebuffer_count = build.post_framebuffers.len() + 2,
+            framebuffer_count = build.post_framebuffers.len()
+                + build.bloom_downsample_framebuffers.len()
+                + build.bloom_upsample_framebuffers.len()
+                + build.god_ray_framebuffers.count()
+                + 2,
             format = ?config.format,
             present_mode = ?config.present_mode,
             transfer_src_supported = config.transfer_src_supported,
@@ -1016,7 +1357,11 @@ impl VulkanDevice {
             height = swapchain.extent.height(),
             image_count = swapchain.images.len(),
             image_view_count = swapchain.image_views.len(),
-            framebuffer_count = swapchain.post_framebuffers.len() + 2,
+            framebuffer_count = swapchain.post_framebuffers.len()
+                + swapchain.bloom_downsample_framebuffers.len()
+                + swapchain.bloom_upsample_framebuffers.len()
+                + swapchain.god_ray_framebuffers.count()
+                + 2,
             format = ?swapchain.format,
             color_space = ?swapchain.color_space,
             present_mode = ?swapchain.present_mode,
@@ -1024,9 +1369,14 @@ impl VulkanDevice {
         );
 
         self.destroy_framebuffers(swapchain.post_framebuffers);
+        swapchain.god_ray_framebuffers.destroy(&self.device);
+        self.destroy_framebuffers(swapchain.bloom_upsample_framebuffers);
+        self.destroy_framebuffers(swapchain.bloom_downsample_framebuffers);
         destroy_framebuffer(&self.device, swapchain.scene_fast_framebuffer);
         destroy_framebuffer(&self.device, swapchain.scene_framebuffer);
         swapchain.post_pipeline.destroy(&self.device);
+        swapchain.god_rays_pipeline.destroy(&self.device);
+        swapchain.bloom_pipeline.destroy(&self.device);
         self.meshes
             .destroy_pipeline_set(&self.device, swapchain.mesh_pipeline);
         self.meshes
@@ -1036,8 +1386,13 @@ impl VulkanDevice {
         self.meshes
             .destroy_pipeline_set(&self.device, swapchain.transparent_mesh_fast_pipeline);
         destroy_render_pass(&self.device, swapchain.post_render_pass);
+        destroy_render_pass(&self.device, swapchain.god_ray_render_pass);
+        destroy_render_pass(&self.device, swapchain.bloom_upsample_render_pass);
+        destroy_render_pass(&self.device, swapchain.bloom_downsample_render_pass);
         destroy_render_pass(&self.device, swapchain.scene_fast_render_pass);
         destroy_render_pass(&self.device, swapchain.scene_render_pass);
+        swapchain.bloom.destroy(&self.device);
+        swapchain.god_rays.destroy(&self.device);
         swapchain.scene.destroy(&self.device);
         self.destroy_image_views(swapchain.image_views);
         self.destroy_swapchain_handle(swapchain.handle);
@@ -1140,6 +1495,21 @@ impl VulkanSwapchain {
         self.post_render_pass
     }
 
+    /// Returns the render pass that extracts and downsamples HDR bloom mips.
+    pub(super) fn bloom_downsample_render_pass(&self) -> vk::RenderPass {
+        self.bloom_downsample_render_pass
+    }
+
+    /// Returns the render pass that additively upsamples bloom mips.
+    pub(super) fn bloom_upsample_render_pass(&self) -> vk::RenderPass {
+        self.bloom_upsample_render_pass
+    }
+
+    /// Returns the render pass that writes the low-resolution god-ray chain.
+    pub(super) fn god_ray_render_pass(&self) -> vk::RenderPass {
+        self.god_ray_render_pass
+    }
+
     /// Returns the mesh graphics pipeline compatible with the scene pass.
     pub(super) fn mesh_pipeline(&self) -> MeshPipelineSet {
         self.mesh_pipeline
@@ -1163,6 +1533,16 @@ impl VulkanSwapchain {
     /// Returns the post pipeline compatible with this swapchain's post pass.
     pub(super) fn post_pipeline(&self) -> &PostPipeline {
         &self.post_pipeline
+    }
+
+    /// Returns the bloom pipeline compatible with this swapchain's bloom passes.
+    pub(super) fn bloom_pipeline(&self) -> &BloomPipeline {
+        &self.bloom_pipeline
+    }
+
+    /// Returns the god-ray pipeline compatible with this swapchain's low-resolution targets.
+    pub(super) fn god_rays_pipeline(&self) -> &GodRaysPipeline {
+        &self.god_rays_pipeline
     }
 
     /// Returns the number of images owned by this swapchain.
@@ -1211,6 +1591,80 @@ impl VulkanSwapchain {
         )
     }
 
+    /// Returns one bloom mip extent.
+    pub(super) fn bloom_extent_2d(&self, mip_index: usize) -> Result<vk::Extent2D, VulkanError> {
+        self.bloom.extent_2d(mip_index)
+    }
+
+    /// Returns the shared extent of the low-resolution god-ray targets.
+    pub(super) fn god_ray_extent_2d(&self) -> vk::Extent2D {
+        self.god_rays.extent_2d()
+    }
+
+    /// Returns whether a previous temporal god-ray history is available.
+    pub(super) fn god_ray_history_valid(&self) -> bool {
+        self.god_rays.history_valid()
+    }
+
+    /// Returns the temporal god-ray history target written by the current graph.
+    pub(super) fn god_ray_history_write_index(&self) -> usize {
+        self.god_rays.history_write_index()
+    }
+
+    /// Returns the framebuffer used by a downsample pass writing one bloom mip.
+    pub(super) fn bloom_downsample_framebuffer(
+        &self,
+        mip_index: usize,
+    ) -> Result<vk::Framebuffer, VulkanError> {
+        self.bloom_downsample_framebuffers
+            .get(mip_index)
+            .copied()
+            .ok_or(VulkanError::SwapchainImageIndexOutOfRange {
+                index: mip_index,
+                count: self.bloom_downsample_framebuffers.len(),
+            })
+    }
+
+    /// Returns the framebuffer used by an upsample pass writing one bloom mip.
+    pub(super) fn bloom_upsample_framebuffer(
+        &self,
+        target_mip_index: usize,
+    ) -> Result<vk::Framebuffer, VulkanError> {
+        self.bloom_upsample_framebuffers
+            .get(target_mip_index)
+            .copied()
+            .ok_or(VulkanError::SwapchainImageIndexOutOfRange {
+                index: target_mip_index,
+                count: self.bloom_upsample_framebuffers.len(),
+            })
+    }
+
+    pub(super) fn god_ray_mask_framebuffer(&self) -> vk::Framebuffer {
+        self.god_ray_framebuffers.mask
+    }
+
+    pub(super) fn god_ray_prefilter_framebuffer(&self) -> vk::Framebuffer {
+        self.god_ray_framebuffers.prefilter
+    }
+
+    pub(super) fn god_ray_radial_framebuffer(&self) -> vk::Framebuffer {
+        self.god_ray_framebuffers.radial
+    }
+
+    pub(super) fn god_ray_history_framebuffer(
+        &self,
+        history_index: usize,
+    ) -> Result<vk::Framebuffer, VulkanError> {
+        self.god_ray_framebuffers
+            .histories
+            .get(history_index)
+            .copied()
+            .ok_or(VulkanError::SwapchainImageIndexOutOfRange {
+                index: history_index,
+                count: self.god_ray_framebuffers.histories.len(),
+            })
+    }
+
     /// Returns the current graph resource states before compiling a frame graph.
     pub(super) fn graph_initial_states(
         &self,
@@ -1249,6 +1703,13 @@ impl VulkanSwapchain {
             scene_normal_roughness_state,
             scene_transparent_normal_roughness_state,
             scene_depth_state,
+        )
+        .with_bloom_mips(self.bloom.graph_states())
+        .with_god_rays(
+            self.god_rays.mask.state,
+            self.god_rays.prefilter.state,
+            self.god_rays.blur.state,
+            self.god_rays.history_states(),
         ))
     }
 
@@ -1262,6 +1723,8 @@ impl VulkanSwapchain {
             *self.image_state_mut(image_index)? = state;
         }
         self.scene.apply_graph_final_states(plan);
+        self.bloom.apply_graph_final_states(plan);
+        self.god_rays.apply_graph_final_states(plan);
         Ok(())
     }
 
@@ -1280,6 +1743,12 @@ impl VulkanSwapchain {
         if let Some(image) = self.scene.graph_image(resource) {
             return Ok(image);
         }
+        if let Some(image) = self.bloom.graph_image(resource) {
+            return Ok(image);
+        }
+        if let Some(image) = self.god_rays.graph_image(resource) {
+            return Ok(image);
+        }
 
         match resource {
             GraphResource::SwapchainImage => Ok((
@@ -1289,8 +1758,18 @@ impl VulkanSwapchain {
             GraphResource::SceneColor
             | GraphResource::SceneNormalRoughness
             | GraphResource::SceneTransparentNormalRoughness
-            | GraphResource::SceneDepth => {
-                unreachable!("scene resources return early above")
+            | GraphResource::SceneDepth
+            | GraphResource::BloomMip0
+            | GraphResource::BloomMip1
+            | GraphResource::BloomMip2
+            | GraphResource::BloomMip3
+            | GraphResource::BloomMip4
+            | GraphResource::GodRayMask
+            | GraphResource::GodRayPrefilter
+            | GraphResource::GodRayBlur
+            | GraphResource::GodRayHistory0
+            | GraphResource::GodRayHistory1 => {
+                unreachable!("scene, bloom, and god-ray resources return early above")
             }
             GraphResource::ShadowMomentRaw0
             | GraphResource::ShadowMomentRaw1
@@ -1349,6 +1828,11 @@ impl ShadowResources {
         self.shadow_render_pass
     }
 
+    /// Returns the depth-only render pass for one local shadow cubemap face.
+    pub(super) fn local_shadow_render_pass(&self) -> vk::RenderPass {
+        self.local_shadow_render_pass
+    }
+
     /// Returns the render pass that writes one separable moment blur target.
     pub(super) fn blur_render_pass(&self) -> vk::RenderPass {
         self.blur_render_pass
@@ -1362,6 +1846,11 @@ impl ShadowResources {
     /// Returns the opaque shadow mesh pipelines shared by all cascades.
     pub(super) fn shadow_pipeline(&self) -> MeshPipelineSet {
         self.shadow_pipeline
+    }
+
+    /// Returns the depth-only local shadow mesh pipelines shared by cubemap faces.
+    pub(super) fn local_shadow_pipeline(&self) -> MeshPipelineSet {
+        self.local_shadow_pipeline
     }
 
     /// Returns the fullscreen separable blur pipeline for shadow moments.
@@ -1393,12 +1882,39 @@ impl ShadowResources {
         })
     }
 
+    /// Returns the fixed render extent shared by local-light shadow maps.
+    pub(super) fn local_extent_2d(&self) -> vk::Extent2D {
+        let local = self
+            .local
+            .first()
+            .expect("local shadow resources are created as a fixed set");
+        vk::Extent2D {
+            width: local.extent.width(),
+            height: local.extent.height(),
+        }
+    }
+
     /// Returns the framebuffer used to render one opaque shadow cascade.
     pub(super) fn shadow_framebuffer(
         &self,
         cascade_index: usize,
     ) -> Result<vk::Framebuffer, VulkanError> {
         Ok(self.cascade(cascade_index)?.shadow_framebuffer)
+    }
+
+    /// Returns the framebuffer used to render one local-light cubemap face.
+    pub(super) fn local_shadow_framebuffer(
+        &self,
+        light_index: usize,
+        face_index: usize,
+    ) -> Result<vk::Framebuffer, VulkanError> {
+        let local = self.local_shadow_cube(light_index)?;
+        local.framebuffers.get(face_index).copied().ok_or(
+            VulkanError::SwapchainImageIndexOutOfRange {
+                index: face_index,
+                count: local.framebuffers.len(),
+            },
+        )
     }
 
     /// Returns the framebuffer that receives horizontal moment blur for one cascade.
@@ -1521,18 +2037,28 @@ impl ShadowResources {
             })
     }
 
+    /// Returns one local-shadow depth image.
+    pub(super) fn local_depth_image(&self, light_index: usize) -> Result<vk::Image, VulkanError> {
+        Ok(self.local_shadow_cube(light_index)?.depth.image)
+    }
+
     /// Releases fixed shadow framebuffers, descriptors, pipelines, render passes, and targets.
     fn destroy(self, device: &Device, meshes: &VulkanMeshStore) {
         self.translucent_pass_resources.destroy(device);
         self.mesh_pass_resources.destroy(device);
         meshes.destroy_pipeline_set(device, self.translucent_pipeline);
         self.blur_pipeline.destroy(device);
+        meshes.destroy_pipeline_set(device, self.local_shadow_pipeline);
         meshes.destroy_pipeline_set(device, self.shadow_pipeline);
         for cascade in self.cascades {
             destroy_shadow_cascade(device, cascade);
         }
+        for local in self.local {
+            destroy_local_shadow_cube(device, local);
+        }
         destroy_render_pass(device, self.translucent_render_pass);
         destroy_render_pass(device, self.blur_render_pass);
+        destroy_render_pass(device, self.local_shadow_render_pass);
         destroy_render_pass(device, self.shadow_render_pass);
     }
 
@@ -1543,6 +2069,15 @@ impl ShadowResources {
             .ok_or(VulkanError::SwapchainImageIndexOutOfRange {
                 index: cascade_index,
                 count: self.cascades.len(),
+            })
+    }
+
+    fn local_shadow_cube(&self, light_index: usize) -> Result<&LocalShadowCube, VulkanError> {
+        self.local
+            .get(light_index)
+            .ok_or(VulkanError::SwapchainImageIndexOutOfRange {
+                index: light_index,
+                count: self.local.len(),
             })
     }
 }
@@ -1556,6 +2091,7 @@ impl ShadowSamplerFallback {
     /// Releases the dummy descriptor set and its tiny sampled images.
     pub(super) fn destroy(self, device: &Device) {
         self.mesh_pass_resources.destroy(device);
+        destroy_depth_cube_target(device, self.local_depth);
         destroy_color_target(device, self.transmittance);
         destroy_color_target(device, self.moments);
     }
@@ -1794,6 +2330,400 @@ fn shadow_cascade_extent(cascade_index: usize) -> NonZeroExtent {
     NonZeroExtent::new(size, size).expect("shadow map extent must be non-zero")
 }
 
+fn local_shadow_extent() -> NonZeroExtent {
+    let size = shadow_cascade_size(0).min(2048).max(1024);
+    NonZeroExtent::new(size, size).expect("local shadow map extent must be non-zero")
+}
+
+fn bloom_mip_extent(full_extent: NonZeroExtent, mip_index: usize) -> NonZeroExtent {
+    let divisor = 1_u32 << (mip_index as u32 + 1);
+    let width = (full_extent.width() / divisor).max(1);
+    let height = (full_extent.height() / divisor).max(1);
+
+    NonZeroExtent::new(width, height).expect("bloom mip extent must be non-zero")
+}
+
+fn god_ray_extent(full_extent: NonZeroExtent) -> NonZeroExtent {
+    let width = (full_extent.width() / 4).max(1);
+    let height = (full_extent.height() / 4).max(1);
+
+    NonZeroExtent::new(width, height).expect("god-ray extent must be non-zero")
+}
+
+fn create_bloom_targets(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    full_extent: NonZeroExtent,
+    format: vk::Format,
+) -> Result<Vec<BloomLevelTarget>, VulkanError> {
+    let mut levels: Vec<BloomLevelTarget> = Vec::with_capacity(BLOOM_MIP_COUNT);
+    for mip_index in 0..BLOOM_MIP_COUNT {
+        let extent = bloom_mip_extent(full_extent, mip_index);
+        let color = match create_color_target(
+            device,
+            memory_properties,
+            extent,
+            format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        ) {
+            Ok(color) => color,
+            Err(error) => {
+                for level in levels.into_iter().rev() {
+                    destroy_color_target(device, level.color);
+                }
+                return Err(error);
+            }
+        };
+        levels.push(BloomLevelTarget {
+            color,
+            extent,
+            state: ResourceState::Undefined,
+        });
+    }
+
+    Ok(levels)
+}
+
+fn create_god_ray_targets(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    full_extent: NonZeroExtent,
+    format: vk::Format,
+) -> Result<GodRayTargetSet, VulkanError> {
+    let extent = god_ray_extent(full_extent);
+    let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
+    let mut targets = Vec::with_capacity(3 + GOD_RAY_HISTORY_COUNT);
+    for _ in 0..(3 + GOD_RAY_HISTORY_COUNT) {
+        match create_color_target(device, memory_properties, extent, format, usage) {
+            Ok(color) => targets.push(GodRayTarget {
+                color,
+                extent,
+                state: ResourceState::Undefined,
+            }),
+            Err(error) => {
+                for target in targets.into_iter().rev() {
+                    destroy_color_target(device, target.color);
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    let mut targets = targets.into_iter();
+    Ok(GodRayTargetSet {
+        mask: targets
+            .next()
+            .expect("god-ray mask target was just created"),
+        prefilter: targets
+            .next()
+            .expect("god-ray prefilter target was just created"),
+        blur: targets
+            .next()
+            .expect("god-ray radial target was just created"),
+        histories: targets.collect(),
+    })
+}
+
+fn create_bloom_framebuffers(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    levels: &[BloomLevelTarget],
+) -> Result<Vec<vk::Framebuffer>, VulkanError> {
+    let mut framebuffers = Vec::with_capacity(levels.len());
+    for level in levels {
+        match create_post_framebuffer(device, render_pass, level.color.view, level.extent) {
+            Ok(framebuffer) => framebuffers.push(framebuffer),
+            Err(error) => {
+                for framebuffer in framebuffers {
+                    destroy_framebuffer(device, framebuffer);
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(framebuffers)
+}
+
+fn create_god_ray_framebuffers(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    build: &SwapchainBuild<'_>,
+) -> Result<GodRayFramebuffers, VulkanError> {
+    let create = |target: &GodRayTarget| {
+        create_post_framebuffer(device, render_pass, target.color.view, target.extent)
+    };
+    let mut created = Vec::with_capacity(3 + build.god_ray_histories.len());
+
+    let mask = match create(
+        build
+            .god_ray_mask
+            .as_ref()
+            .expect("god-ray mask target exists while building framebuffers"),
+    ) {
+        Ok(framebuffer) => {
+            created.push(framebuffer);
+            framebuffer
+        }
+        Err(error) => return Err(error),
+    };
+    let prefilter = match create(
+        build
+            .god_ray_prefilter
+            .as_ref()
+            .expect("god-ray prefilter target exists while building framebuffers"),
+    ) {
+        Ok(framebuffer) => {
+            created.push(framebuffer);
+            framebuffer
+        }
+        Err(error) => {
+            for framebuffer in created {
+                destroy_framebuffer(device, framebuffer);
+            }
+            return Err(error);
+        }
+    };
+    let radial = match create(
+        build
+            .god_ray_blur
+            .as_ref()
+            .expect("god-ray radial target exists while building framebuffers"),
+    ) {
+        Ok(framebuffer) => {
+            created.push(framebuffer);
+            framebuffer
+        }
+        Err(error) => {
+            for framebuffer in created {
+                destroy_framebuffer(device, framebuffer);
+            }
+            return Err(error);
+        }
+    };
+
+    let mut histories = Vec::with_capacity(build.god_ray_histories.len());
+    for target in &build.god_ray_histories {
+        match create(target) {
+            Ok(framebuffer) => {
+                created.push(framebuffer);
+                histories.push(framebuffer);
+            }
+            Err(error) => {
+                for framebuffer in created {
+                    destroy_framebuffer(device, framebuffer);
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(GodRayFramebuffers {
+        mask,
+        prefilter,
+        radial,
+        histories,
+    })
+}
+
+fn create_local_shadow_cube_target(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    extent: NonZeroExtent,
+    render_pass: vk::RenderPass,
+) -> Result<LocalShadowCube, VulkanError> {
+    let depth = create_depth_cube_target(
+        device,
+        memory_properties,
+        extent,
+        DEPTH_FORMAT,
+        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_DST,
+    )?;
+    let mut framebuffers = [vk::Framebuffer::null(); 6];
+    for face in 0..6 {
+        framebuffers[face] = match create_local_shadow_framebuffer(
+            device,
+            render_pass,
+            depth.face_views[face],
+            extent,
+        ) {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                for framebuffer in framebuffers {
+                    destroy_framebuffer(device, framebuffer);
+                }
+                destroy_depth_cube_target(device, depth);
+                return Err(error);
+            }
+        };
+    }
+
+    Ok(LocalShadowCube {
+        depth,
+        framebuffers,
+        extent,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_shadow_cascade_target(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    extent: NonZeroExtent,
+    moment_format: vk::Format,
+    shadow_render_pass: vk::RenderPass,
+    blur_render_pass: vk::RenderPass,
+    translucent_render_pass: vk::RenderPass,
+) -> Result<ShadowCascade, VulkanError> {
+    let moments = create_color_target(
+        device,
+        memory_properties,
+        extent,
+        moment_format,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+    )?;
+    let blurred_moments = match create_color_target(
+        device,
+        memory_properties,
+        extent,
+        moment_format,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            destroy_color_target(device, moments);
+            return Err(error);
+        }
+    };
+    let filtered_moments = match create_color_target(
+        device,
+        memory_properties,
+        extent,
+        moment_format,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            destroy_color_target(device, blurred_moments);
+            destroy_color_target(device, moments);
+            return Err(error);
+        }
+    };
+    let depth = match create_depth_target(
+        device,
+        memory_properties,
+        extent,
+        DEPTH_FORMAT,
+        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            destroy_color_target(device, filtered_moments);
+            destroy_color_target(device, blurred_moments);
+            destroy_color_target(device, moments);
+            return Err(error);
+        }
+    };
+    let transmittance = match create_color_target(
+        device,
+        memory_properties,
+        extent,
+        TRANSLUCENT_SHADOW_FORMAT,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            destroy_depth_target(device, depth);
+            destroy_color_target(device, filtered_moments);
+            destroy_color_target(device, blurred_moments);
+            destroy_color_target(device, moments);
+            return Err(error);
+        }
+    };
+    let shadow_framebuffer = match create_shadow_framebuffer(
+        device,
+        shadow_render_pass,
+        moments.view,
+        depth.view,
+        extent,
+    ) {
+        Ok(framebuffer) => framebuffer,
+        Err(error) => {
+            destroy_color_target(device, transmittance);
+            destroy_depth_target(device, depth);
+            destroy_color_target(device, filtered_moments);
+            destroy_color_target(device, blurred_moments);
+            destroy_color_target(device, moments);
+            return Err(error);
+        }
+    };
+    let blur_h_framebuffer =
+        match create_post_framebuffer(device, blur_render_pass, blurred_moments.view, extent) {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                destroy_framebuffer(device, shadow_framebuffer);
+                destroy_color_target(device, transmittance);
+                destroy_depth_target(device, depth);
+                destroy_color_target(device, filtered_moments);
+                destroy_color_target(device, blurred_moments);
+                destroy_color_target(device, moments);
+                return Err(error);
+            }
+        };
+    let blur_v_framebuffer =
+        match create_post_framebuffer(device, blur_render_pass, filtered_moments.view, extent) {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                destroy_framebuffer(device, blur_h_framebuffer);
+                destroy_framebuffer(device, shadow_framebuffer);
+                destroy_color_target(device, transmittance);
+                destroy_depth_target(device, depth);
+                destroy_color_target(device, filtered_moments);
+                destroy_color_target(device, blurred_moments);
+                destroy_color_target(device, moments);
+                return Err(error);
+            }
+        };
+    let translucent_framebuffer = match create_translucent_shadow_framebuffer(
+        device,
+        translucent_render_pass,
+        transmittance.view,
+        extent,
+    ) {
+        Ok(framebuffer) => framebuffer,
+        Err(error) => {
+            destroy_framebuffer(device, blur_v_framebuffer);
+            destroy_framebuffer(device, blur_h_framebuffer);
+            destroy_framebuffer(device, shadow_framebuffer);
+            destroy_color_target(device, transmittance);
+            destroy_depth_target(device, depth);
+            destroy_color_target(device, filtered_moments);
+            destroy_color_target(device, blurred_moments);
+            destroy_color_target(device, moments);
+            return Err(error);
+        }
+    };
+
+    Ok(ShadowCascade {
+        moments,
+        blurred_moments,
+        filtered_moments,
+        depth,
+        transmittance,
+        raw_moment_state: ResourceState::Undefined,
+        blur_moment_state: ResourceState::Undefined,
+        moment_state: ResourceState::Undefined,
+        transmittance_state: ResourceState::Undefined,
+        shadow_framebuffer,
+        blur_h_framebuffer,
+        blur_v_framebuffer,
+        translucent_framebuffer,
+        extent,
+    })
+}
+
 /// Extracts one image view per cascade without repeating Vec conversion boilerplate.
 fn cascade_views<F>(cascades: &[ShadowCascade], select: F) -> [vk::ImageView; SHADOW_CASCADE_COUNT]
 where
@@ -1807,6 +2737,15 @@ where
     std::array::from_fn(|index| select(&cascades[index]))
 }
 
+fn local_shadow_views(local: &[LocalShadowCube]) -> [vk::ImageView; MAX_LOCAL_LIGHTS] {
+    assert_eq!(
+        local.len(),
+        MAX_LOCAL_LIGHTS,
+        "all local shadow cubemaps must exist before creating descriptors"
+    );
+    std::array::from_fn(|index| local[index].depth.view)
+}
+
 /// Destroys one fixed shadow cascade after frame work has completed.
 fn destroy_shadow_cascade(device: &Device, cascade: ShadowCascade) {
     destroy_framebuffer(device, cascade.translucent_framebuffer);
@@ -1818,4 +2757,11 @@ fn destroy_shadow_cascade(device: &Device, cascade: ShadowCascade) {
     destroy_color_target(device, cascade.filtered_moments);
     destroy_color_target(device, cascade.blurred_moments);
     destroy_color_target(device, cascade.moments);
+}
+
+fn destroy_local_shadow_cube(device: &Device, local: LocalShadowCube) {
+    for framebuffer in local.framebuffers {
+        destroy_framebuffer(device, framebuffer);
+    }
+    destroy_depth_cube_target(device, local.depth);
 }

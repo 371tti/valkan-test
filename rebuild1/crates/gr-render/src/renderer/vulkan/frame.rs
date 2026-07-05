@@ -4,32 +4,40 @@ use ash::{Device, khr, vk};
 
 use crate::{
     math::{dot3, normalize_or, sub3},
-    protocol::{CameraSnapshot, FrameSnapshot, RenderItemPacket, RenderQualitySettings},
+    protocol::{
+        CameraSnapshot, FrameSnapshot, LocalLightKind, LocalLightPacket, RenderItemPacket,
+        RenderQualitySettings,
+    },
     renderer::graph::{
-        BarrierLocation, FrameGraphPlan, GraphPass, PassOutput, ResourceBarrier, ResourceState,
-        SHADOW_CASCADE_COUNT, shadow_blur_h_pass_index, shadow_blur_v_pass_index,
+        BarrierLocation, FrameGraphPlan, GOD_RAY_MASK_PASS, GOD_RAY_PREFILTER_PASS,
+        GOD_RAY_RADIAL_PASS, GOD_RAY_TEMPORAL_PASS, GraphPass, PassOutput, ResourceBarrier,
+        ResourceState, SHADOW_CASCADE_COUNT, bloom_downsample_pass_index,
+        bloom_upsample_pass_index, shadow_blur_h_pass_index, shadow_blur_v_pass_index,
         shadow_pass_index, translucent_shadow_pass_index,
     },
 };
 
 use super::{
     VulkanDevice, VulkanError,
-    material::VulkanMaterialStore,
+    god_rays::GodRayPushConstants,
+    material::{MaterialDrawInfo, VulkanMaterialStore},
     mesh::{
-        EmissiveLightUniforms, MAX_EMISSIVE_LIGHTS, MAX_LOCAL_SHADOW_CASTERS, MeshDrawOptions,
+        EmissiveLightUniforms, LOCAL_SHADOW_FACE_COUNT, MAX_LOCAL_LIGHTS, MeshDrawOptions,
         MeshDrawState, MeshPassResources, MeshPipelineKey, MeshPipelineSet, ShadowCascadeCull,
         VulkanMeshStore,
     },
     readback::{FramebufferReadbackCopy, FramebufferReadbackSample, record_image_to_buffer},
     shadow::{
-        mesh_frame_uniform_for_frame, shadow_cascade_cull, shadow_frame_data,
-        shadow_frame_signature,
+        LocalShadowFrameData, LocalShadowLightData, has_local_shadow_light,
+        local_shadow_frame_data, mesh_frame_uniform_for_frame, shadow_cascade_cull,
+        shadow_frame_data, shadow_frame_signature,
     },
     swapchain::{ShadowResources, VulkanSwapchain},
 };
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.015, 0.018, 0.026, 1.0];
+const LOCAL_SHADOW_CASCADE_INDEX: usize = SHADOW_CASCADE_COUNT;
 
 pub(super) struct VulkanFrames {
     command_pool: vk::CommandPool,
@@ -227,7 +235,11 @@ impl VulkanDevice {
         let features = frame_feature_flags(&self.materials, &snapshot.render_items);
         let camera = active_camera(snapshot);
         let scene_metadata_required = scene_material_metadata_required(self.quality);
-        if features.has_shadow_casters {
+        let emissive_lights =
+            emissive_light_uniforms(&self.materials, &self.meshes, snapshot, camera);
+        let wants_local_shadow =
+            features.has_opaque_shadow_casters && has_local_shadow_light(&emissive_lights);
+        if features.has_shadow_casters || wants_local_shadow {
             self.ensure_shadow_resources()?;
         }
         let shadow_signature = features.has_shadow_casters.then(|| {
@@ -252,6 +264,13 @@ impl VulkanDevice {
         } else {
             cached_shadow_data.or(current_shadow_data)
         };
+        let local_shadow_data = if wants_local_shadow {
+            self.shadows.as_ref().and_then(|shadows| {
+                local_shadow_frame_data(&emissive_lights, shadows.local_extent_2d())
+            })
+        } else {
+            None
+        };
         let frame = match self
             .frames
             .acquire(&self.device, &self.swapchain_loader, swapchain)?
@@ -270,17 +289,24 @@ impl VulkanDevice {
             .prepare_frame(&self.device, frame.image_index)?;
         let shadows = self.shadows.as_ref();
         let initial_states = swapchain.graph_initial_states(frame.image_index, shadows)?;
+        let bloom_enabled = self.quality.bloom().intensity() > 0.0;
+        let god_rays_enabled = self.quality.bloom().god_rays_intensity() > 0.0;
+        let god_ray_history_write_index = swapchain.god_ray_history_write_index();
         let graph = if refresh_shadows {
-            FrameGraphPlan::standard_frame_with_readback_and_scene_metadata(
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
                 DEFAULT_CLEAR_COLOR,
                 initial_states,
                 readback.copy.is_some(),
                 features.has_shadow_casters,
                 features.has_translucent_shadow_casters,
+                true,
                 scene_metadata_required,
+                bloom_enabled,
+                god_rays_enabled,
+                god_ray_history_write_index,
             )
         } else {
-            FrameGraphPlan::standard_frame_with_shadow_refresh_and_scene_metadata(
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
                 DEFAULT_CLEAR_COLOR,
                 initial_states,
                 readback.copy.is_some(),
@@ -288,6 +314,9 @@ impl VulkanDevice {
                 features.has_translucent_shadow_casters,
                 false,
                 scene_metadata_required,
+                bloom_enabled,
+                god_rays_enabled,
+                god_ray_history_write_index,
             )
         }
         .map_err(|error| VulkanError::GraphCompile(error.to_string()))?;
@@ -304,7 +333,8 @@ impl VulkanDevice {
                 features.has_shadow_casters,
                 features.has_translucent_shadow_casters,
                 shadow_data,
-                emissive_light_uniforms(&self.materials, &self.meshes, snapshot, camera),
+                local_shadow_data,
+                emissive_lights,
             ),
         )?;
         let scene_pass_resources = shadows.map_or_else(
@@ -324,6 +354,8 @@ impl VulkanDevice {
             readback.copy,
             features,
             self.quality,
+            emissive_lights,
+            local_shadow_data,
         )?;
         submit_frame(&self.device, self.graphics_queue, frame)?;
         swapchain.apply_graph_final_states(frame.image_index, &graph)?;
@@ -525,6 +557,8 @@ fn record_graph_command_buffer(
     readback: Option<FramebufferReadbackCopy>,
     features: FrameFeatureFlags,
     quality: RenderQualitySettings,
+    emissive_lights: EmissiveLightUniforms,
+    local_shadow_data: Option<LocalShadowFrameData>,
 ) -> Result<(), VulkanError> {
     tracing::trace!(
         passes = graph.pass_count(),
@@ -541,16 +575,28 @@ fn record_graph_command_buffer(
         let record_shadow_draws = graph.passes().iter().any(|pass| {
             shadow_pass_index(pass.name()).is_some()
                 || translucent_shadow_pass_index(pass.name()).is_some()
-        });
+        }) || local_shadow_data.is_some();
         let mut state = FrameRecordState::new(
             features,
             quality,
+            emissive_lights,
             materials,
             meshes,
             snapshot,
             swapchain.extent_2d(),
             record_shadow_draws,
+            local_shadow_data,
         );
+        if let (Some(shadows), Some(local_shadow)) = (shadows, local_shadow_data) {
+            record_local_shadow_passes(
+                device,
+                frame,
+                shadows,
+                meshes,
+                &state.draw_lists.local_shadow,
+                local_shadow,
+            )?;
+        }
         for pass in graph.passes() {
             record_barriers_for_location(
                 device,
@@ -568,7 +614,6 @@ fn record_graph_command_buffer(
                 shadows,
                 scene_pass_resources,
                 pass,
-                materials,
                 meshes,
                 snapshot,
                 readback,
@@ -601,6 +646,7 @@ struct FrameFeatureFlags {
 struct FrameRecordState<'a> {
     features: FrameFeatureFlags,
     quality: RenderQualitySettings,
+    emissive_lights: EmissiveLightUniforms,
     draw_lists: FrameDrawLists<'a>,
 }
 
@@ -609,15 +655,18 @@ impl<'a> FrameRecordState<'a> {
     fn new(
         features: FrameFeatureFlags,
         quality: RenderQualitySettings,
+        emissive_lights: EmissiveLightUniforms,
         materials: &VulkanMaterialStore,
         meshes: &VulkanMeshStore,
         snapshot: &'a FrameSnapshot,
         extent: vk::Extent2D,
         record_shadow_draws: bool,
+        local_shadow_data: Option<LocalShadowFrameData>,
     ) -> Self {
         Self {
             features,
             quality,
+            emissive_lights,
             draw_lists: FrameDrawLists::new(
                 materials,
                 meshes,
@@ -625,6 +674,7 @@ impl<'a> FrameRecordState<'a> {
                 extent,
                 features,
                 record_shadow_draws,
+                local_shadow_data,
             ),
         }
     }
@@ -634,11 +684,13 @@ struct SceneDrawItem<'a> {
     item: &'a RenderItemPacket,
     options: MeshDrawOptions,
     pipeline_key: MeshPipelineKey,
+    material_descriptor_set: vk::DescriptorSet,
 }
 
 struct ShadowDrawItem<'a> {
     item: &'a RenderItemPacket,
     pipeline_key: MeshPipelineKey,
+    material_descriptor_set: vk::DescriptorSet,
 }
 
 struct FrameDrawLists<'a> {
@@ -646,6 +698,7 @@ struct FrameDrawLists<'a> {
     transparent_scene: Vec<SceneDrawItem<'a>>,
     opaque_shadow: [Vec<ShadowDrawItem<'a>>; SHADOW_CASCADE_COUNT],
     translucent_shadow: [Vec<ShadowDrawItem<'a>>; SHADOW_CASCADE_COUNT],
+    local_shadow: [Vec<ShadowDrawItem<'a>>; MAX_LOCAL_LIGHTS],
 }
 
 impl<'a> FrameDrawLists<'a> {
@@ -657,6 +710,7 @@ impl<'a> FrameDrawLists<'a> {
         extent: vk::Extent2D,
         features: FrameFeatureFlags,
         record_shadow_draws: bool,
+        local_shadow_data: Option<LocalShadowFrameData>,
     ) -> Self {
         let camera = active_camera(snapshot);
         let camera_forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
@@ -664,14 +718,15 @@ impl<'a> FrameDrawLists<'a> {
             .render_items
             .iter()
             .filter_map(|item| {
-                if materials.is_transparent(item.material) {
+                let material = materials.draw_info(item.material)?;
+                if material.transparent {
                     return None;
                 }
                 let options =
                     meshes.scene_draw_options(item.mesh, extent, camera, snapshot.optimization)?;
                 let pipeline_key = MeshPipelineKey {
-                    uses_textures: materials.has_any_texture(item.material),
-                    double_sided: materials.is_double_sided(item.material),
+                    uses_textures: material.uses_any_texture,
+                    double_sided: material.double_sided,
                 };
 
                 Some((
@@ -686,6 +741,7 @@ impl<'a> FrameDrawLists<'a> {
                         item,
                         options,
                         pipeline_key,
+                        material_descriptor_set: material.descriptor_set,
                     },
                 ))
             })
@@ -699,19 +755,21 @@ impl<'a> FrameDrawLists<'a> {
             .render_items
             .iter()
             .filter_map(|item| {
-                if !materials.is_transparent(item.material) {
+                let material = materials.draw_info(item.material)?;
+                if !material.transparent {
                     return None;
                 }
                 let options =
                     meshes.scene_draw_options(item.mesh, extent, camera, snapshot.optimization)?;
                 let pipeline_key = MeshPipelineKey {
-                    uses_textures: materials.has_any_texture(item.material),
-                    double_sided: materials.is_double_sided(item.material),
+                    uses_textures: material.uses_any_texture,
+                    double_sided: material.double_sided,
                 };
                 Some(SceneDrawItem {
                     item,
                     options,
                     pipeline_key,
+                    material_descriptor_set: material.descriptor_set,
                 })
             })
             .collect::<Vec<_>>();
@@ -742,12 +800,18 @@ impl<'a> FrameDrawLists<'a> {
         } else {
             std::array::from_fn(|_| Vec::new())
         };
+        let local_shadow = if record_shadow_draws {
+            local_shadow_draw_items(materials, meshes, &snapshot.render_items, local_shadow_data)
+        } else {
+            std::array::from_fn(|_| Vec::new())
+        };
 
         Self {
             opaque_scene,
             transparent_scene,
             opaque_shadow,
             translucent_shadow,
+            local_shadow,
         }
     }
 }
@@ -762,12 +826,13 @@ fn frame_feature_flags(
         if !item.flags.visible {
             continue;
         }
+        let Some(material) = materials.draw_info(item.material) else {
+            continue;
+        };
         let casts_shadow = item.flags.casts_shadow;
-        let is_transparent = materials.is_transparent(item.material);
-        let casts_opaque_shadow = casts_shadow && materials.casts_opaque_shadow(item.material);
-        let casts_translucent_shadow =
-            casts_shadow && materials.casts_translucent_shadow(item.material);
-        flags.has_transparent_scene_items |= is_transparent;
+        let casts_opaque_shadow = casts_shadow && material.casts_opaque_shadow;
+        let casts_translucent_shadow = casts_shadow && material.casts_translucent_shadow;
+        flags.has_transparent_scene_items |= material.transparent;
         flags.has_opaque_shadow_casters |= casts_opaque_shadow;
         flags.has_translucent_shadow_casters |= casts_translucent_shadow;
         flags.has_shadow_casters |= casts_translucent_shadow || casts_opaque_shadow;
@@ -790,7 +855,6 @@ fn record_graph_pass(
     shadows: Option<&ShadowResources>,
     scene_pass_resources: &MeshPassResources,
     pass: &GraphPass,
-    materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
     snapshot: &FrameSnapshot,
     readback: Option<FramebufferReadbackCopy>,
@@ -804,7 +868,6 @@ fn record_graph_pass(
             frame,
             shadows,
             cascade_index,
-            materials,
             meshes,
             state.draw_lists.opaque_shadow[cascade_index].as_slice(),
         );
@@ -831,20 +894,40 @@ fn record_graph_pass(
             frame,
             shadows,
             cascade_index,
-            materials,
             meshes,
             state.draw_lists.translucent_shadow[cascade_index].as_slice(),
         );
     }
+    if let Some(mip_index) = bloom_downsample_pass_index(name) {
+        return record_bloom_downsample_pass(device, frame, swapchain, mip_index, state.quality);
+    }
+    if let Some(target_mip_index) = bloom_upsample_pass_index(name) {
+        return record_bloom_upsample_pass(
+            device,
+            frame,
+            swapchain,
+            target_mip_index,
+            state.quality,
+        );
+    }
 
     match name {
+        GOD_RAY_MASK_PASS => record_god_ray_mask_pass(device, frame, swapchain, snapshot, state),
+        GOD_RAY_PREFILTER_PASS => {
+            record_god_ray_prefilter_pass(device, frame, swapchain, snapshot, state)
+        }
+        GOD_RAY_RADIAL_PASS => {
+            record_god_ray_radial_pass(device, frame, swapchain, snapshot, state)
+        }
+        GOD_RAY_TEMPORAL_PASS => {
+            record_god_ray_temporal_pass(device, frame, swapchain, snapshot, state)
+        }
         "scene" => record_scene_pass(
             device,
             frame,
             swapchain,
             scene_pass_resources,
             pass,
-            materials,
             meshes,
             state,
         ),
@@ -915,6 +998,7 @@ fn scene_material_metadata_required(quality: RenderQualitySettings) -> bool {
     quality.ssao().intensity() > 0.0
         || quality.ssr().intensity() > 0.0
         || quality.anti_aliasing().blend() > 0.0
+        || quality.bloom().god_rays_intensity() > 0.0
 }
 
 /// Records one graph-owned image barrier outside pass recording.
@@ -958,6 +1042,39 @@ fn record_graph_barrier(
     }
 }
 
+fn record_image_state_transition_layers(
+    device: &Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    aspect: vk::ImageAspectFlags,
+    from: ResourceState,
+    to: ResourceState,
+    layer_count: u32,
+) {
+    let image_barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(access_for_source_state(from))
+        .dst_access_mask(access_for_destination_state(to))
+        .old_layout(layout_for_state(from))
+        .new_layout(layout_for_state(to))
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource_range(aspect).layer_count(layer_count));
+    let image_barriers = [image_barrier];
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            stage_for_source_state(from),
+            stage_for_destination_state(to),
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &image_barriers,
+        );
+    }
+}
+
 /// Records scene draws into the graph-owned scene color and depth targets.
 fn record_scene_pass(
     device: &Device,
@@ -965,7 +1082,6 @@ fn record_scene_pass(
     swapchain: &VulkanSwapchain,
     pass_resources: &MeshPassResources,
     pass: &GraphPass,
-    materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
     state: &FrameRecordState<'_>,
 ) -> Result<(), VulkanError> {
@@ -1016,10 +1132,10 @@ fn record_scene_pass(
                 device,
                 frame.command_buffer,
                 opaque_pipeline,
-                materials,
                 Some(pass_resources),
                 frame.slot_index,
                 draw.item,
+                draw.material_descriptor_set,
                 draw.options,
                 draw.pipeline_key,
                 &mut opaque_draw_state,
@@ -1033,10 +1149,10 @@ fn record_scene_pass(
                 device,
                 frame.command_buffer,
                 transparent_pipeline,
-                materials,
                 Some(pass_resources),
                 frame.slot_index,
                 draw.item,
+                draw.material_descriptor_set,
                 draw.options,
                 draw.pipeline_key,
                 &mut transparent_draw_state,
@@ -1062,49 +1178,18 @@ fn record_shadow_pass(
     frame: ActiveFrame,
     shadows: &ShadowResources,
     cascade_index: usize,
-    materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
     items: &[ShadowDrawItem<'_>],
 ) -> Result<(), VulkanError> {
-    let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0]), depth_clear_value()];
-    let shadow_extent = shadows.extent_2d(cascade_index)?;
-    let render_area = vk::Rect2D::default()
-        .offset(vk::Offset2D { x: 0, y: 0 })
-        .extent(shadow_extent);
-    let render_pass_info = vk::RenderPassBeginInfo::default()
-        .render_pass(shadows.shadow_render_pass())
-        .framebuffer(shadows.shadow_framebuffer(cascade_index)?)
-        .render_area(render_area)
-        .clear_values(&clear_values);
-
-    // Safety: graph barriers place the moment map in color attachment layout before this pass.
-    unsafe {
-        device.cmd_begin_render_pass(
-            frame.command_buffer,
-            &render_pass_info,
-            vk::SubpassContents::INLINE,
-        );
-        let caster_count = record_mesh_draws(
-            device,
-            frame,
-            materials,
-            meshes,
-            shadows.shadow_pipeline(),
-            None,
-            items,
-            shadow_extent,
-            cascade_index,
-        )?;
-        if caster_count == 0 {
-            tracing::trace!(
-                cascade_index,
-                "opaque shadow pass cleared without mesh draws because no casters are live"
-            );
-        }
-        device.cmd_end_render_pass(frame.command_buffer);
-    }
-
-    Ok(())
+    record_shadow_map_pass(
+        device,
+        frame,
+        shadows,
+        meshes,
+        items,
+        ShadowMapTarget::Cascade(cascade_index),
+        "opaque shadow pass cleared without mesh draws because no casters are live",
+    )
 }
 
 /// Records one separable blur pass over shadow moments for a single cascade.
@@ -1115,24 +1200,83 @@ fn record_shadow_moment_blur_pass(
     cascade_index: usize,
     horizontal: bool,
 ) -> Result<(), VulkanError> {
+    record_shadow_moment_blur_target_pass(
+        device,
+        frame,
+        shadows,
+        ShadowMapTarget::Cascade(cascade_index),
+        horizontal,
+    )
+}
+
+/// Records raw moment data for either a global cascade or the local-light shadow map.
+fn record_shadow_map_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    shadows: &ShadowResources,
+    meshes: &VulkanMeshStore,
+    items: &[ShadowDrawItem<'_>],
+    target: ShadowMapTarget,
+    empty_message: &'static str,
+) -> Result<(), VulkanError> {
+    let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0]), depth_clear_value()];
+    let shadow_extent = shadow_map_target_extent(shadows, target)?;
+    let render_area = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(shadow_extent);
+    let render_pass_info = vk::RenderPassBeginInfo::default()
+        .render_pass(shadows.shadow_render_pass())
+        .framebuffer(shadow_map_target_framebuffer(shadows, target)?)
+        .render_area(render_area)
+        .clear_values(&clear_values);
+
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        let caster_count = record_mesh_draws(
+            device,
+            frame,
+            meshes,
+            shadows.shadow_pipeline(),
+            None,
+            items,
+            shadow_extent,
+            shadow_map_target_pipeline_index(target),
+        )?;
+        if caster_count == 0 {
+            tracing::trace!(target = shadow_map_target_name(target), "{}", empty_message);
+        }
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+/// Records one separable blur pass for either a global cascade or the local-light shadow map.
+fn record_shadow_moment_blur_target_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    shadows: &ShadowResources,
+    target: ShadowMapTarget,
+    horizontal: bool,
+) -> Result<(), VulkanError> {
     let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0])];
-    let shadow_extent = shadows.extent_2d(cascade_index)?;
-    let framebuffer = if horizontal {
-        shadows.blur_h_framebuffer(cascade_index)?
-    } else {
-        shadows.blur_v_framebuffer(cascade_index)?
-    };
+    let shadow_extent = shadow_map_target_extent(shadows, target)?;
     let render_area = vk::Rect2D::default()
         .offset(vk::Offset2D { x: 0, y: 0 })
         .extent(shadow_extent);
     let render_pass_info = vk::RenderPassBeginInfo::default()
         .render_pass(shadows.blur_render_pass())
-        .framebuffer(framebuffer)
+        .framebuffer(shadow_map_target_blur_framebuffer(
+            shadows, target, horizontal,
+        )?)
         .render_area(render_area)
         .clear_values(&clear_values);
+    let pipeline_index = shadow_map_target_pipeline_index(target);
 
-    // Safety: graph barriers place the blur source in shader-read layout and the blur target in
-    // color-attachment layout before this fullscreen pass begins.
     unsafe {
         device.cmd_begin_render_pass(
             frame.command_buffer,
@@ -1143,15 +1287,117 @@ fn record_shadow_moment_blur_pass(
             shadows.blur_pipeline().draw_horizontal(
                 device,
                 frame.command_buffer,
-                cascade_index,
+                pipeline_index,
                 shadow_extent,
             );
         } else {
             shadows.blur_pipeline().draw_vertical(
                 device,
                 frame.command_buffer,
-                cascade_index,
+                pipeline_index,
                 shadow_extent,
+            );
+        }
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+/// Records depth cubemaps for shadowed local lights before scene lighting samples them.
+fn record_local_shadow_passes(
+    device: &Device,
+    frame: ActiveFrame,
+    shadows: &ShadowResources,
+    meshes: &VulkanMeshStore,
+    items: &[Vec<ShadowDrawItem<'_>>; MAX_LOCAL_LIGHTS],
+    local_shadow: LocalShadowFrameData,
+) -> Result<(), VulkanError> {
+    let command_buffer = frame.command_buffer;
+    for local_light in local_shadow.lights.into_iter().flatten() {
+        let light_index = local_light.light_index;
+        record_image_state_transition_layers(
+            device,
+            command_buffer,
+            shadows.local_depth_image(light_index)?,
+            vk::ImageAspectFlags::DEPTH,
+            ResourceState::ShaderRead,
+            ResourceState::DepthAttachment,
+            LOCAL_SHADOW_FACE_COUNT as u32,
+        );
+
+        for face_index in 0..LOCAL_SHADOW_FACE_COUNT {
+            record_local_shadow_face_pass(
+                device,
+                frame,
+                shadows,
+                meshes,
+                &items[light_index],
+                light_index,
+                face_index,
+            )?;
+        }
+
+        record_image_state_transition_layers(
+            device,
+            command_buffer,
+            shadows.local_depth_image(light_index)?,
+            vk::ImageAspectFlags::DEPTH,
+            ResourceState::DepthAttachment,
+            ResourceState::ShaderRead,
+            LOCAL_SHADOW_FACE_COUNT as u32,
+        );
+
+        tracing::trace!(
+            light_index,
+            caster_count = items[light_index].len(),
+            source_radius = local_light.source_radius,
+            "recorded local-light cubemap shadow"
+        );
+    }
+    Ok(())
+}
+
+fn record_local_shadow_face_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    shadows: &ShadowResources,
+    meshes: &VulkanMeshStore,
+    items: &[ShadowDrawItem<'_>],
+    light_index: usize,
+    face_index: usize,
+) -> Result<(), VulkanError> {
+    let clear_values = [depth_clear_value()];
+    let shadow_extent = shadows.local_extent_2d();
+    let render_area = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(shadow_extent);
+    let render_pass_info = vk::RenderPassBeginInfo::default()
+        .render_pass(shadows.local_shadow_render_pass())
+        .framebuffer(shadows.local_shadow_framebuffer(light_index, face_index)?)
+        .render_area(render_area)
+        .clear_values(&clear_values);
+
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        let caster_count = record_mesh_draws(
+            device,
+            frame,
+            meshes,
+            shadows.local_shadow_pipeline(),
+            None,
+            items,
+            shadow_extent,
+            LOCAL_SHADOW_CASCADE_INDEX + light_index * LOCAL_SHADOW_FACE_COUNT + face_index,
+        )?;
+        if caster_count == 0 {
+            tracing::trace!(
+                face_index,
+                "local shadow cubemap face cleared without mesh draws"
             );
         }
         device.cmd_end_render_pass(frame.command_buffer);
@@ -1166,7 +1412,6 @@ fn record_translucent_shadow_pass(
     frame: ActiveFrame,
     shadows: &ShadowResources,
     cascade_index: usize,
-    materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
     items: &[ShadowDrawItem<'_>],
 ) -> Result<(), VulkanError> {
@@ -1192,7 +1437,6 @@ fn record_translucent_shadow_pass(
         let caster_count = record_mesh_draws(
             device,
             frame,
-            materials,
             meshes,
             shadows.translucent_pipeline(),
             Some(shadows.translucent_pass_resources()),
@@ -1206,6 +1450,235 @@ fn record_translucent_shadow_pass(
                 "translucent shadow pass cleared to full transmittance because no casters are live"
             );
         }
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+/// Records one bloom downsample pass in the HDR mip chain.
+fn record_bloom_downsample_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    mip_index: usize,
+    quality: RenderQualitySettings,
+) -> Result<(), VulkanError> {
+    let target_extent = swapchain.bloom_extent_2d(mip_index)?;
+    let source_extent = if mip_index == 0 {
+        swapchain.extent_2d()
+    } else {
+        swapchain.bloom_extent_2d(mip_index - 1)?
+    };
+    let render_area = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(target_extent);
+    let render_pass_info = vk::RenderPassBeginInfo::default()
+        .render_pass(swapchain.bloom_downsample_render_pass())
+        .framebuffer(swapchain.bloom_downsample_framebuffer(mip_index)?)
+        .render_area(render_area);
+
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.bloom_pipeline().draw_downsample(
+            device,
+            frame.command_buffer,
+            mip_index,
+            source_extent,
+            target_extent,
+            quality.bloom(),
+        )?;
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+/// Records one additive bloom upsample pass from a smaller mip into the next larger mip.
+fn record_bloom_upsample_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    target_mip_index: usize,
+    quality: RenderQualitySettings,
+) -> Result<(), VulkanError> {
+    let source_extent = swapchain.bloom_extent_2d(target_mip_index + 1)?;
+    let target_extent = swapchain.bloom_extent_2d(target_mip_index)?;
+    let render_area = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(target_extent);
+    let render_pass_info = vk::RenderPassBeginInfo::default()
+        .render_pass(swapchain.bloom_upsample_render_pass())
+        .framebuffer(swapchain.bloom_upsample_framebuffer(target_mip_index)?)
+        .render_area(render_area);
+
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.bloom_pipeline().draw_upsample(
+            device,
+            frame.command_buffer,
+            target_mip_index,
+            source_extent,
+            target_extent,
+            quality.bloom(),
+        )?;
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+fn god_ray_push_constants(
+    swapchain: &VulkanSwapchain,
+    snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
+) -> GodRayPushConstants {
+    GodRayPushConstants::new(
+        active_camera(snapshot),
+        swapchain.god_ray_extent_2d(),
+        state.quality,
+        frame_light_intensity(snapshot),
+        state.emissive_lights,
+        state.features.has_transparent_scene_items,
+        swapchain.god_ray_history_valid(),
+    )
+}
+
+fn god_ray_render_pass_info(
+    swapchain: &VulkanSwapchain,
+    framebuffer: vk::Framebuffer,
+) -> vk::RenderPassBeginInfo<'_> {
+    let render_area = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(swapchain.god_ray_extent_2d());
+    vk::RenderPassBeginInfo::default()
+        .render_pass(swapchain.god_ray_render_pass())
+        .framebuffer(framebuffer)
+        .render_area(render_area)
+}
+
+fn record_god_ray_mask_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
+) -> Result<(), VulkanError> {
+    let push = god_ray_push_constants(swapchain, snapshot, state);
+    let render_pass_info =
+        god_ray_render_pass_info(swapchain, swapchain.god_ray_mask_framebuffer());
+
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.god_rays_pipeline().draw_mask(
+            device,
+            frame.command_buffer,
+            swapchain.god_ray_extent_2d(),
+            push,
+        );
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+fn record_god_ray_prefilter_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
+) -> Result<(), VulkanError> {
+    let push = god_ray_push_constants(swapchain, snapshot, state);
+    let render_pass_info =
+        god_ray_render_pass_info(swapchain, swapchain.god_ray_prefilter_framebuffer());
+
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.god_rays_pipeline().draw_prefilter(
+            device,
+            frame.command_buffer,
+            swapchain.god_ray_extent_2d(),
+            push,
+        );
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+fn record_god_ray_radial_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
+) -> Result<(), VulkanError> {
+    let push = god_ray_push_constants(swapchain, snapshot, state);
+    let render_pass_info =
+        god_ray_render_pass_info(swapchain, swapchain.god_ray_radial_framebuffer());
+
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.god_rays_pipeline().draw_radial(
+            device,
+            frame.command_buffer,
+            swapchain.god_ray_extent_2d(),
+            push,
+        );
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+fn record_god_ray_temporal_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
+) -> Result<(), VulkanError> {
+    let write_history_index = swapchain.god_ray_history_write_index();
+    let push = god_ray_push_constants(swapchain, snapshot, state);
+    let render_pass_info = god_ray_render_pass_info(
+        swapchain,
+        swapchain.god_ray_history_framebuffer(write_history_index)?,
+    );
+
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.god_rays_pipeline().draw_temporal(
+            device,
+            frame.command_buffer,
+            swapchain.god_ray_extent_2d(),
+            write_history_index,
+            push,
+        )?;
         device.cmd_end_render_pass(frame.command_buffer);
     }
 
@@ -1246,6 +1719,9 @@ fn record_post_pass(
             active_camera(snapshot),
             state.quality,
             state.features.has_transparent_scene_items,
+            swapchain.god_ray_history_write_index(),
+            frame_light_intensity(snapshot),
+            state.emissive_lights,
         );
         device.cmd_end_render_pass(frame.command_buffer);
     }
@@ -1283,11 +1759,56 @@ enum MeshDrawFilter {
     TranslucentShadowCasters,
 }
 
+#[derive(Clone, Copy)]
+enum ShadowMapTarget {
+    Cascade(usize),
+}
+
+fn shadow_map_target_extent(
+    shadows: &ShadowResources,
+    target: ShadowMapTarget,
+) -> Result<vk::Extent2D, VulkanError> {
+    match target {
+        ShadowMapTarget::Cascade(index) => shadows.extent_2d(index),
+    }
+}
+
+fn shadow_map_target_framebuffer(
+    shadows: &ShadowResources,
+    target: ShadowMapTarget,
+) -> Result<vk::Framebuffer, VulkanError> {
+    match target {
+        ShadowMapTarget::Cascade(index) => shadows.shadow_framebuffer(index),
+    }
+}
+
+fn shadow_map_target_blur_framebuffer(
+    shadows: &ShadowResources,
+    target: ShadowMapTarget,
+    horizontal: bool,
+) -> Result<vk::Framebuffer, VulkanError> {
+    match (target, horizontal) {
+        (ShadowMapTarget::Cascade(index), true) => shadows.blur_h_framebuffer(index),
+        (ShadowMapTarget::Cascade(index), false) => shadows.blur_v_framebuffer(index),
+    }
+}
+
+fn shadow_map_target_pipeline_index(target: ShadowMapTarget) -> usize {
+    match target {
+        ShadowMapTarget::Cascade(index) => index,
+    }
+}
+
+fn shadow_map_target_name(target: ShadowMapTarget) -> &'static str {
+    match target {
+        ShadowMapTarget::Cascade(_) => "cascade",
+    }
+}
+
 /// Records mesh-only passes without duplicating per-pass draw loops.
 fn record_mesh_draws(
     device: &Device,
     frame: ActiveFrame,
-    materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
     pipeline: MeshPipelineSet,
     pass_resources: Option<&MeshPassResources>,
@@ -1303,10 +1824,10 @@ fn record_mesh_draws(
             device,
             frame.command_buffer,
             pipeline,
-            materials,
             pass_resources,
             frame.slot_index,
             draw.item,
+            draw.material_descriptor_set,
             draw_options,
             draw.pipeline_key,
             &mut draw_state,
@@ -1331,14 +1852,15 @@ fn shadow_draw_items<'a>(
             let mut draw_items = items
                 .iter()
                 .filter_map(|item| {
-                    if !shadow_filter_accepts(filter, materials, item)
+                    let material = materials.draw_info(item.material)?;
+                    if !shadow_filter_accepts(filter, material, item)
                         || !meshes.accepts_shadow_cascade(item.mesh, shadow_cull)
                     {
                         return None;
                     }
                     let pipeline_key = MeshPipelineKey {
-                        uses_textures: materials.has_base_color_texture(item.material),
-                        double_sided: materials.is_double_sided(item.material),
+                        uses_textures: material.uses_base_color_texture,
+                        double_sided: material.double_sided,
                     };
 
                     Some((
@@ -1348,7 +1870,11 @@ fn shadow_draw_items<'a>(
                             item.material.raw(),
                             item.mesh.raw(),
                         ),
-                        ShadowDrawItem { item, pipeline_key },
+                        ShadowDrawItem {
+                            item,
+                            pipeline_key,
+                            material_descriptor_set: material.descriptor_set,
+                        },
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -1358,7 +1884,8 @@ fn shadow_draw_items<'a>(
         MeshDrawFilter::TranslucentShadowCasters => items
             .iter()
             .filter_map(|item| {
-                if !shadow_filter_accepts(filter, materials, item)
+                let material = materials.draw_info(item.material)?;
+                if !shadow_filter_accepts(filter, material, item)
                     || !meshes.accepts_shadow_cascade(item.mesh, shadow_cull)
                 {
                     return None;
@@ -1366,13 +1893,107 @@ fn shadow_draw_items<'a>(
                 Some(ShadowDrawItem {
                     item,
                     pipeline_key: MeshPipelineKey {
-                        uses_textures: materials.has_base_color_texture(item.material),
-                        double_sided: materials.is_double_sided(item.material),
+                        uses_textures: material.uses_base_color_texture,
+                        double_sided: material.double_sided,
                     },
+                    material_descriptor_set: material.descriptor_set,
                 })
             })
             .collect(),
     }
+}
+
+/// Builds local-light shadow draw lists for every enabled cubemap light.
+fn local_shadow_draw_items<'a>(
+    materials: &VulkanMaterialStore,
+    meshes: &VulkanMeshStore,
+    items: &'a [RenderItemPacket],
+    local_shadow: Option<LocalShadowFrameData>,
+) -> [Vec<ShadowDrawItem<'a>>; MAX_LOCAL_LIGHTS] {
+    let Some(local_shadow) = local_shadow else {
+        return std::array::from_fn(|_| Vec::new());
+    };
+
+    std::array::from_fn(|light_index| {
+        let Some(local_light) = local_shadow.lights[light_index] else {
+            return Vec::new();
+        };
+
+        local_shadow_draw_items_for_light(materials, meshes, items, local_light)
+    })
+}
+
+fn local_shadow_draw_items_for_light<'a>(
+    materials: &VulkanMaterialStore,
+    meshes: &VulkanMeshStore,
+    items: &'a [RenderItemPacket],
+    local_shadow: LocalShadowLightData,
+) -> Vec<ShadowDrawItem<'a>> {
+    let light = local_shadow.light_position_radius;
+    let light_position = [light[0], light[1], light[2]];
+    let range = light[3].max(0.0);
+    let source_radius = local_shadow.source_radius.max(0.0);
+    if range <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut draw_items = items
+        .iter()
+        .filter_map(|item| {
+            let material = materials.draw_info(item.material)?;
+            if !shadow_filter_accepts(MeshDrawFilter::OpaqueShadowCasters, material, item) {
+                return None;
+            }
+            let Some(bounds) = meshes.bounds_for(item.mesh) else {
+                return None;
+            };
+            let center = bounds.center();
+            let radius = bounds.radius();
+            if local_shadow_self_occluder(center, radius, light_position, source_radius) {
+                return None;
+            }
+            let dx = center[0] - light_position[0];
+            let dy = center[1] - light_position[1];
+            let dz = center[2] - light_position[2];
+            let influence = range + radius;
+            if dx * dx + dy * dy + dz * dz > influence * influence {
+                return None;
+            }
+
+            // Cubemap shadows see the same caster from every direction, so material-side
+            // backface culling can drop a face of the local shadow map.
+            let pipeline_key = MeshPipelineKey {
+                uses_textures: material.uses_base_color_texture,
+                double_sided: true,
+            };
+            Some((
+                (
+                    pipeline_key.uses_textures,
+                    pipeline_key.double_sided,
+                    item.material.raw(),
+                    item.mesh.raw(),
+                ),
+                ShadowDrawItem {
+                    item,
+                    pipeline_key,
+                    material_descriptor_set: material.descriptor_set,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    draw_items.sort_unstable_by_key(|(key, _)| *key);
+    draw_items.into_iter().map(|(_, draw)| draw).collect()
+}
+
+fn local_shadow_self_occluder(
+    center: [f32; 3],
+    radius: f32,
+    light_position: [f32; 3],
+    source_radius: f32,
+) -> bool {
+    let delta = sub3(center, light_position);
+    let skip_radius = source_radius.max(0.08).min(radius.max(0.08)) * 0.2;
+    dot3(delta, delta) <= skip_radius * skip_radius
 }
 
 /// Returns a coarse front-to-back bucket for opaque scene draws.
@@ -1405,16 +2026,14 @@ fn opaque_scene_depth_bucket(
 /// Returns whether one render item belongs in the selected shadow caster pass.
 fn shadow_filter_accepts(
     filter: MeshDrawFilter,
-    materials: &VulkanMaterialStore,
+    material: MaterialDrawInfo,
     item: &crate::protocol::RenderItemPacket,
 ) -> bool {
     item.flags.visible
         && item.flags.casts_shadow
         && match filter {
-            MeshDrawFilter::OpaqueShadowCasters => materials.casts_opaque_shadow(item.material),
-            MeshDrawFilter::TranslucentShadowCasters => {
-                materials.casts_translucent_shadow(item.material)
-            }
+            MeshDrawFilter::OpaqueShadowCasters => material.casts_opaque_shadow,
+            MeshDrawFilter::TranslucentShadowCasters => material.casts_translucent_shadow,
         }
 }
 
@@ -1438,19 +2057,15 @@ fn frame_light_intensity(snapshot: &FrameSnapshot) -> f32 {
 }
 
 #[derive(Clone, Copy)]
-struct EmissiveLightCandidate {
+struct LocalLightCandidate {
     score: f32,
     position_radius: [f32; 4],
     color: [f32; 4],
+    direction_radius: [f32; 4],
+    size_kind: [f32; 4],
 }
 
-#[derive(Clone, Copy)]
-struct LocalShadowCasterCandidate {
-    score: f32,
-    center_radius: [f32; 4],
-}
-
-/// Extracts a small, stable local-light set from emissive mesh materials.
+/// Extracts a small, stable local-light set from explicit packets and emissive mesh materials.
 fn emissive_light_uniforms(
     materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
@@ -1459,148 +2074,131 @@ fn emissive_light_uniforms(
 ) -> EmissiveLightUniforms {
     const MIN_EMISSIVE_BRIGHTNESS: f32 = 0.02;
     const EMISSIVE_LIGHT_COLOR_SCALE: f32 = 1.35;
-    const EMISSIVE_LIGHT_RADIUS_SCALE: f32 = 4.5;
-    const EMISSIVE_LIGHT_MIN_RADIUS: f32 = 1.5;
-    const EMISSIVE_LIGHT_MAX_RADIUS: f32 = 72.0;
+    const EMISSIVE_LIGHT_RADIUS_SCALE: f32 = 10.0;
+    const EMISSIVE_LIGHT_BRIGHTNESS_RANGE_SCALE: f32 = 6.0;
+    const EMISSIVE_LIGHT_MIN_RADIUS: f32 = 4.0;
+    const EMISSIVE_LIGHT_MAX_RADIUS: f32 = 192.0;
 
     let mut candidates = Vec::new();
-
-    for item in &snapshot.render_items {
-        if !item.flags.visible {
-            continue;
+    for light in &snapshot.local_lights {
+        let candidate = local_light_candidate(light, camera);
+        if candidate.color[3] > MIN_EMISSIVE_BRIGHTNESS {
+            candidates.push(candidate);
         }
+    }
 
-        let Some(emissive) = materials.emissive_factor(item.material) else {
-            continue;
-        };
-        let brightness = max3(emissive);
-        if brightness <= MIN_EMISSIVE_BRIGHTNESS {
-            continue;
+    if candidates.len() < MAX_LOCAL_LIGHTS {
+        for item in &snapshot.render_items {
+            if !item.flags.visible {
+                continue;
+            }
+
+            let Some(emissive) = materials.emissive_factor(item.material) else {
+                continue;
+            };
+            let brightness = max3(emissive);
+            if brightness <= MIN_EMISSIVE_BRIGHTNESS {
+                continue;
+            }
+
+            let Some(bounds) = meshes.bounds_for(item.mesh) else {
+                continue;
+            };
+            let center = bounds.center();
+            let source_radius = bounds.radius();
+            if has_explicit_local_light_near(&candidates, center, source_radius) {
+                continue;
+            }
+            let brightness_gain = brightness.sqrt();
+            let light_radius = (source_radius
+                * (EMISSIVE_LIGHT_RADIUS_SCALE + brightness_gain * 2.0)
+                + brightness_gain * EMISSIVE_LIGHT_BRIGHTNESS_RANGE_SCALE)
+                .clamp(EMISSIVE_LIGHT_MIN_RADIUS, EMISSIVE_LIGHT_MAX_RADIUS);
+            let area_radius = source_radius.clamp(0.05, light_radius * 0.45);
+            let camera_delta = sub3(center, camera.eye);
+            let camera_distance_sq = dot3(camera_delta, camera_delta).max(1.0);
+            let score =
+                brightness * light_radius * light_radius / (1.0 + camera_distance_sq * 0.0025);
+
+            candidates.push(LocalLightCandidate {
+                score,
+                position_radius: [center[0], center[1], center[2], light_radius],
+                color: [
+                    emissive[0] * EMISSIVE_LIGHT_COLOR_SCALE,
+                    emissive[1] * EMISSIVE_LIGHT_COLOR_SCALE,
+                    emissive[2] * EMISSIVE_LIGHT_COLOR_SCALE,
+                    brightness,
+                ],
+                direction_radius: [0.0, -1.0, 0.0, area_radius],
+                size_kind: [
+                    area_radius,
+                    area_radius,
+                    LocalLightKind::Sphere.shader_code(),
+                    1.0,
+                ],
+            });
         }
-
-        let Some(bounds) = meshes.bounds_for(item.mesh) else {
-            continue;
-        };
-        let center = bounds.center();
-        let source_radius = bounds.radius();
-        let light_radius = (source_radius * (EMISSIVE_LIGHT_RADIUS_SCALE + brightness.sqrt()))
-            .clamp(EMISSIVE_LIGHT_MIN_RADIUS, EMISSIVE_LIGHT_MAX_RADIUS);
-        let camera_delta = sub3(center, camera.eye);
-        let camera_distance_sq = dot3(camera_delta, camera_delta).max(1.0);
-        let score = brightness * light_radius * light_radius / (1.0 + camera_distance_sq * 0.0025);
-
-        candidates.push(EmissiveLightCandidate {
-            score,
-            position_radius: [center[0], center[1], center[2], light_radius],
-            color: [
-                emissive[0] * EMISSIVE_LIGHT_COLOR_SCALE,
-                emissive[1] * EMISSIVE_LIGHT_COLOR_SCALE,
-                emissive[2] * EMISSIVE_LIGHT_COLOR_SCALE,
-                brightness,
-            ],
-        });
     }
 
     candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
     let mut uniforms = EmissiveLightUniforms::disabled();
-    for (index, candidate) in candidates.iter().take(MAX_EMISSIVE_LIGHTS).enumerate() {
+    for (index, candidate) in candidates.iter().take(MAX_LOCAL_LIGHTS).enumerate() {
         uniforms.position_radius[index] = candidate.position_radius;
         uniforms.color[index] = candidate.color;
+        uniforms.direction_radius[index] = candidate.direction_radius;
+        uniforms.size_kind[index] = candidate.size_kind;
     }
-    uniforms.count[0] = candidates.len().min(MAX_EMISSIVE_LIGHTS) as f32;
-    let selected_light_position_radius = uniforms.position_radius;
-    let selected_light_count = uniforms.count[0] as usize;
-    fill_local_shadow_casters(
-        materials,
-        meshes,
-        snapshot,
-        camera,
-        &selected_light_position_radius,
-        selected_light_count,
-        &mut uniforms,
-    );
+    uniforms.count[0] = candidates.len().min(MAX_LOCAL_LIGHTS) as f32;
 
     uniforms
 }
 
-fn fill_local_shadow_casters(
-    materials: &VulkanMaterialStore,
-    meshes: &VulkanMeshStore,
-    snapshot: &FrameSnapshot,
-    camera: CameraSnapshot,
-    light_position_radius: &[[f32; 4]; MAX_EMISSIVE_LIGHTS],
-    light_count: usize,
-    uniforms: &mut EmissiveLightUniforms,
-) {
-    if light_count == 0 {
-        return;
+fn has_explicit_local_light_near(
+    candidates: &[LocalLightCandidate],
+    center: [f32; 3],
+    radius: f32,
+) -> bool {
+    let threshold = (radius * 0.25).max(0.25);
+    let threshold_sq = threshold * threshold;
+    candidates.iter().any(|candidate| {
+        let light = candidate.position_radius;
+        let delta = sub3([light[0], light[1], light[2]], center);
+        dot3(delta, delta) <= threshold_sq
+    })
+}
+
+fn local_light_candidate(light: &LocalLightPacket, camera: CameraSnapshot) -> LocalLightCandidate {
+    let brightness = max3(light.color) * light.intensity;
+    let camera_delta = sub3(light.position, camera.eye);
+    let camera_distance_sq = dot3(camera_delta, camera_delta).max(1.0);
+    let score = brightness * light.range * light.range / (1.0 + camera_distance_sq * 0.0025);
+    let kind = light.kind.shader_code();
+    let casts_shadow = if light.casts_shadow { 1.0 } else { 0.0 };
+    let source_radius = light.source_radius.max(0.0).min(light.range);
+
+    LocalLightCandidate {
+        score,
+        position_radius: [
+            light.position[0],
+            light.position[1],
+            light.position[2],
+            light.range,
+        ],
+        color: [
+            light.color[0] * light.intensity,
+            light.color[1] * light.intensity,
+            light.color[2] * light.intensity,
+            brightness,
+        ],
+        direction_radius: [
+            light.direction[0],
+            light.direction[1],
+            light.direction[2],
+            source_radius,
+        ],
+        size_kind: [light.half_size[0], light.half_size[1], kind, casts_shadow],
     }
-
-    const MIN_OCCLUDER_RADIUS: f32 = 0.08;
-    const EMISSIVE_OCCLUDER_SKIP_BRIGHTNESS: f32 = 0.04;
-    const LOCAL_SHADOW_INFLUENCE_SCALE: f32 = 1.15;
-
-    let mut candidates = Vec::new();
-
-    for item in &snapshot.render_items {
-        if !item.flags.visible
-            || !item.flags.casts_shadow
-            || !materials.casts_opaque_shadow(item.material)
-        {
-            continue;
-        }
-
-        if materials
-            .emissive_factor(item.material)
-            .is_some_and(|emissive| max3(emissive) > EMISSIVE_OCCLUDER_SKIP_BRIGHTNESS)
-        {
-            continue;
-        }
-
-        let Some(bounds) = meshes.bounds_for(item.mesh) else {
-            continue;
-        };
-        let center = bounds.center();
-        let radius = bounds.radius();
-        if radius < MIN_OCCLUDER_RADIUS {
-            continue;
-        }
-
-        let mut light_score = 0.0_f32;
-        for light in light_position_radius.iter().take(light_count) {
-            let light_radius = light[3].max(0.001);
-            let light_to_caster = sub3(center, [light[0], light[1], light[2]]);
-            let distance_sq = dot3(light_to_caster, light_to_caster);
-            let influence_radius = (light_radius + radius) * LOCAL_SHADOW_INFLUENCE_SCALE;
-
-            if distance_sq > influence_radius * influence_radius {
-                continue;
-            }
-
-            light_score = light_score.max((radius * radius) / (distance_sq + radius * radius));
-        }
-
-        if light_score <= 0.0 {
-            continue;
-        }
-
-        let camera_delta = sub3(center, camera.eye);
-        let camera_distance_sq = dot3(camera_delta, camera_delta).max(1.0);
-        let camera_score = (radius * radius) / (camera_distance_sq * 0.015 + radius * radius);
-
-        candidates.push(LocalShadowCasterCandidate {
-            score: light_score * 0.8 + camera_score * 0.2,
-            center_radius: [center[0], center[1], center[2], radius],
-        });
-    }
-
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-
-    for (index, candidate) in candidates.iter().take(MAX_LOCAL_SHADOW_CASTERS).enumerate() {
-        uniforms.shadow_caster_center_radius[index] = candidate.center_radius;
-    }
-    uniforms.shadow_caster_count[0] = candidates.len().min(MAX_LOCAL_SHADOW_CASTERS) as f32;
 }
 
 fn max3(value: [f32; 3]) -> f32 {

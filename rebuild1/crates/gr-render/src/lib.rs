@@ -13,16 +13,17 @@ pub use renderer::{
 /// Stable imports for applications and ECS extraction layers using the renderer protocol.
 pub mod prelude {
     pub use crate::protocol::{
-        AntiAliasingQualitySettings, CameraEffects, CameraSnapshot, CommandSink, DropReason,
-        Exposure, FrameId, FrameSnapshot, FrameSnapshotBuilder, FramebufferMetering,
-        FramebufferReadbackOptions, LightPacket, LoadedAsset, MaterialAlphaMode,
-        MaterialDescriptor, MaterialHandle, MaterialTextureSlot, MeshHandle, MessageEnvelope,
-        NativeSurfaceHandle, NonZeroExtent, PostQualitySettings, RenderItemPacket,
-        RenderQualitySettings, RendererCommand, RendererEndpoint, RendererEvent,
-        RendererEventEnvelope, RequestId, SceneBounds, SceneHandle, ShadowSofteningQualitySettings,
-        SnapshotError, SsaoQualitySettings, SsrQualitySettings, SurfaceDescriptor,
-        SurfaceGeneration, SurfaceId, TextureDescriptor, TextureHandle, TransportError, ViewId,
-        ViewPacket, Win32SurfaceHandle, WindowId, renderer_transport,
+        AntiAliasingQualitySettings, BloomQualitySettings, CameraEffects, CameraSnapshot,
+        CommandSink, DropReason, Exposure, FrameId, FrameSnapshot, FrameSnapshotBuilder,
+        FramebufferMetering, FramebufferReadbackOptions, LightPacket, LoadedAsset, LocalLightKind,
+        LocalLightPacket, MaterialAlphaMode, MaterialDescriptor, MaterialHandle,
+        MaterialTextureSlot, MeshHandle, MessageEnvelope, NativeSurfaceHandle, NonZeroExtent,
+        PostQualitySettings, RenderItemPacket, RenderQualitySettings, RendererCommand,
+        RendererEndpoint, RendererEvent, RendererEventEnvelope, RequestId, SceneBounds,
+        SceneHandle, ShadowSofteningQualitySettings, SnapshotError, SsaoQualitySettings,
+        SsrQualitySettings, SurfaceDescriptor, SurfaceGeneration, SurfaceId, TextureDescriptor,
+        TextureHandle, TransportError, ViewId, ViewPacket, Win32SurfaceHandle, WindowId,
+        renderer_transport,
     };
     pub use crate::renderer::{
         NullRendererBackend, RendererBackend, RendererError, RendererResult, RendererThread,

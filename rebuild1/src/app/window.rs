@@ -54,7 +54,7 @@ const WINDOW_MAX_FPS_ENV: &str = "REBUILD1_MAX_FPS";
 const DEFAULT_WINDOW_MAX_FPS: u32 = 120;
 const MIN_WINDOW_MAX_FPS: u32 = 15;
 const MAX_WINDOW_MAX_FPS: u32 = 240;
-const INITIAL_WINDOW_QUALITY: WindowQualityPreset = WindowQualityPreset::Performance;
+const INITIAL_WINDOW_QUALITY: WindowQualityPreset = WindowQualityPreset::HighQuality;
 
 #[derive(Debug, Error)]
 pub enum WindowedRunError {
@@ -707,6 +707,9 @@ impl WindowedApp {
             builder.add_render_item(RenderItemPacket::new(mesh, material));
             count += 1;
         }
+        for &light in &asset.local_lights {
+            builder.add_local_light(light);
+        }
 
         count
     }
@@ -976,6 +979,7 @@ impl WindowedApp {
                         meshes = asset.meshes.len(),
                         materials = asset.materials.len(),
                         textures = asset.textures.len(),
+                        local_lights = asset.local_lights.len(),
                         bounds_center = ?bounds.map(|bounds| bounds.center()),
                         bounds_radius = ?bounds.map(|bounds| bounds.radius()),
                         "window model asset loaded"
@@ -1101,6 +1105,18 @@ impl WindowedApp {
                 self.set_quality_preset(preset)?;
                 return Ok(());
             }
+
+            match physical_key {
+                PhysicalKey::Code(KeyCode::PageUp) => {
+                    self.adjust_camera_smoothing(1);
+                    return Ok(());
+                }
+                PhysicalKey::Code(KeyCode::PageDown) => {
+                    self.adjust_camera_smoothing(-1);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         match physical_key {
@@ -1121,6 +1137,18 @@ impl WindowedApp {
 
         self.camera.set_key(camera_key(physical_key), pressed);
         Ok(())
+    }
+
+    /// Changes renderer-facing camera stabilization from PageUp/PageDown.
+    fn adjust_camera_smoothing(&mut self, delta: i32) {
+        let changed = self.camera.adjust_smoothing_level(delta);
+        let smoothing_ms = self.camera.smoothing_seconds() * 1000.0;
+
+        if changed {
+            tracing::info!(smoothing_ms, "updated window camera smoothing");
+        } else {
+            tracing::trace!(smoothing_ms, "window camera smoothing unchanged");
+        }
     }
 
     /// Sends a renderer quality update selected by a number key.
@@ -1454,6 +1482,26 @@ mod tests {
             RendererCommand::SetQualitySettings { settings }
                 if settings == RenderQualitySettings::interactive()
         ));
+    }
+
+    #[test]
+    fn page_keys_adjust_camera_smoothing() {
+        let config = WindowConfig::default();
+        let (endpoint, _inbox) = renderer_transport(1);
+        let mut app = WindowedApp::new(endpoint, config);
+        let initial = app.camera.smoothing_seconds();
+
+        app.handle_keyboard(PhysicalKey::Code(KeyCode::PageUp), ElementState::Pressed)
+            .expect("page up should adjust local camera smoothing");
+        assert!(app.camera.smoothing_seconds() > initial);
+
+        app.handle_keyboard(PhysicalKey::Code(KeyCode::PageDown), ElementState::Pressed)
+            .expect("page down should adjust local camera smoothing");
+        assert_eq!(app.camera.smoothing_seconds(), initial);
+
+        app.handle_keyboard(PhysicalKey::Code(KeyCode::PageDown), ElementState::Pressed)
+            .expect("page down should keep lowering local camera smoothing");
+        assert!(app.camera.smoothing_seconds() < initial);
     }
 
     // Verifies that window shutdown does not use tokio's blocking send inside a runtime.

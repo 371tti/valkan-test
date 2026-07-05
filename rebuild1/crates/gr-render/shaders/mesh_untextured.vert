@@ -2,14 +2,10 @@
 
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_normal;
-layout(location = 2) in vec2 in_uv;
-layout(location = 3) in vec4 in_tangent;
 layout(location = 4) in vec4 in_color;
 
 layout(location = 1) out vec3 frag_normal;
-layout(location = 2) out vec2 frag_uv;
 layout(location = 3) out vec4 frag_color;
-layout(location = 4) out vec4 frag_tangent;
 layout(location = 5) out vec4 frag_shadow_pos[4];
 layout(location = 9) out vec3 frag_world_pos;
 layout(location = 10) out float frag_view_depth;
@@ -32,9 +28,7 @@ void main() {
     vec4 world_pos = vec4(in_position, 1.0);
     gl_Position = frame_camera.view_proj * world_pos;
     frag_normal = in_normal;
-    frag_uv = in_uv;
     frag_color = in_color;
-    frag_tangent = in_tangent;
     frag_shadow_pos[0] = frame_camera.shadow_view_proj[0] * world_pos;
     frag_shadow_pos[1] = frame_camera.shadow_view_proj[1] * world_pos;
     frag_shadow_pos[2] = frame_camera.shadow_view_proj[2] * world_pos;
