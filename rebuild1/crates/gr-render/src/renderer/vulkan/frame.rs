@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     VulkanDevice, VulkanError,
-    god_rays::GodRayPushConstants,
+    god_rays::{GodRayPushConstants, frame_god_ray_sources},
     material::{MaterialDrawInfo, VulkanMaterialStore},
     mesh::{
         EmissiveLightUniforms, LOCAL_SHADOW_FACE_COUNT, MAX_LOCAL_LIGHTS, MeshDrawOptions,
@@ -289,8 +289,16 @@ impl VulkanDevice {
             .prepare_frame(&self.device, frame.image_index)?;
         let shadows = self.shadows.as_ref();
         let initial_states = swapchain.graph_initial_states(frame.image_index, shadows)?;
+        let directional_light_intensity = frame_light_intensity(snapshot);
         let bloom_enabled = self.quality.bloom().intensity() > 0.0;
-        let god_rays_enabled = self.quality.bloom().god_rays_intensity() > 0.0;
+        let god_ray_sources = frame_god_ray_sources(
+            camera,
+            swapchain.god_ray_extent_2d(),
+            self.quality,
+            directional_light_intensity,
+            emissive_lights,
+        );
+        let god_rays_enabled = god_ray_sources.iter().any(|source| source.source[3] > 0.0);
         let god_ray_history_write_index = swapchain.god_ray_history_write_index();
         let graph = if refresh_shadows {
             FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
@@ -327,7 +335,7 @@ impl VulkanDevice {
             frame.slot_index,
             mesh_frame_uniform_for_frame(
                 camera,
-                frame_light_intensity(snapshot),
+                directional_light_intensity,
                 self.quality,
                 swapchain.extent_2d(),
                 features.has_shadow_casters,
@@ -714,65 +722,24 @@ impl<'a> FrameDrawLists<'a> {
     ) -> Self {
         let camera = active_camera(snapshot);
         let camera_forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
-        let mut opaque_scene = snapshot
-            .render_items
-            .iter()
-            .filter_map(|item| {
-                let material = materials.draw_info(item.material)?;
-                if material.transparent {
-                    return None;
-                }
-                let options =
-                    meshes.scene_draw_options(item.mesh, extent, camera, snapshot.optimization)?;
-                let pipeline_key = MeshPipelineKey {
-                    uses_textures: material.uses_any_texture,
-                    double_sided: material.double_sided,
-                };
-
-                Some((
-                    (
-                        opaque_scene_depth_bucket(meshes, camera, camera_forward, item),
-                        pipeline_key.uses_textures,
-                        pipeline_key.double_sided,
-                        item.material.raw(),
-                        item.mesh.raw(),
-                    ),
-                    SceneDrawItem {
-                        item,
-                        options,
-                        pipeline_key,
-                        material_descriptor_set: material.descriptor_set,
-                    },
-                ))
-            })
-            .collect::<Vec<_>>();
-        opaque_scene.sort_unstable_by_key(|(key, _)| *key);
-        let opaque_scene = opaque_scene
-            .into_iter()
-            .map(|(_, draw)| draw)
-            .collect::<Vec<_>>();
-        let transparent_scene = snapshot
-            .render_items
-            .iter()
-            .filter_map(|item| {
-                let material = materials.draw_info(item.material)?;
-                if !material.transparent {
-                    return None;
-                }
-                let options =
-                    meshes.scene_draw_options(item.mesh, extent, camera, snapshot.optimization)?;
-                let pipeline_key = MeshPipelineKey {
-                    uses_textures: material.uses_any_texture,
-                    double_sided: material.double_sided,
-                };
-                Some(SceneDrawItem {
-                    item,
-                    options,
-                    pipeline_key,
-                    material_descriptor_set: material.descriptor_set,
-                })
-            })
-            .collect::<Vec<_>>();
+        let opaque_scene = scene_draw_items(
+            materials,
+            meshes,
+            snapshot,
+            extent,
+            camera,
+            camera_forward,
+            false,
+        );
+        let transparent_scene = scene_draw_items(
+            materials,
+            meshes,
+            snapshot,
+            extent,
+            camera,
+            camera_forward,
+            true,
+        );
 
         let opaque_shadow = if record_shadow_draws && features.has_opaque_shadow_casters {
             std::array::from_fn(|cascade_index| {
@@ -813,6 +780,92 @@ impl<'a> FrameDrawLists<'a> {
             translucent_shadow,
             local_shadow,
         }
+    }
+}
+
+fn scene_draw_items<'a>(
+    materials: &VulkanMaterialStore,
+    meshes: &VulkanMeshStore,
+    snapshot: &'a FrameSnapshot,
+    extent: vk::Extent2D,
+    camera: CameraSnapshot,
+    camera_forward: [f32; 3],
+    transparent: bool,
+) -> Vec<SceneDrawItem<'a>> {
+    let mut draws = snapshot
+        .render_items
+        .iter()
+        .filter_map(|item| {
+            let material = materials.draw_info(item.material)?;
+            if material.transparent != transparent {
+                return None;
+            }
+            let options =
+                meshes.scene_draw_options(item.mesh, extent, camera, snapshot.optimization)?;
+            let pipeline_key = MeshPipelineKey {
+                uses_textures: material.uses_any_texture,
+                double_sided: material.double_sided,
+            };
+            let draw = SceneDrawItem {
+                item,
+                options,
+                pipeline_key,
+                material_descriptor_set: material.descriptor_set,
+            };
+
+            if transparent {
+                Some((None, draw))
+            } else {
+                Some((
+                    Some((
+                        opaque_scene_depth_bucket(meshes, camera, camera_forward, item),
+                        pipeline_key.uses_textures,
+                        pipeline_key.double_sided,
+                        item.material.raw(),
+                        item.mesh.raw(),
+                    )),
+                    draw,
+                ))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if transparent {
+        let mut transparent_draws = draws.into_iter().map(|(_, draw)| draw).collect::<Vec<_>>();
+        transparent_draws.sort_by(|left, right| {
+            let left_depth = transparent_scene_depth(meshes, camera, camera_forward, left.item);
+            let right_depth = transparent_scene_depth(meshes, camera, camera_forward, right.item);
+            right_depth
+                .total_cmp(&left_depth)
+                .then_with(|| left.item.material.raw().cmp(&right.item.material.raw()))
+                .then_with(|| left.item.mesh.raw().cmp(&right.item.mesh.raw()))
+        });
+        return transparent_draws;
+    }
+
+    draws.sort_unstable_by_key(|(key, _)| *key);
+    draws.into_iter().map(|(_, draw)| draw).collect()
+}
+
+/// Returns the farthest camera-space point of a transparent mesh.
+///
+/// Alpha blending is order-dependent, so transparent bounds are submitted back-to-front.
+/// Using the farthest point is conservative for intersecting bounds and avoids ordering flips
+/// when the camera crosses a large thin or double-sided surface.
+fn transparent_scene_depth(
+    meshes: &VulkanMeshStore,
+    camera: CameraSnapshot,
+    camera_forward: [f32; 3],
+    item: &RenderItemPacket,
+) -> f32 {
+    let Some(bounds) = meshes.bounds_for(item.mesh) else {
+        return f32::NEG_INFINITY;
+    };
+    let depth = dot3(sub3(bounds.center(), camera.eye), camera_forward) + bounds.radius();
+    if depth.is_finite() {
+        depth
+    } else {
+        f32::NEG_INFINITY
     }
 }
 

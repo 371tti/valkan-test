@@ -1,26 +1,25 @@
-use std::{ffi::CStr, io::Cursor, mem::size_of};
+use std::{ffi::CStr, mem::size_of};
 
-use ash::{Device, util, vk};
+use ash::{Device, vk};
 
 use crate::{
-    math::{cross3, dot3, normalize_or, sub3},
     protocol::{
         AntiAliasingQualitySettings, BloomQualitySettings, CameraEffects, CameraSnapshot,
         RenderQualitySettings, ShadowSofteningQualitySettings,
     },
-    renderer::{
-        DEFAULT_DIRECTIONAL_LIGHT_COLOR, DEFAULT_DIRECTIONAL_LIGHT_DIR, pipeline::shader_interface,
-    },
+    renderer::pipeline::shader_interface,
 };
 
 use super::{
     VulkanError,
-    mesh::{EmissiveLightUniforms, MAX_LOCAL_LIGHTS},
+    god_rays::frame_god_ray_sources,
+    mesh::EmissiveLightUniforms,
+    shader::{self, assets},
 };
 
-const SHADER_ENTRY: &CStr = c"main";
-const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.vert.spv"));
-const FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.frag.spv"));
+const SHADER_ENTRY: &CStr = shader::ENTRY;
+const VERTEX_SHADER: &[u8] = assets::POST_VERT;
+const FRAGMENT_SHADER: &[u8] = assets::POST_FRAG;
 const POST_SCENE_COLOR_BINDING: u32 = 0;
 const POST_SCENE_DEPTH_BINDING: u32 = 1;
 const POST_SCENE_NORMAL_ROUGHNESS_BINDING: u32 = 2;
@@ -28,13 +27,6 @@ const POST_SCENE_TRANSPARENT_NORMAL_ROUGHNESS_BINDING: u32 = 3;
 const POST_BLOOM_BINDING: u32 = 4;
 const POST_GOD_RAY_0_BINDING: u32 = 5;
 const POST_GOD_RAY_1_BINDING: u32 = 6;
-const GOD_RAY_SOURCE_COUNT: usize = 2;
-
-#[derive(Clone, Copy, Default)]
-struct GodRaySource {
-    source: [f32; 4],
-    color: [f32; 4],
-}
 
 pub(super) struct PostPipeline {
     pipeline: vk::Pipeline,
@@ -210,10 +202,10 @@ impl PostPushConstants {
         let bloom = quality.bloom();
         let post = quality.post();
         let camera_params = Self::camera_params(camera, extent);
-        let god_ray_sources = Self::god_ray_sources(
+        let god_ray_sources = frame_god_ray_sources(
             camera,
-            camera_params,
-            bloom,
+            extent,
+            quality,
             directional_light_intensity,
             emissive_lights,
         );
@@ -310,194 +302,6 @@ impl PostPushConstants {
             bloom.god_rays_intensity(),
         ]
     }
-
-    /// Selects a tiny set of visible light sources used by the screen-space god-ray pass.
-    fn god_ray_sources(
-        camera: CameraSnapshot,
-        camera_params: [f32; 4],
-        bloom: BloomQualitySettings,
-        directional_light_intensity: f32,
-        emissive_lights: EmissiveLightUniforms,
-    ) -> [GodRaySource; GOD_RAY_SOURCE_COUNT] {
-        let mut sources = [GodRaySource::default(); GOD_RAY_SOURCE_COUNT];
-        if bloom.god_rays_intensity() <= 0.0 {
-            return sources;
-        }
-
-        let forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
-        let right = normalize_or(cross3(forward, camera.up), [1.0, 0.0, 0.0]);
-        let up = cross3(right, forward);
-
-        if let Some(source) = Self::directional_god_ray_source(
-            camera_params,
-            forward,
-            right,
-            up,
-            directional_light_intensity,
-        ) {
-            Self::push_god_ray_source(&mut sources, source);
-        }
-
-        let light_count = (emissive_lights.count[0] as usize).min(MAX_LOCAL_LIGHTS);
-        let focal = camera_params[0]
-            .abs()
-            .max(camera_params[1].abs())
-            .max(0.0001);
-        let near = camera.near.max(0.001);
-        for index in 0..light_count {
-            if let Some(source) = Self::local_god_ray_source(
-                camera,
-                camera_params,
-                forward,
-                right,
-                up,
-                focal,
-                near,
-                emissive_lights,
-                index,
-            ) {
-                Self::push_god_ray_source(&mut sources, source);
-            }
-        }
-
-        sources
-    }
-
-    fn directional_god_ray_source(
-        camera_params: [f32; 4],
-        forward: [f32; 3],
-        right: [f32; 3],
-        up: [f32; 3],
-        directional_light_intensity: f32,
-    ) -> Option<GodRaySource> {
-        let light_dir = normalize_or(DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
-        let sun_dir = [-light_dir[0], -light_dir[1], -light_dir[2]];
-        let forward_alignment = dot3(forward, sun_dir);
-        let visibility = smoothstep(-0.02, 0.24, forward_alignment);
-        if visibility <= 0.001 {
-            return None;
-        }
-
-        let inv_depth = 1.0 / forward_alignment.max(0.0001);
-        let ndc_x = dot3(right, sun_dir) * camera_params[0] * inv_depth;
-        let ndc_y = dot3(up, sun_dir) * camera_params[1] * inv_depth;
-        let uv = [ndc_x * 0.5 + 0.5, ndc_y * 0.5 + 0.5];
-        let screen_presence = screen_presence(uv, 0.30);
-        if screen_presence <= 0.001 {
-            return None;
-        }
-
-        let color = [
-            DEFAULT_DIRECTIONAL_LIGHT_COLOR[0] * directional_light_intensity,
-            DEFAULT_DIRECTIONAL_LIGHT_COLOR[1] * directional_light_intensity,
-            DEFAULT_DIRECTIONAL_LIGHT_COLOR[2] * directional_light_intensity,
-        ];
-        let brightness = max3(color).sqrt().clamp(0.0, 2.0);
-        let chroma = chroma3(color, [1.0, 0.88, 0.72]);
-
-        Some(GodRaySource {
-            source: [
-                uv[0],
-                uv[1],
-                0.040,
-                visibility * screen_presence * brightness,
-            ],
-            color: [chroma[0], chroma[1], chroma[2], 1.0],
-        })
-    }
-
-    fn local_god_ray_source(
-        camera: CameraSnapshot,
-        camera_params: [f32; 4],
-        forward: [f32; 3],
-        right: [f32; 3],
-        up: [f32; 3],
-        focal: f32,
-        near: f32,
-        emissive_lights: EmissiveLightUniforms,
-        index: usize,
-    ) -> Option<GodRaySource> {
-        let position_radius = emissive_lights.position_radius[index];
-        let color = emissive_lights.color[index];
-        let position = [position_radius[0], position_radius[1], position_radius[2]];
-        let delta = sub3(position, camera.eye);
-        let depth = dot3(forward, delta);
-        if !depth.is_finite() || depth <= near {
-            return None;
-        }
-
-        let inv_depth = 1.0 / depth;
-        let ndc_x = dot3(right, delta) * camera_params[0] * inv_depth;
-        let ndc_y = dot3(up, delta) * camera_params[1] * inv_depth;
-        let uv = [ndc_x * 0.5 + 0.5, ndc_y * 0.5 + 0.5];
-        let screen_presence = screen_presence(uv, 0.10);
-        if screen_presence <= 0.001 {
-            return None;
-        }
-
-        let range = position_radius[3].max(0.001);
-        let distance = dot3(delta, delta).sqrt();
-        let distance_fade = 1.0 - smoothstep(range * 0.72, range * 1.20, distance);
-        let light_color = [color[0], color[1], color[2]];
-        let brightness = color[3].max(max3(light_color)).max(0.0);
-        let strength = (brightness * 0.22).sqrt().clamp(0.0, 1.5) * distance_fade * screen_presence;
-        if strength <= 0.001 || !strength.is_finite() {
-            return None;
-        }
-
-        let source_radius = emissive_lights.direction_radius[index][3]
-            .max(emissive_lights.size_kind[index][0].max(emissive_lights.size_kind[index][1]))
-            .max(range * 0.012)
-            .min(range * 0.35);
-        let screen_radius = (source_radius * focal * 0.5 * inv_depth).clamp(0.006, 0.095);
-        let chroma = chroma3(light_color, [1.0, 0.82, 0.55]);
-
-        Some(GodRaySource {
-            source: [uv[0], uv[1], screen_radius, strength],
-            color: [chroma[0], chroma[1], chroma[2], 0.0],
-        })
-    }
-
-    fn push_god_ray_source(
-        sources: &mut [GodRaySource; GOD_RAY_SOURCE_COUNT],
-        source: GodRaySource,
-    ) {
-        if source.source[3] <= 0.0 {
-            return;
-        }
-        if source.source[3] > sources[0].source[3] {
-            sources[1] = sources[0];
-            sources[0] = source;
-        } else if source.source[3] > sources[1].source[3] {
-            sources[1] = source;
-        }
-    }
-}
-
-fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
-    let t = ((value - edge0) / (edge1 - edge0).max(0.0001)).clamp(0.0, 1.0);
-
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn screen_presence(uv: [f32; 2], margin: f32) -> f32 {
-    let offscreen_x = ((uv[0] - 0.5).abs() - (0.5 + margin)).max(0.0);
-    let offscreen_y = ((uv[1] - 0.5).abs() - (0.5 + margin)).max(0.0);
-
-    1.0 - smoothstep(0.02, 0.42 + margin, offscreen_x.hypot(offscreen_y))
-}
-
-fn chroma3(color: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
-    let peak = max3(color);
-    if !peak.is_finite() || peak <= 0.0001 {
-        return fallback;
-    }
-
-    [color[0] / peak, color[1] / peak, color[2] / peak]
-}
-
-fn max3(value: [f32; 3]) -> f32 {
-    value[0].max(value[1]).max(value[2])
 }
 
 impl PostPipeline {
@@ -848,11 +652,11 @@ fn create_post_pipeline(
     pipeline_layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
 ) -> Result<vk::Pipeline, VulkanError> {
-    let vertex_shader = create_shader_module(device, VERTEX_SHADER)?;
-    let fragment_shader = match create_shader_module(device, FRAGMENT_SHADER) {
+    let vertex_shader = shader::create_shader_module(device, VERTEX_SHADER)?;
+    let fragment_shader = match shader::create_shader_module(device, FRAGMENT_SHADER) {
         Ok(shader) => shader,
         Err(error) => {
-            destroy_shader_module(device, vertex_shader);
+            shader::destroy_shader_module(device, vertex_shader);
             return Err(error);
         }
     };
@@ -864,18 +668,9 @@ fn create_post_pipeline(
         fragment_shader,
     );
 
-    destroy_shader_module(device, fragment_shader);
-    destroy_shader_module(device, vertex_shader);
+    shader::destroy_shader_module(device, fragment_shader);
+    shader::destroy_shader_module(device, vertex_shader);
     pipeline
-}
-
-/// Creates one shader module from build-script compiled SPIR-V bytes.
-fn create_shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, VulkanError> {
-    let code = util::read_spv(&mut Cursor::new(bytes)).map_err(VulkanError::ShaderCodeRead)?;
-    let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
-
-    // Safety: SPIR-V bytes are copied into an owned word vector for this call.
-    unsafe { device.create_shader_module(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
 /// Creates fixed-function state for a full-screen triangle post pass.
@@ -992,13 +787,5 @@ fn destroy_pipeline(device: &Device, pipeline: vk::Pipeline) {
     if pipeline != vk::Pipeline::null() {
         // Safety: the pipeline was created by this device and is no longer referenced.
         unsafe { device.destroy_pipeline(pipeline, None) };
-    }
-}
-
-/// Destroys one temporary shader module.
-fn destroy_shader_module(device: &Device, shader: vk::ShaderModule) {
-    if shader != vk::ShaderModule::null() {
-        // Safety: shader modules are destroyed after pipeline creation returns.
-        unsafe { device.destroy_shader_module(shader, None) };
     }
 }

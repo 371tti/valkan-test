@@ -2,7 +2,7 @@
 
 ## 前作の問題
 
-Rust 側の descriptor binding、push constants、GLSL 側の layout が暗黙に一致していました。片側だけ直してもビルドで気づきにくく、shader が増えるほど認知負荷が上がります。
+Rust 側の descriptor binding、push constants、shader 側の layout が暗黙に一致していました。片側だけ直してもビルドで気づきにくく、shader が増えるほど認知負荷が上がります。
 
 `rebuild1` では shader interface を先に名前付きで定義します。
 
@@ -19,6 +19,39 @@ shader と pipeline の操作も protocol 境界を意識します。user code �
 | 2 | pass | graph/pass | shadow cascades, translucent shadow maps, post input など pass 固有 |
 
 binding 番号は `shader_interface` に集約します。pipeline 作成側、descriptor 作成側、shader 側が別々の数字を直接持たないようにします。
+
+## Slang build pipeline
+
+shader source は `crates/gr-render/shaders/` 以下の Slang を source of truth にします。用途ごとの構成は次の通りです。
+
+```text
+shaders/
+  shared/             型に依存しない数学・Slang compatibility
+  scene/              mesh entrypoint・material sampling・PBR lighting
+  shadow/             cascade/local shadow・moment filtering
+  post/               compose・FXAA・SSAO・SSR
+    bloom/            bloom downsample/upsample
+    god_rays/         mask/prefilter/radial/temporal
+```
+
+entrypoint と include 専用 module をファイル名だけで区別せず、責務をディレクトリで固定します。`build.rs` の `SHADERS` manifest が entrypoint、stage、SPIR-V output、Rust asset 名を一元管理し、各ディレクトリを明示的な include search path として渡します。
+
+build 時の処理:
+
+- `slangc` で `main` entrypoint を SPIR-V へ compile する
+- `-matrix-layout-column-major` を固定し、既存 uniform buffer の matrix ABI を保つ
+- `-reflection-json` と depfile を `OUT_DIR` に出す
+- `spirv-val --target-env vulkan1.1` で生成 SPIR-V を検証する
+- `OUT_DIR/shader_assets.rs` を生成し、`renderer::vulkan::shader::assets::*` から読む
+
+Vulkan 側は `renderer::vulkan::shader` だけが `include_bytes!` と shader module 作成を持ちます。個別 pipeline module は `assets::POST_VERT` のような生成済み asset を選ぶだけにします。
+
+追加手順:
+
+1. `.slang` source を対応する機能ディレクトリに追加する。
+2. `build.rs` の `SHADERS` manifest に `const_name` / `source` / `output` / `stage` を追加する。
+3. 必要な Vulkan pipeline module で `shader::assets::<CONST_NAME>` を選ぶ。
+4. descriptor set や push constant layout を変える場合は `shader_interface` と docs を同じ変更として更新する。
 
 ## Push constants
 
@@ -72,12 +105,12 @@ shader reload の結果は `ShaderReloaded` / `ShaderReloadFailed` event で返�
 理想は shader reflection か codegen です。最初はそこまで作り込まず、少なくとも次を守ります。
 
 - binding 番号を document と Rust constants に集約する
-- GLSL 側は同じ名前を include で共有できるようにする
+- Slang 側は同じ名前を include で共有できるようにする
 - descriptor set layout の作成箇所を module ごとに分けない
 - pipeline layout の差分を README ではなく設計ファイルで追う
 - protocol handle と GPU internal handle を同じ型にしない
 
-Stage 8 では `renderer::pipeline::shader_interface` に mesh shader binding contract を置き、`VulkanMeshStore::create` の前に set order と binding 衝突を検証します。これは reflection/codegen ではありませんが、Rust layout と GLSL layout の数字が散らばる状態には戻さないための gate です。
+Stage 8 では `renderer::pipeline::shader_interface` に mesh shader binding contract を置き、`VulkanMeshStore::create` の前に set order と binding 衝突を検証します。現状は reflection JSON を生成しますが、descriptor layout の自動生成にはまだ使いません。Rust layout と Slang layout の数字が散らばる状態には戻さないための gate です。
 
 ## Mesh and post pipeline
 
@@ -103,4 +136,4 @@ Stage 6 では `MaterialAlphaMode` と named texture slot を protocol に持た
 
 Stage 8 では material descriptor set を mesh pipeline に接続し、base-color texture を持つ material だけ sampled texture shader variant に入ります。暗黙 white texture は作りません。alpha cutout は scene と opaque shadow の両方で discard されます。
 
-Stage 9 shadow slice では pass descriptor set が `shadow_cascade_0..2` と `translucent_shadow_0..2` を名前付き binding として持ちます。opaque/cutout material は depth cascade に入り、transparent material は transmittance cascade に入ります。
+Stage 9 shadow slice では pass descriptor set が `shadow_cascade_0..3` と `translucent_shadow_0..3` を名前付き binding として持ちます。opaque/cutout material は depth cascade に入り、transparent material は transmittance cascade に入ります。

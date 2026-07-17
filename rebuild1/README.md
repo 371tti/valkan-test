@@ -54,7 +54,7 @@
 - present 待ちの semaphore は swapchain image ごとに持ち、frame slot ごとに再利用しない。
 - window path は surface configure 後に redraw-driven の最小 `SubmitFrame` loop を走らせる。
 - renderer graph は `shadow_cascade[0..2] -> translucent_shadow[0..2] -> scene_color/depth -> post -> optional readback -> swapchain present` を実行計画として持ち、resource state から explicit barrier plan を生成する。
-- shader source は `build.rs` で SPIR-V にする。temporary debug triangle pipeline は削除済みで、asset 未ロード時は scene clear frame を present する。
+- shader source は機能別に分けた Slang (`crates/gr-render/shaders/{shared,scene,shadow,post}/`) を `build.rs` で SPIR-V にする。`slangc` と `spirv-val` を使い、生成 asset registry は `renderer::vulkan::shader` に集約する。temporary debug triangle pipeline は削除済みで、asset 未ロード時は scene clear frame を present する。
 - Stage 4 first draw は window capture で triangle 表示確認済み。
 - winit resize は command channel を詰まらせないよう、in-flight 1 件と pending 最新 1 件に coalesce する。
 - `FrameSnapshot` は `SurfaceId` / `SurfaceGeneration` を持ち、古い generation の frame は `FrameDropped` で落とす。
@@ -81,7 +81,7 @@
 - `REBUILD1_WINDOW_ASSET=assets/stage9_translucent_shadow.r1scene` で transparent shadow verification scene を window smoke に流せる。
 - `--window-smoke` は `assets/model.glb` がある場合に asset load 後の mesh frame まで待って自動終了する。
 - asset load 失敗時に renderer が cube や placeholder を作る経路はない。
-- まだ独立した user task、本格的な shader reflection/codegen、screenshot golden image は未実装。
+- まだ独立した user task、reflection JSON を使った descriptor codegen、screenshot golden image は未実装。
 
 ## 最終方針
 

@@ -10,6 +10,7 @@ mod material_texture;
 mod mesh;
 mod post;
 mod readback;
+mod shader;
 mod shadow;
 mod shadow_blur;
 mod swapchain;
@@ -1008,7 +1009,7 @@ fn create_instance(entry: &Entry, debug: &VulkanDebugConfig) -> Result<Instance,
         .application_version(vk::make_api_version(0, 0, 1, 0))
         .engine_name(ENGINE_NAME)
         .engine_version(vk::make_api_version(0, 0, 1, 0))
-        .api_version(vk::make_api_version(0, 1, 0, 0));
+        .api_version(vk::API_VERSION_1_1);
 
     let mut extensions = vec![
         khr::surface::NAME.as_ptr(),
@@ -1046,10 +1047,13 @@ fn create_device_for_surface(
         .queue_priorities(&priorities)];
     let extensions = [khr::swapchain::NAME.as_ptr()];
     let features = vk::PhysicalDeviceFeatures::default().independent_blend(true);
+    let mut vulkan11_features =
+        vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
     let create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
         .enabled_extension_names(&extensions)
-        .enabled_features(&features);
+        .enabled_features(&features)
+        .push_next(&mut vulkan11_features);
 
     tracing::trace!(
         queue_family_index = candidate.queue_family_index,
@@ -1161,9 +1165,12 @@ fn select_device_candidate(
         let properties = get_physical_device_properties(instance, physical_device);
         let name = physical_device_name(&properties);
         let score = physical_device_score(&properties);
+        let supports_vulkan_1_1 = properties.api_version >= vk::API_VERSION_1_1;
         let features = get_physical_device_features(instance, physical_device);
+        let vulkan11_features = get_physical_device_vulkan11_features(instance, physical_device);
         let has_swapchain = device_supports_swapchain(instance, physical_device)?;
         let has_independent_blend = features.independent_blend == vk::TRUE;
+        let has_shader_draw_parameters = vulkan11_features.shader_draw_parameters == vk::TRUE;
         let queue_family_index =
             find_graphics_present_queue(instance, surface_loader, physical_device, surface)?;
 
@@ -1172,6 +1179,8 @@ fn select_device_candidate(
             score,
             has_swapchain,
             has_independent_blend,
+            has_shader_draw_parameters,
+            supports_vulkan_1_1,
             queue_family_index,
             "evaluated Vulkan physical device"
         );
@@ -1180,7 +1189,11 @@ fn select_device_candidate(
             continue;
         };
 
-        if !has_swapchain || !has_independent_blend {
+        if !supports_vulkan_1_1
+            || !has_swapchain
+            || !has_independent_blend
+            || !has_shader_draw_parameters
+        {
             continue;
         }
 
@@ -1291,6 +1304,23 @@ fn get_physical_device_features(
 ) -> vk::PhysicalDeviceFeatures {
     // Safety: `physical_device` came from `instance.enumerate_physical_devices`.
     unsafe { instance.get_physical_device_features(physical_device) }
+}
+
+/// Reads Vulkan 1.1 feature support needed by generated Slang SPIR-V.
+fn get_physical_device_vulkan11_features(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+) -> vk::PhysicalDeviceVulkan11Features<'static> {
+    let mut vulkan11_features = vk::PhysicalDeviceVulkan11Features::default();
+    let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan11_features);
+
+    // Safety: `physical_device` came from `instance.enumerate_physical_devices`, and the feature
+    // structs live until the query returns.
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features2);
+    }
+
+    vulkan11_features
 }
 
 /// Reads queue family properties for a Vulkan physical device.

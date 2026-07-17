@@ -49,8 +49,8 @@ const SCENE_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 // UNORM8 would clamp that to 1.0, so post.frag's `transparent.w > 1.0` test can never work.
 const SCENE_TRANSPARENT_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-const DEFAULT_SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
-const FAST_SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+const DEFAULT_SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R32G32_SFLOAT;
+const FAST_SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
 const TRANSLUCENT_SHADOW_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const FALLBACK_SHADOW_TRANSMITTANCE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 static SHADOW_MOMENT_FORMAT: OnceLock<vk::Format> = OnceLock::new();

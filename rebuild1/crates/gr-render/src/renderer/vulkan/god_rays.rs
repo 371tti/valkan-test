@@ -1,6 +1,6 @@
-use std::{ffi::CStr, io::Cursor, mem::size_of};
+use std::{ffi::CStr, mem::size_of};
 
-use ash::{Device, util, vk};
+use ash::{Device, vk};
 
 use crate::{
     math::{cross3, dot3, normalize_or, sub3},
@@ -13,17 +13,15 @@ use crate::{
 use super::{
     VulkanError,
     mesh::{EmissiveLightUniforms, MAX_LOCAL_LIGHTS},
+    shader::{self, assets},
 };
 
-const SHADER_ENTRY: &CStr = c"main";
-const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.vert.spv"));
-const MASK_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post_god_ray_mask.frag.spv"));
-const PREFILTER_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/post_god_ray_prefilter.frag.spv"));
-const RADIAL_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/post_god_ray_radial.frag.spv"));
-const TEMPORAL_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/post_god_ray_temporal.frag.spv"));
+const SHADER_ENTRY: &CStr = shader::ENTRY;
+const VERTEX_SHADER: &[u8] = assets::POST_VERT;
+const MASK_SHADER: &[u8] = assets::POST_GOD_RAY_MASK_FRAG;
+const PREFILTER_SHADER: &[u8] = assets::POST_GOD_RAY_PREFILTER_FRAG;
+const RADIAL_SHADER: &[u8] = assets::POST_GOD_RAY_RADIAL_FRAG;
+const TEMPORAL_SHADER: &[u8] = assets::POST_GOD_RAY_TEMPORAL_FRAG;
 
 const MASK_SCENE_COLOR_BINDING: u32 = 0;
 const MASK_SCENE_DEPTH_BINDING: u32 = 1;
@@ -34,9 +32,9 @@ const TEMPORAL_HISTORY_BINDING: u32 = 1;
 const GOD_RAY_SOURCE_COUNT: usize = 2;
 
 #[derive(Clone, Copy, Default)]
-struct GodRaySource {
-    source: [f32; 4],
-    color: [f32; 4],
+pub(super) struct GodRaySource {
+    pub(super) source: [f32; 4],
+    pub(super) color: [f32; 4],
 }
 
 #[repr(C)]
@@ -63,11 +61,10 @@ impl GodRayPushConstants {
         history_valid: bool,
     ) -> Self {
         let bloom = quality.bloom();
-        let camera_params = camera_params(camera, target_extent);
-        let sources = god_ray_sources(
+        let sources = frame_god_ray_sources(
             camera,
-            camera_params,
-            bloom,
+            target_extent,
+            quality,
             directional_light_intensity,
             emissive_lights,
         );
@@ -556,6 +553,24 @@ fn bloom_params(bloom: BloomQualitySettings) -> [f32; 4] {
     ]
 }
 
+pub(super) fn frame_god_ray_sources(
+    camera: CameraSnapshot,
+    target_extent: vk::Extent2D,
+    quality: RenderQualitySettings,
+    directional_light_intensity: f32,
+    emissive_lights: EmissiveLightUniforms,
+) -> [GodRaySource; GOD_RAY_SOURCE_COUNT] {
+    let camera_params = camera_params(camera, target_extent);
+    let bloom = quality.bloom();
+    god_ray_sources(
+        camera,
+        camera_params,
+        bloom,
+        directional_light_intensity,
+        emissive_lights,
+    )
+}
+
 fn god_ray_sources(
     camera: CameraSnapshot,
     camera_params: [f32; 4],
@@ -929,11 +944,11 @@ fn create_god_ray_pipeline(
     render_pass: vk::RenderPass,
     fragment_shader_bytes: &[u8],
 ) -> Result<vk::Pipeline, VulkanError> {
-    let vertex_shader = create_shader_module(device, VERTEX_SHADER)?;
-    let fragment_shader = match create_shader_module(device, fragment_shader_bytes) {
+    let vertex_shader = shader::create_shader_module(device, VERTEX_SHADER)?;
+    let fragment_shader = match shader::create_shader_module(device, fragment_shader_bytes) {
         Ok(shader) => shader,
         Err(error) => {
-            destroy_shader_module(device, vertex_shader);
+            shader::destroy_shader_module(device, vertex_shader);
             return Err(error);
         }
     };
@@ -945,16 +960,9 @@ fn create_god_ray_pipeline(
         fragment_shader,
     );
 
-    destroy_shader_module(device, fragment_shader);
-    destroy_shader_module(device, vertex_shader);
+    shader::destroy_shader_module(device, fragment_shader);
+    shader::destroy_shader_module(device, vertex_shader);
     pipeline
-}
-
-fn create_shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, VulkanError> {
-    let code = util::read_spv(&mut Cursor::new(bytes)).map_err(VulkanError::ShaderCodeRead)?;
-    let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
-
-    unsafe { device.create_shader_module(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
 fn create_graphics_pipeline(
@@ -1067,11 +1075,5 @@ fn destroy_sampler(device: &Device, sampler: vk::Sampler) {
 fn destroy_pipeline(device: &Device, pipeline: vk::Pipeline) {
     if pipeline != vk::Pipeline::null() {
         unsafe { device.destroy_pipeline(pipeline, None) };
-    }
-}
-
-fn destroy_shader_module(device: &Device, shader: vk::ShaderModule) {
-    if shader != vk::ShaderModule::null() {
-        unsafe { device.destroy_shader_module(shader, None) };
     }
 }

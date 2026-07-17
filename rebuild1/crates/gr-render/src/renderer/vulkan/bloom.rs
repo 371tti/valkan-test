@@ -1,17 +1,18 @@
-use std::{ffi::CStr, io::Cursor, mem::size_of};
+use std::{ffi::CStr, mem::size_of};
 
-use ash::{Device, util, vk};
+use ash::{Device, vk};
 
 use crate::{protocol::BloomQualitySettings, renderer::pipeline::shader_interface};
 
-use super::VulkanError;
+use super::{
+    VulkanError,
+    shader::{self, assets},
+};
 
-const SHADER_ENTRY: &CStr = c"main";
-const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.vert.spv"));
-const DOWNSAMPLE_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/post_bloom_downsample.frag.spv"));
-const UPSAMPLE_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/post_bloom_upsample.frag.spv"));
+const SHADER_ENTRY: &CStr = shader::ENTRY;
+const VERTEX_SHADER: &[u8] = assets::POST_VERT;
+const DOWNSAMPLE_SHADER: &[u8] = assets::POST_BLOOM_DOWNSAMPLE_FRAG;
+const UPSAMPLE_SHADER: &[u8] = assets::POST_BLOOM_UPSAMPLE_FRAG;
 const BLOOM_SOURCE_BINDING: u32 = 0;
 
 #[repr(C)]
@@ -446,11 +447,11 @@ fn create_bloom_pipeline(
     fragment_shader_bytes: &[u8],
     additive_blend: bool,
 ) -> Result<vk::Pipeline, VulkanError> {
-    let vertex_shader = create_shader_module(device, VERTEX_SHADER)?;
-    let fragment_shader = match create_shader_module(device, fragment_shader_bytes) {
+    let vertex_shader = shader::create_shader_module(device, VERTEX_SHADER)?;
+    let fragment_shader = match shader::create_shader_module(device, fragment_shader_bytes) {
         Ok(shader) => shader,
         Err(error) => {
-            destroy_shader_module(device, vertex_shader);
+            shader::destroy_shader_module(device, vertex_shader);
             return Err(error);
         }
     };
@@ -463,16 +464,9 @@ fn create_bloom_pipeline(
         additive_blend,
     );
 
-    destroy_shader_module(device, fragment_shader);
-    destroy_shader_module(device, vertex_shader);
+    shader::destroy_shader_module(device, fragment_shader);
+    shader::destroy_shader_module(device, vertex_shader);
     pipeline
-}
-
-fn create_shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, VulkanError> {
-    let code = util::read_spv(&mut Cursor::new(bytes)).map_err(VulkanError::ShaderCodeRead)?;
-    let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
-
-    unsafe { device.create_shader_module(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
 fn create_graphics_pipeline(
@@ -603,11 +597,5 @@ fn destroy_sampler(device: &Device, sampler: vk::Sampler) {
 fn destroy_pipeline(device: &Device, pipeline: vk::Pipeline) {
     if pipeline != vk::Pipeline::null() {
         unsafe { device.destroy_pipeline(pipeline, None) };
-    }
-}
-
-fn destroy_shader_module(device: &Device, shader: vk::ShaderModule) {
-    if shader != vk::ShaderModule::null() {
-        unsafe { device.destroy_shader_module(shader, None) };
     }
 }

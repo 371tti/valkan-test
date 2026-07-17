@@ -1,13 +1,15 @@
-use std::{ffi::CStr, io::Cursor, mem::size_of};
+use std::{ffi::CStr, mem::size_of};
 
-use ash::{Device, util, vk};
+use ash::{Device, vk};
 
-use super::VulkanError;
+use super::{
+    VulkanError,
+    shader::{self, assets},
+};
 
-const SHADER_ENTRY: &CStr = c"main";
-const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/post.vert.spv"));
-const FRAGMENT_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/shadow_moment_blur.frag.spv"));
+const SHADER_ENTRY: &CStr = shader::ENTRY;
+const VERTEX_SHADER: &[u8] = assets::POST_VERT;
+const FRAGMENT_SHADER: &[u8] = assets::SHADOW_MOMENT_BLUR_FRAG;
 const SOURCE_MOMENTS_BINDING: u32 = 0;
 
 pub(super) struct ShadowMomentBlurPipeline {
@@ -407,11 +409,11 @@ fn create_pipeline(
     pipeline_layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
 ) -> Result<vk::Pipeline, VulkanError> {
-    let vertex_shader = create_shader_module(device, VERTEX_SHADER)?;
-    let fragment_shader = match create_shader_module(device, FRAGMENT_SHADER) {
+    let vertex_shader = shader::create_shader_module(device, VERTEX_SHADER)?;
+    let fragment_shader = match shader::create_shader_module(device, FRAGMENT_SHADER) {
         Ok(shader) => shader,
         Err(error) => {
-            destroy_shader_module(device, vertex_shader);
+            shader::destroy_shader_module(device, vertex_shader);
             return Err(error);
         }
     };
@@ -423,17 +425,9 @@ fn create_pipeline(
         fragment_shader,
     );
 
-    destroy_shader_module(device, fragment_shader);
-    destroy_shader_module(device, vertex_shader);
+    shader::destroy_shader_module(device, fragment_shader);
+    shader::destroy_shader_module(device, vertex_shader);
     pipeline
-}
-
-/// Creates one shader module from build-script compiled SPIR-V bytes.
-fn create_shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, VulkanError> {
-    let code = util::read_spv(&mut Cursor::new(bytes)).map_err(VulkanError::ShaderCodeRead)?;
-    let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
-
-    unsafe { device.create_shader_module(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
 /// Creates fixed-function state for a fullscreen blur pass.
@@ -550,11 +544,5 @@ fn destroy_sampler(device: &Device, sampler: vk::Sampler) {
 fn destroy_pipeline(device: &Device, pipeline: vk::Pipeline) {
     if pipeline != vk::Pipeline::null() {
         unsafe { device.destroy_pipeline(pipeline, None) };
-    }
-}
-
-fn destroy_shader_module(device: &Device, shader: vk::ShaderModule) {
-    if shader != vk::ShaderModule::null() {
-        unsafe { device.destroy_shader_module(shader, None) };
     }
 }

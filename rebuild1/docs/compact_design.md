@@ -31,7 +31,7 @@
 - render graph compiler: pass/resource declaration, dependency sort, lifetime, barrier plan
 - explicit barrier plan generated from resource usage
 - executable graph path: shadow cascades -> translucent shadow transmittance -> scene target -> post -> optional readback -> present
-- build-time GLSL -> SPIR-V
+- build-time Slang -> SPIR-V with generated Vulkan shader asset registry
 - temporary debug triangle pipeline was removed; startup without assets presents a clear scene frame
 - window capture で triangle 表示確認
 - `SurfaceId` / `SurfaceGeneration`

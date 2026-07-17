@@ -1,11 +1,10 @@
 use std::{
     collections::BTreeMap,
     ffi::CStr,
-    io::Cursor,
     mem::{offset_of, size_of},
 };
 
-use ash::{Device, Instance, util, vk};
+use ash::{Device, Instance, vk};
 
 use crate::{
     import::ImportedMesh,
@@ -31,36 +30,23 @@ use super::{
         memory_properties, write_buffer_value,
     },
     lod::unique_lod_indices,
+    shader::{self, assets},
 };
 
-const SHADER_ENTRY: &CStr = c"main";
-const UNTEXTURED_VERTEX_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/mesh_untextured.vert.spv"));
-const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.vert.spv"));
-const SCENE_FRAGMENT_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/mesh_scene.frag.spv"));
-const SCENE_FAST_FRAGMENT_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/mesh_scene_fast.frag.spv"));
-const SCENE_TEXTURED_FRAGMENT_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/mesh_scene_textured.frag.spv"));
-const SCENE_TEXTURED_FAST_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/mesh_scene_textured_fast.frag.spv"
-));
-const SHADOW_VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
-const SHADOW_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
-const SHADOW_TEXTURED_FRAGMENT_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/shadow_textured.frag.spv"));
-const SHADOW_DEPTH_FRAGMENT_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth.frag.spv"));
-const SHADOW_DEPTH_TEXTURED_FRAGMENT_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/shadow_depth_textured.frag.spv"));
-const SHADOW_TRANSLUCENT_FRAGMENT_SHADER: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/shadow_translucent.frag.spv"));
-const SHADOW_TRANSLUCENT_TEXTURED_FRAGMENT_SHADER: &[u8] = include_bytes!(concat!(
-    env!("OUT_DIR"),
-    "/shadow_translucent_textured.frag.spv"
-));
+const SHADER_ENTRY: &CStr = shader::ENTRY;
+const UNTEXTURED_VERTEX_SHADER: &[u8] = assets::MESH_UNTEXTURED_VERT;
+const VERTEX_SHADER: &[u8] = assets::MESH_VERT;
+const SCENE_FRAGMENT_SHADER: &[u8] = assets::MESH_SCENE_FRAG;
+const SCENE_FAST_FRAGMENT_SHADER: &[u8] = assets::MESH_SCENE_FAST_FRAG;
+const SCENE_TEXTURED_FRAGMENT_SHADER: &[u8] = assets::MESH_SCENE_TEXTURED_FRAG;
+const SCENE_TEXTURED_FAST_FRAGMENT_SHADER: &[u8] = assets::MESH_SCENE_TEXTURED_FAST_FRAG;
+const SHADOW_VERTEX_SHADER: &[u8] = assets::SHADOW_VERT;
+const SHADOW_FRAGMENT_SHADER: &[u8] = assets::SHADOW_FRAG;
+const SHADOW_TEXTURED_FRAGMENT_SHADER: &[u8] = assets::SHADOW_TEXTURED_FRAG;
+const SHADOW_DEPTH_FRAGMENT_SHADER: &[u8] = assets::SHADOW_DEPTH_FRAG;
+const SHADOW_DEPTH_TEXTURED_FRAGMENT_SHADER: &[u8] = assets::SHADOW_DEPTH_TEXTURED_FRAG;
+const SHADOW_TRANSLUCENT_FRAGMENT_SHADER: &[u8] = assets::SHADOW_TRANSLUCENT_FRAG;
+const SHADOW_TRANSLUCENT_TEXTURED_FRAGMENT_SHADER: &[u8] = assets::SHADOW_TRANSLUCENT_TEXTURED_FRAG;
 const MESH_FRONT_FACE: vk::FrontFace = vk::FrontFace::COUNTER_CLOCKWISE;
 const SHADOW_DEPTH_BIAS_CONSTANT: f32 = 0.35;
 const SHADOW_DEPTH_BIAS_SLOPE: f32 = 0.65;
@@ -1145,7 +1131,7 @@ impl EmissiveLightUniforms {
     }
 }
 
-/// Creates the frame descriptor set layout shared with `shaders/mesh.vert`.
+/// Creates the frame descriptor set layout shared with `shaders/scene/mesh.vert.slang`.
 fn create_frame_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, VulkanError> {
     let binding = vk::DescriptorSetLayoutBinding::default()
         .binding(shader_interface::FRAME_CAMERA_BINDING)
@@ -1651,11 +1637,11 @@ fn create_mesh_pipeline(
     target: MeshPipelineTarget,
     cull_mode: vk::CullModeFlags,
 ) -> Result<vk::Pipeline, VulkanError> {
-    let vertex_shader = create_shader_module(device, vertex_shader_bytes)?;
-    let fragment_shader = match create_shader_module(device, fragment_shader_bytes) {
+    let vertex_shader = shader::create_shader_module(device, vertex_shader_bytes)?;
+    let fragment_shader = match shader::create_shader_module(device, fragment_shader_bytes) {
         Ok(shader) => shader,
         Err(error) => {
-            destroy_shader_module(device, vertex_shader);
+            shader::destroy_shader_module(device, vertex_shader);
             return Err(error);
         }
     };
@@ -1670,18 +1656,9 @@ fn create_mesh_pipeline(
         cull_mode,
     );
 
-    destroy_shader_module(device, fragment_shader);
-    destroy_shader_module(device, vertex_shader);
+    shader::destroy_shader_module(device, fragment_shader);
+    shader::destroy_shader_module(device, vertex_shader);
     pipeline
-}
-
-/// Creates one shader module from build-script compiled SPIR-V bytes.
-fn create_shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, VulkanError> {
-    let code = util::read_spv(&mut Cursor::new(bytes)).map_err(VulkanError::ShaderCodeRead)?;
-    let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
-
-    // Safety: SPIR-V bytes are generated by `build.rs` and copied into a local word vector.
-    unsafe { device.create_shader_module(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
 /// Creates the fixed-function pipeline state for the current mesh vertex format.
@@ -1923,18 +1900,6 @@ fn destroy_pipeline(device: &Device, pipeline: vk::Pipeline) {
 fn destroy_pipeline_variants(device: &Device, variants: MeshPipelineVariants) {
     destroy_pipeline(device, variants.culled.handle);
     destroy_pipeline(device, variants.double_sided.handle);
-}
-
-/// Destroys one temporary shader module.
-fn destroy_shader_module(device: &Device, shader: vk::ShaderModule) {
-    if shader == vk::ShaderModule::null() {
-        return;
-    }
-
-    // Safety: pipeline creation has finished before temporary shader modules are destroyed.
-    unsafe {
-        device.destroy_shader_module(shader, None);
-    }
 }
 
 #[cfg(test)]
