@@ -260,7 +260,7 @@ Stage 7 から外したもの:
 - Vulkan executor は fixed swapchain pass ではなく、compiled graph の pass/barrier を実際に記録する。
 - fake shadow graph は置かない。shadow cascade、translucent shadow、scene color/depth、swapchain image はすべて graph resource と Vulkan resource が対応している。
 - shadow pass は `render_items` の opaque/cutout caster を depth-only pipeline で記録する。
-- translucent shadow pass は opaque depth を shader sample し、transparent caster を transmittance target へ multiplicative blend で記録する。
+- translucent shadow pass は opaque D16 arrayをsampleし、cascade間で共有して毎pass clearするD32 scratchのdepth test/writeで最近傍casterのtransmittanceだけを記録する。
 - scene pass は shadow cascade と translucent transmittance を graph read として宣言する。
 - imported texture は renderer asset store の owned `TextureDescriptor` clone から Vulkan sampled image へ upload する。
 - material は named slot と alpha policy を descriptor set へ upload する。暗黙 white texture は作らない。

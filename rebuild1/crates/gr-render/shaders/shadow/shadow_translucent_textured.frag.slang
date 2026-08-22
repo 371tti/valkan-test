@@ -13,72 +13,29 @@ struct MaterialParams {
 };
 [[vk::binding(0, 1)]] ConstantBuffer<MaterialParams> material;
 
-[[vk::binding(1, 1)]] Sampler2D base_color_texture;
-
-[[vk::binding(0, 2)]] Sampler2D shadow_cascade_0;
-[[vk::binding(1, 2)]] Sampler2D shadow_cascade_1;
-[[vk::binding(2, 2)]] Sampler2D shadow_cascade_2;
-[[vk::binding(3, 2)]] Sampler2D shadow_cascade_3;
+// All four stable CSM cascades share one four-layer depth array.
+[[vk::binding(10, 2)]] Sampler2DArray opaque_shadow_depth;
 
 struct ShadowCascade {
     uint cascade_index;
 };
 [[vk::push_constant]] ConstantBuffer<ShadowCascade> shadow_cascade;
 
-static const uint TEX_BASE_COLOR = 1u << 0;
-
-#include "shadow_alpha.slang"
-
-bool has_base_color_texture() {
-    return (material.flags.y & TEX_BASE_COLOR) != 0u;
+float opaque_shadow_depth_at_pixel(int2 coordinate) {
+    uint matrix_index = shadow_cascade.cascade_index;
+    int4 location = int4(coordinate, int(matrix_index), 0);
+    return opaque_shadow_depth.Load(location).r;
 }
 
-int2 shadow_texel_coord(float4 sv_position) {
-    return int2(sv_position.xy);
+bool translucent_is_in_front_of_opaque(float4 sv_position) {
+    // Rasterized framebuffer coordinates are non-negative; integer conversion is floor here.
+    int2 coordinate = int2(sv_position.xy);
+    float opaque_depth = opaque_shadow_depth_at_pixel(coordinate);
+    // A tiny tolerance keeps coplanar transparent decals from disappearing due to raster precision.
+    return sv_position.z <= opaque_depth + 0.00001;
 }
 
-float opaque_depth_for_cascade(uint index, int2 texel_coord) {
-    index = min(index, 3u);
-
-    if (index == 0u) {
-        return load_texel(
-            shadow_cascade_0,
-            texel_coord,
-            0
-        ).r;
-    }
-
-    if (index == 1u) {
-        return load_texel(
-            shadow_cascade_1,
-            texel_coord,
-            0
-        ).r;
-    }
-
-    if (index == 2u) {
-        return load_texel(
-            shadow_cascade_2,
-            texel_coord,
-            0
-        ).r;
-    }
-
-    return load_texel(
-        shadow_cascade_3,
-        texel_coord,
-        0
-    ).r;
-}
-
-void discard_when_hidden_by_opaque(float4 sv_position) {
-    uint index = min(shadow_cascade.cascade_index, 3u);
-    float opaque_depth = opaque_depth_for_cascade(index, shadow_texel_coord(sv_position));
-
-    if (sv_position.z > opaque_depth + 0.00065) {
-        discard;
-    }
-}
+[[vk::binding(1, 1)]] Sampler2D base_color_texture;
 
 float3 translucent_transmittance(float3 color, float alpha) {
     color = clamp(color, float3(0.0), float3(1.0));
@@ -89,19 +46,26 @@ float3 translucent_transmittance(float3 color, float alpha) {
 
 [shader("fragment")]
 void main(float4 sv_position : SV_Position) {
-    float4 base_color = frag_color * material.base_color_factor;
+    float4 texture_color = sample_texture(base_color_texture, frag_uv);
 
-    if (has_base_color_texture()) {
-        base_color *= sample_texture(base_color_texture, frag_uv);
+    float alpha = clamp(
+        frag_color.a * material.base_color_factor.a * texture_color.a,
+        0.0,
+        1.0
+    );
+
+    if (alpha <= 0.001) {
+        discard;
     }
-
-    float alpha = clamp(base_color.a, 0.0, 1.0);
-
-    discard_translucent_shadow_alpha(material.flags.x, alpha);
-    discard_when_hidden_by_opaque(sv_position);
-
+    // Reject transparent fragments before the opaque-depth array fetch whenever possible.
+    if (!translucent_is_in_front_of_opaque(sv_position)) {
+        discard;
+    }
+    float3 color = frag_color.rgb
+        * material.base_color_factor.rgb
+        * texture_color.rgb;
     out_transmittance = float4(
-        translucent_transmittance(base_color.rgb, alpha),
+        translucent_transmittance(color, alpha),
         clamp(sv_position.z, 0.0, 1.0)
     );
 }

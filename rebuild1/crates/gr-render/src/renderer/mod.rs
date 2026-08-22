@@ -1,3 +1,4 @@
+mod asset_import;
 mod assets;
 mod graph;
 mod pipeline;
@@ -10,56 +11,53 @@ use std::{future::Future, io, thread};
 
 use thiserror::Error;
 
-use crate::{
-    import::import_asset_on_worker,
-    protocol::{MessageEnvelope, RendererCommand, RendererEvent, RendererInbox, TransportError},
+use crate::protocol::{
+    MessageEnvelope, RendererCommand, RendererEvent, RendererInbox, TransportError,
 };
 
-use self::assets::GpuAssetStore;
 use self::surface::SurfaceRegistry;
 pub use self::vulkan::{VulkanError, VulkanRendererBackend};
+use self::{
+    asset_import::{AssetImportScheduler, RendererLoopEvent},
+    assets::GpuAssetStore,
+};
 
 const DEFAULT_SHADOW_MAP_SIZE: u32 = 4096;
-const MIN_SHADOW_MAP_SIZE: u32 = 1024;
+const MIN_SHADOW_MAP_SIZE: u32 = 512;
 const MAX_SHADOW_MAP_SIZE: u32 = 8192;
 pub(crate) const DEFAULT_DIRECTIONAL_LIGHT_DIR: [f32; 3] = [0.45, -1.0, 0.25];
 pub(crate) const DEFAULT_DIRECTIONAL_LIGHT_COLOR: [f32; 3] = [3.00, 2.65, 2.15];
 pub(crate) const DEFAULT_AMBIENT_COLOR: [f32; 4] = [0.020, 0.023, 0.031, 0.68];
 pub(crate) const DEFAULT_SHADOW_CASCADE_SPLITS: [f32; 4] = [20.0, 52.0, 128.0, 320.0];
 pub(crate) const DEFAULT_SHADOW_CASCADE_METRICS: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-static SHADOW_MAP_SIZE: OnceLock<u32> = OnceLock::new();
+static SHADOW_MAP_SIZE_OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
+
+fn shadow_map_size_override() -> Option<u32> {
+    *SHADOW_MAP_SIZE_OVERRIDE.get_or_init(|| {
+        std::env::var("REBUILD1_SHADOW_MAP_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.clamp(MIN_SHADOW_MAP_SIZE, MAX_SHADOW_MAP_SIZE))
+    })
+}
 
 /// Returns the fixed shadow-map resolution for this renderer process.
 ///
 /// `REBUILD1_SHADOW_MAP_SIZE` can lower quality for profiling or raise it for offline inspection.
 /// The value is clamped once so swapchain resources stay stable after the renderer starts.
 pub(crate) fn shadow_map_size() -> u32 {
-    *SHADOW_MAP_SIZE.get_or_init(|| {
-        std::env::var("REBUILD1_SHADOW_MAP_SIZE")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| *value > 0)
-            .map(|value| value.clamp(MIN_SHADOW_MAP_SIZE, MAX_SHADOW_MAP_SIZE))
-            .unwrap_or(DEFAULT_SHADOW_MAP_SIZE)
-    })
+    shadow_map_size_override().unwrap_or(DEFAULT_SHADOW_MAP_SIZE)
 }
 
-/// Returns the per-cascade shadow-map edge length for a smoother CSM quality curve.
-pub(crate) fn shadow_cascade_size(cascade_index: usize) -> u32 {
-    let base = shadow_map_size();
-    let scaled = match cascade_index {
-        0 => base,
-        1 => base.saturating_mul(3) / 4,
-        2 => base / 2,
-        _ => base.saturating_mul(3) / 8,
-    };
-    let minimum = match cascade_index {
-        0 | 1 => 1024,
-        2 => 768,
-        _ => 512,
-    };
-
-    scaled.max(minimum).min(base)
+/// Resolves a quality-profile CSM resolution while honoring the process-wide profiling override.
+///
+/// The directional shadow resource is one fixed-size array with four layers.  A quality change
+/// therefore selects one edge length for every layer; there is no near-cascade-only resolution
+/// multiplier or extra cascade.
+pub(crate) fn shadow_map_size_for_quality(requested: u32) -> u32 {
+    let requested = requested.clamp(MIN_SHADOW_MAP_SIZE, MAX_SHADOW_MAP_SIZE);
+    shadow_map_size_override().unwrap_or(requested)
 }
 
 pub type RendererResult = Result<(), RendererError>;
@@ -146,13 +144,39 @@ impl RendererBackend for NullRendererBackend {
         tracing::info!("null renderer backend starting");
         let mut assets = GpuAssetStore::default();
         let mut surfaces = SurfaceRegistry::default();
+        let mut asset_imports = AssetImportScheduler::default();
 
         inbox
             .send_event(MessageEnvelope::new(RendererEvent::RendererReady))
             .await?;
         tracing::info!("null renderer backend ready");
 
-        while let Some(command) = inbox.recv_command().await {
+        loop {
+            let command = match asset_imports.next_event(&mut inbox).await {
+                RendererLoopEvent::Command(command) => command,
+                RendererLoopEvent::AssetImported(completion) => {
+                    let event = match completion.result {
+                        Ok(imported) => {
+                            let asset = assets.upload_imported_scene(&imported);
+                            RendererEvent::AssetLoaded {
+                                request_id: completion.request_id,
+                                asset,
+                            }
+                        }
+                        Err(reason) => RendererEvent::AssetLoadFailed {
+                            request_id: completion.request_id,
+                            reason,
+                        },
+                    };
+                    inbox.send_event(MessageEnvelope::new(event)).await?;
+                    continue;
+                }
+                RendererLoopEvent::CommandChannelClosed => {
+                    asset_imports.shutdown();
+                    break;
+                }
+            };
+            let request_id = command.request_id;
             match command.payload {
                 RendererCommand::ConfigureSurface { surface } => {
                     tracing::trace!(
@@ -231,28 +255,14 @@ impl RendererBackend for NullRendererBackend {
                     })
                     .with_frame_id(snapshot.frame_id);
                     inbox.send_event(event).await?;
-                    assets.collect_deferred_destroys();
+                    assets.collect_deferred_destroys(0);
                 }
                 RendererCommand::LoadAsset { path } => {
-                    tracing::trace!(path = %path.display(), "null renderer loading asset");
-                    let event = match import_asset_on_worker(path).await {
-                        Ok(imported) => {
-                            let asset = assets.upload_imported_scene(&imported);
-                            RendererEvent::AssetLoaded {
-                                request_id: command.request_id,
-                                asset,
-                            }
-                        }
-                        Err(error) => RendererEvent::AssetLoadFailed {
-                            request_id: command.request_id,
-                            reason: error.to_string(),
-                        },
-                    };
-                    inbox.send_event(MessageEnvelope::new(event)).await?;
+                    asset_imports.enqueue(request_id, path);
                 }
                 RendererCommand::UnloadAsset { asset } => {
                     tracing::trace!(asset = ?asset, "null renderer unloading asset");
-                    if !assets.unload(asset) {
+                    if !assets.unload(asset, 0) {
                         let event = RendererEvent::ValidationWarning {
                             message: format!("asset unload ignored for stale handle: {asset:?}"),
                         };
@@ -268,6 +278,7 @@ impl RendererBackend for NullRendererBackend {
                 }
                 RendererCommand::Shutdown => {
                     tracing::info!("null renderer backend stopping");
+                    asset_imports.shutdown();
                     inbox
                         .send_event(MessageEnvelope::new(RendererEvent::RendererStopped))
                         .await?;
@@ -497,10 +508,6 @@ mod tests {
             )
             .await
             .expect("command channel should accept asset load");
-        endpoint
-            .send(MessageEnvelope::new(RendererCommand::Shutdown))
-            .await
-            .expect("command channel should accept shutdown");
 
         let mut loaded = false;
         while let Some(event) = endpoint.recv_event().await {
@@ -514,9 +521,19 @@ mod tests {
                         && asset.meshes.len() == 1
                         && asset.materials.len() == 1
                         && asset.textures.len() == 1;
+                    break;
                 }
-                RendererEvent::RendererStopped => break,
                 _ => {}
+            }
+        }
+
+        endpoint
+            .send(MessageEnvelope::new(RendererCommand::Shutdown))
+            .await
+            .expect("command channel should accept shutdown after asset completion");
+        while let Some(event) = endpoint.recv_event().await {
+            if matches!(event.payload, RendererEvent::RendererStopped) {
+                break;
             }
         }
 
@@ -541,10 +558,6 @@ mod tests {
             )
             .await
             .expect("command channel should accept asset load");
-        endpoint
-            .send(MessageEnvelope::new(RendererCommand::Shutdown))
-            .await
-            .expect("command channel should accept shutdown");
 
         let mut failed = false;
         while let Some(event) = endpoint.recv_event().await {
@@ -554,9 +567,19 @@ mod tests {
                     reason,
                 } => {
                     failed = id == request_id && reason.contains("does not exist");
+                    break;
                 }
-                RendererEvent::RendererStopped => break,
                 _ => {}
+            }
+        }
+
+        endpoint
+            .send(MessageEnvelope::new(RendererCommand::Shutdown))
+            .await
+            .expect("command channel should accept shutdown after asset completion");
+        while let Some(event) = endpoint.recv_event().await {
+            if matches!(event.payload, RendererEvent::RendererStopped) {
+                break;
             }
         }
 

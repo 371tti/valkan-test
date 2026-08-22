@@ -313,6 +313,20 @@ float ssr_material_weight(
     return base + transparent_boost + grazing_boost;
 }
 
+// Broad, low-reflectance dielectric highlights are better represented by the
+// environment term than by a long, noisy screen-space trace.  Keep transparent
+// surfaces and highly reflective materials on the full SSR path.
+bool ssr_trace_is_worthwhile(SurfaceMaterial material, float smoothness) {
+    if (material.transparent_weight > 0.0) {
+        return true;
+    }
+
+    float reflective_priority = smoothstep(0.20, 0.55, material.reflectance);
+    float minimum_smoothness = lerp(0.18, 0.055, reflective_priority);
+
+    return smoothness > minimum_smoothness;
+}
+
 bool build_ssr_dda_ray(
     float3 origin,
     float3 ray_dir,
@@ -436,7 +450,7 @@ float4 screen_space_reflection(float2 uv, SurfaceMaterial material, float ao) {
 
     float smoothness = 1.0 - material.roughness;
 
-    if (smoothness <= 0.055 && material.transparent_weight <= 0.0) {
+    if (!ssr_trace_is_worthwhile(material, smoothness)) {
         return float4(0.0);
     }
 
@@ -460,6 +474,21 @@ float4 screen_space_reflection(float2 uv, SurfaceMaterial material, float ao) {
     }
 
     float3 ray_dir = normalize_fast(reflect(view_ray, material.normal));
+
+    // Screen-space reflection becomes ill-conditioned at grazing incidence.
+    // At that angle a one-texel normal/depth change can swing the reflected
+    // ray completely out of the screen, producing streaks and false hits.
+    // Fade those rays before doing the (expensive) DDA traversal.  SSR also
+    // only has useful information when the ray travels into the scene
+    // (negative view-space Z); rays heading back toward the camera cannot hit
+    // a surface represented by the depth buffer reliably.
+    float view_angle_mask = smoothstep(0.075, 0.30, ndotv);
+    float ray_into_scene_mask = smoothstep(0.015, 0.18, -ray_dir.z);
+    float angle_mask = view_angle_mask * ray_into_scene_mask;
+
+    if (angle_mask <= 0.01) {
+        return float4(0.0);
+    }
 
     int max_steps = int(clamp(params.ssr.y, 1.0, float(SSR_MAX_DDA_STEPS)));
     float max_distance = max(params.ssr.z, 0.25);
@@ -622,6 +651,7 @@ float4 screen_space_reflection(float2 uv, SurfaceMaterial material, float ao) {
             float candidate_weight =
                 params.ssr.x *
                 material_weight *
+                angle_mask *
                 distance_fade *
                 edge_fade *
                 hit_fade *

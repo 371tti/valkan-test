@@ -1,21 +1,34 @@
 use std::{
+    cell::RefCell,
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
+    rc::Rc,
+    thread,
+    time::Instant,
 };
-
-use thiserror::Error;
 
 use crate::{
     math::{add3, cross3, dot3, normalize_or, sub3},
     protocol::{
         LocalLightPacket, MaterialAlphaMode, MaterialTextureSlot, SceneBounds, TextureDescriptor,
+        TextureFormat,
     },
 };
+use thiserror::Error;
 
 const REBUILD1_SCENE_EXTENSION: &str = "r1scene";
 const REBUILD1_SCENE_HEADER: &str = "rebuild1-scene";
 const GLB_EXTENSION: &str = "glb";
 const GLTF_EXTENSION: &str = "gltf";
+const STATIC_BATCH_MAX_VERTICES: usize = u16::MAX as usize;
+const STATIC_BATCH_MAX_PRIMITIVES: usize = 16;
+const STATIC_BATCH_MAX_RADIUS_GROWTH: f32 = 4.0;
+const STATIC_BATCH_MAX_RADIUS_RATIO: f32 = 4.0;
+const MAX_GLTF_IMAGE_DECODE_WORKERS: usize = 8;
+const PARALLEL_IMAGE_DECODE_MIN_BYTES: usize = 512 * 1024;
+const MAX_IMAGE_CONVERT_WORKERS: usize = 8;
+const PARALLEL_IMAGE_CONVERT_MIN_PIXELS: usize = 1_000_000;
 const MAT4_IDENTITY: [f32; 16] = [
     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
 ];
@@ -51,11 +64,9 @@ impl ImportedScene {
         meshes: Vec<ImportedMesh>,
         materials: Vec<ImportedMaterial>,
         textures: Vec<ImportedTexture>,
-        mut local_lights: Vec<LocalLightPacket>,
+        local_lights: Vec<LocalLightPacket>,
     ) -> Self {
         let bounds = scene_bounds_from_meshes(&meshes);
-        local_lights.extend(emissive_mesh_local_lights(&meshes, &materials));
-
         Self {
             source,
             meshes,
@@ -552,15 +563,182 @@ fn checker_texture(rgba: [u8; 8]) -> ImportedTexture {
         .expect("hard-coded checker texture byte count is valid")
 }
 
+#[derive(Clone)]
+struct GltfImageDecodeJob<'a> {
+    index: usize,
+    image: gltf::Image<'a>,
+    weight: usize,
+}
+
+/// Decodes independent glTF images concurrently while preserving source-index order.
+///
+/// The glTF crate already owns URI, data URI, MIME, and buffer-view semantics in
+/// `image::Data::from_source`; this scheduler only distributes those exact calls.
+fn import_gltf_images_parallel(
+    path: &Path,
+    document: &gltf::Document,
+    base: &Path,
+    buffers: &[gltf::buffer::Data],
+) -> Result<(Vec<gltf::image::Data>, usize), ImportError> {
+    let mut jobs = document
+        .images()
+        .map(|image| GltfImageDecodeJob {
+            index: image.index(),
+            weight: gltf_image_decode_weight(&image, base),
+            image,
+        })
+        .collect::<Vec<_>>();
+    let image_count = jobs.len();
+    if image_count == 0 {
+        return Ok((Vec::new(), 0));
+    }
+
+    let encoded_bytes = jobs
+        .iter()
+        .fold(0_usize, |total, job| total.saturating_add(job.weight));
+    let worker_count = gltf_image_decode_worker_count(image_count, encoded_bytes);
+    if worker_count == 1 {
+        let images = gltf::import_images(document, Some(base), buffers)
+            .map_err(|source| gltf_error(path, source))?;
+        return Ok((images, 1));
+    }
+
+    // Largest-first bin packing keeps one high-resolution texture from becoming a serial tail.
+    // Jobs inside each bucket return to source order so its first error matches serial import.
+    jobs.sort_unstable_by(|left, right| right.weight.cmp(&left.weight));
+    let mut buckets = (0..worker_count)
+        .map(|_| Vec::<GltfImageDecodeJob<'_>>::new())
+        .collect::<Vec<_>>();
+    let mut bucket_weights = vec![0_usize; worker_count];
+    for job in jobs {
+        let bucket = bucket_weights
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, weight)| **weight)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        bucket_weights[bucket] = bucket_weights[bucket].saturating_add(job.weight);
+        buckets[bucket].push(job);
+    }
+    for bucket in &mut buckets {
+        bucket.sort_unstable_by_key(|job| job.index);
+    }
+
+    let worker_results = thread::scope(|scope| {
+        let workers = buckets
+            .into_iter()
+            .map(|bucket| {
+                scope.spawn(move || {
+                    let mut decoded = Vec::with_capacity(bucket.len());
+                    for job in bucket {
+                        match gltf::image::Data::from_source(
+                            job.image.source(),
+                            Some(base),
+                            buffers,
+                        ) {
+                            Ok(image) => decoded.push((job.index, image)),
+                            Err(source) => return Err((job.index, source)),
+                        }
+                    }
+                    Ok(decoded)
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(thread::ScopedJoinHandle::join)
+            .collect::<Vec<_>>()
+    });
+
+    let mut ordered = (0..image_count).map(|_| None).collect::<Vec<_>>();
+    let mut first_error = None::<(usize, gltf::Error)>;
+    for worker in worker_results {
+        let decoded =
+            worker.map_err(|_| gltf_message(path, "glTF image decode worker panicked"))?;
+        match decoded {
+            Ok(images) => {
+                for (index, image) in images {
+                    ordered[index] = Some(image);
+                }
+            }
+            Err((index, source)) => {
+                if first_error
+                    .as_ref()
+                    .is_none_or(|(first_index, _)| index < *first_index)
+                {
+                    first_error = Some((index, source));
+                }
+            }
+        }
+    }
+
+    if let Some((_, source)) = first_error {
+        return Err(gltf_error(path, source));
+    }
+    let images = ordered
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| gltf_message(path, "glTF image decode produced an incomplete result"))?;
+    Ok((images, worker_count))
+}
+
+/// Estimates decode work without reading image payloads a second time.
+fn gltf_image_decode_weight(image: &gltf::Image<'_>, base: &Path) -> usize {
+    match image.source() {
+        gltf::image::Source::View { view, .. } => view.length(),
+        gltf::image::Source::Uri { uri, .. } if uri.starts_with("data:") => uri.len(),
+        gltf::image::Source::Uri { uri, .. } => {
+            let file_uri = uri
+                .strip_prefix("file://")
+                .or_else(|| uri.strip_prefix("file:"));
+            let source = file_uri.map_or_else(|| base.join(uri), PathBuf::from);
+            fs::metadata(source)
+                .ok()
+                .and_then(|metadata| usize::try_from(metadata.len()).ok())
+                .unwrap_or(uri.len())
+        }
+    }
+}
+
+fn gltf_image_decode_worker_count(image_count: usize, encoded_bytes: usize) -> usize {
+    if image_count <= 1 || encoded_bytes < PARALLEL_IMAGE_DECODE_MIN_BYTES {
+        return 1;
+    }
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_GLTF_IMAGE_DECODE_WORKERS)
+        .min(image_count)
+        .max(1)
+}
+
 /// Imports glTF/GLB triangle primitives into the renderer-independent intermediate scene.
 fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
-    let (document, buffers, images) =
-        gltf::import(path).map_err(|source| gltf_error(path, source))?;
+    let total_started = Instant::now();
+    let document_started = Instant::now();
+    let gltf = gltf::Gltf::open(path).map_err(|source| gltf_error(path, source))?;
+    let document_ms = document_started.elapsed().as_secs_f64() * 1000.0;
+    let gltf::Gltf { document, blob } = gltf;
+    let base = path.parent().unwrap_or_else(|| Path::new("./"));
+    let buffer_started = Instant::now();
+    let buffers = gltf::import_buffers(&document, Some(base), blob)
+        .map_err(|source| gltf_error(path, source))?;
+    let buffer_ms = buffer_started.elapsed().as_secs_f64() * 1000.0;
+    let image_decode_started = Instant::now();
+    let (images, image_decode_workers) =
+        import_gltf_images_parallel(path, &document, base, &buffers)?;
+    let image_decode_ms = image_decode_started.elapsed().as_secs_f64() * 1000.0;
+    let decode_ms = document_ms + buffer_ms + image_decode_ms;
     let mut meshes = Vec::new();
     let mut materials = Vec::new();
     let mut local_lights = Vec::new();
-    let texture_import = import_gltf_textures(path, &document, &images)?;
+    let texture_started = Instant::now();
+    let texture_import = import_gltf_textures(path, &document, images)?;
+    let texture_ms = texture_started.elapsed().as_secs_f64() * 1000.0;
+    let transform_started = Instant::now();
     let transforms = gltf_scene_transforms(&document, &buffers)?;
+    let transform_ms = transform_started.elapsed().as_secs_f64() * 1000.0;
+    let primitive_started = Instant::now();
 
     if let Some(scene) = document.default_scene() {
         for node in scene.nodes() {
@@ -617,22 +795,246 @@ fn import_gltf_scene(path: &Path) -> Result<ImportedScene, ImportError> {
         ));
     }
 
-    tracing::trace!(
-        source = %path.display(),
-        meshes = meshes.len(),
-        materials = materials.len(),
-        local_lights = local_lights.len(),
-        bounds = ?scene_bounds_from_meshes(&meshes),
-        "imported glTF asset"
-    );
-
-    Ok(ImportedScene::from_parts(
+    let primitive_ms = primitive_started.elapsed().as_secs_f64() * 1000.0;
+    let source_primitives = meshes.len();
+    let batch_started = Instant::now();
+    (meshes, materials) = batch_static_gltf_primitives(meshes, materials);
+    let batch_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
+    let scene = ImportedScene::from_parts(
         path.to_path_buf(),
         meshes,
         materials,
         texture_import.into_textures(),
         local_lights,
-    ))
+    );
+
+    tracing::trace!(
+        source = %path.display(),
+        source_primitives,
+        static_batches = scene.mesh_count(),
+        meshes = scene.mesh_count(),
+        materials = scene.material_count(),
+        local_lights = scene.local_lights().len(),
+        bounds = ?scene.bounds(),
+        decode_ms,
+        document_ms,
+        buffer_ms,
+        image_decode_ms,
+        image_decode_workers,
+        texture_ms,
+        transform_ms,
+        primitive_ms,
+        batch_ms,
+        total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+        "imported glTF asset"
+    );
+
+    Ok(scene)
+}
+
+/// Combines nearby static glTF primitives that use exactly the same material.
+///
+/// glTF node and skin transforms are already baked into imported vertices, so separate opaque
+/// primitives do not require per-draw transforms. Keeping each primitive in its own Vulkan
+/// buffers therefore adds draw and bind overhead without changing the result. Batches remain
+/// deliberately small and spatially coherent so camera and shadow-cascade culling do not turn a
+/// nearby object into a draw of unrelated distant geometry. Transparent primitives stay separate
+/// because their submission order is part of alpha blending correctness.
+fn batch_static_gltf_primitives(
+    meshes: Vec<ImportedMesh>,
+    materials: Vec<ImportedMaterial>,
+) -> (Vec<ImportedMesh>, Vec<ImportedMaterial>) {
+    if meshes.len() != materials.len() {
+        debug_assert_eq!(meshes.len(), materials.len());
+        return (meshes, materials);
+    }
+
+    let source_count = meshes.len();
+    let mut batches = Vec::<StaticPrimitiveBatch>::new();
+    let mut passthrough = Vec::<(ImportedMesh, ImportedMaterial)>::new();
+
+    for (mesh, material) in meshes.into_iter().zip(materials) {
+        let ImportedMesh::Indexed(data) = mesh else {
+            passthrough.push((mesh, material));
+            continue;
+        };
+        let Some(bounds) = ImportedMeshBounds::from_data(&data) else {
+            passthrough.push((ImportedMesh::Indexed(data), material));
+            continue;
+        };
+        if material.alpha_mode() == MaterialAlphaMode::Transparent
+            || data.vertices().len() > STATIC_BATCH_MAX_VERTICES
+        {
+            passthrough.push((ImportedMesh::Indexed(data), material));
+            continue;
+        }
+
+        let best_batch = batches
+            .iter()
+            .enumerate()
+            .filter(|(_, batch)| batch.can_merge(&data, &material, bounds))
+            .min_by(|(_, left), (_, right)| {
+                squared_distance(left.bounds.center(), bounds.center())
+                    .total_cmp(&squared_distance(right.bounds.center(), bounds.center()))
+            })
+            .map(|(index, _)| index);
+
+        if let Some(index) = best_batch {
+            batches[index].merge(data, bounds);
+        } else {
+            batches.push(StaticPrimitiveBatch::new(data, material, bounds));
+        }
+    }
+
+    let mut output_meshes = Vec::with_capacity(batches.len() + passthrough.len());
+    let mut output_materials = Vec::with_capacity(output_meshes.capacity());
+    for batch in batches {
+        let (mesh, material) = batch.finish();
+        output_meshes.push(mesh);
+        output_materials.push(material);
+    }
+    for (mesh, material) in passthrough {
+        output_meshes.push(mesh);
+        output_materials.push(material);
+    }
+
+    tracing::trace!(
+        source_primitives = source_count,
+        static_batches = output_meshes.len(),
+        merged_primitives = source_count.saturating_sub(output_meshes.len()),
+        "batched spatially coherent static glTF primitives"
+    );
+    (output_meshes, output_materials)
+}
+
+struct StaticPrimitiveBatch {
+    data: ImportedMeshData,
+    material: ImportedMaterial,
+    bounds: ImportedMeshBounds,
+    max_source_radius: f32,
+    primitive_count: usize,
+}
+
+impl StaticPrimitiveBatch {
+    fn new(data: ImportedMeshData, material: ImportedMaterial, bounds: ImportedMeshBounds) -> Self {
+        Self {
+            data,
+            material,
+            bounds,
+            max_source_radius: bounds.radius,
+            primitive_count: 1,
+        }
+    }
+
+    fn can_merge(
+        &self,
+        data: &ImportedMeshData,
+        material: &ImportedMaterial,
+        bounds: ImportedMeshBounds,
+    ) -> bool {
+        if self.material != *material
+            || self.primitive_count >= STATIC_BATCH_MAX_PRIMITIVES
+            || self.data.vertices.len() + data.vertices().len() > STATIC_BATCH_MAX_VERTICES
+        {
+            return false;
+        }
+
+        let smallest_radius = self.max_source_radius.min(bounds.radius).max(0.001);
+        let largest_radius = self.max_source_radius.max(bounds.radius);
+        if largest_radius / smallest_radius > STATIC_BATCH_MAX_RADIUS_RATIO {
+            return false;
+        }
+
+        let merged = self.bounds.union(bounds);
+        merged.radius <= largest_radius * STATIC_BATCH_MAX_RADIUS_GROWTH
+    }
+
+    fn merge(&mut self, data: ImportedMeshData, bounds: ImportedMeshBounds) {
+        let vertex_offset = self.data.vertices.len() as u32;
+        self.data.vertices.extend(data.vertices);
+        self.data
+            .indices
+            .extend(data.indices.into_iter().map(|index| index + vertex_offset));
+        self.bounds = self.bounds.union(bounds);
+        self.max_source_radius = self.max_source_radius.max(bounds.radius);
+        self.primitive_count += 1;
+    }
+
+    fn finish(self) -> (ImportedMesh, ImportedMaterial) {
+        (ImportedMesh::Indexed(self.data), self.material)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ImportedMeshBounds {
+    min: [f32; 3],
+    max: [f32; 3],
+    radius: f32,
+}
+
+impl ImportedMeshBounds {
+    fn from_data(data: &ImportedMeshData) -> Option<Self> {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for vertex in data.vertices() {
+            let position = vertex.position();
+            if !position.iter().all(|value| value.is_finite()) {
+                return None;
+            }
+            for axis in 0..3 {
+                min[axis] = min[axis].min(position[axis]);
+                max[axis] = max[axis].max(position[axis]);
+            }
+        }
+        (!data.vertices().is_empty()).then(|| Self::from_min_max(min, max))
+    }
+
+    fn from_min_max(min: [f32; 3], max: [f32; 3]) -> Self {
+        let half_extent = [
+            (max[0] - min[0]) * 0.5,
+            (max[1] - min[1]) * 0.5,
+            (max[2] - min[2]) * 0.5,
+        ];
+        Self {
+            min,
+            max,
+            radius: (half_extent[0] * half_extent[0]
+                + half_extent[1] * half_extent[1]
+                + half_extent[2] * half_extent[2])
+                .sqrt()
+                .max(0.001),
+        }
+    }
+
+    fn center(self) -> [f32; 3] {
+        [
+            (self.min[0] + self.max[0]) * 0.5,
+            (self.min[1] + self.max[1]) * 0.5,
+            (self.min[2] + self.max[2]) * 0.5,
+        ]
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self::from_min_max(
+            [
+                self.min[0].min(other.min[0]),
+                self.min[1].min(other.min[1]),
+                self.min[2].min(other.min[2]),
+            ],
+            [
+                self.max[0].max(other.max[0]),
+                self.max[1].max(other.max[1]),
+                self.max[2].max(other.max[2]),
+            ],
+        )
+    }
+}
+
+fn squared_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
+    let dx = left[0] - right[0];
+    let dy = left[1] - right[1];
+    let dz = left[2] - right[2];
+    dx * dx + dy * dy + dz * dz
 }
 
 #[derive(Clone, Copy)]
@@ -995,7 +1397,12 @@ fn import_gltf_primitive(
         &positions,
         &indices,
     );
-    let tangents = compute_vertex_tangents(&positions, &normals, &uvs, &indices);
+    // Tangents are only consumed by normal-mapped materials.  Generating a TBN frame for every
+    // imported primitive is expensive on dense assets and cannot affect materials without a
+    // normal map, so retain the inexpensive default tangent for those paths instead.
+    let tangents = material_uses_normal_map(&material)
+        .then(|| compute_vertex_tangents(&positions, &normals, &uvs, &indices))
+        .unwrap_or_default();
 
     let vertices = positions
         .into_iter()
@@ -1010,12 +1417,133 @@ fn import_gltf_primitive(
             )
         })
         .collect::<Vec<_>>();
-    meshes.push(ImportedMesh::Indexed(ImportedMeshData::new(
-        vertices, indices,
-    )));
-    materials.push(material);
+    push_gltf_primitive_by_alpha_coverage(
+        ImportedMeshData::new(vertices, indices),
+        material,
+        textures,
+        meshes,
+        materials,
+    );
 
     Ok(())
+}
+
+/// Separates only alpha-mask triangles whose complete filtered texture footprint has a proven
+/// outcome. Opaque triangles then use the position-only shadow path, while transparent triangles
+/// are removed before they consume vertex, raster, or shadow work. Any uncertainty remains in the
+/// original cutout material so import never guesses at authored coverage.
+fn push_gltf_primitive_by_alpha_coverage(
+    data: ImportedMeshData,
+    material: ImportedMaterial,
+    textures: &GltfImportedTextures,
+    meshes: &mut Vec<ImportedMesh>,
+    materials: &mut Vec<ImportedMaterial>,
+) {
+    if material.alpha_mode() != MaterialAlphaMode::Cutout
+        || !data
+            .vertices()
+            .iter()
+            .all(|vertex| vertex.color()[3] == 1.0)
+    {
+        push_imported_primitive(data, material, meshes, materials);
+        return;
+    }
+
+    let Some(classifier) = textures.cutout_alpha_classifier(&material) else {
+        push_imported_primitive(data, material, meshes, materials);
+        return;
+    };
+    let mut cutout_indices = Vec::new();
+    let mut opaque_indices = Vec::new();
+    let mut transparent_triangles = 0_usize;
+
+    for triangle in data.indices().chunks_exact(3) {
+        let (Some(a), Some(b), Some(c)) = (
+            data.vertices().get(triangle[0] as usize),
+            data.vertices().get(triangle[1] as usize),
+            data.vertices().get(triangle[2] as usize),
+        ) else {
+            cutout_indices.extend_from_slice(triangle);
+            continue;
+        };
+        let coverage = classifier.triangle_coverage([a.uv(), b.uv(), c.uv()]);
+        match coverage {
+            TriangleAlphaCoverage::Opaque => opaque_indices.extend_from_slice(triangle),
+            TriangleAlphaCoverage::Transparent => transparent_triangles += 1,
+            TriangleAlphaCoverage::Mixed => cutout_indices.extend_from_slice(triangle),
+        }
+    }
+
+    if opaque_indices.is_empty() && transparent_triangles == 0 {
+        push_imported_primitive(data, material, meshes, materials);
+        return;
+    }
+
+    let original_triangles = data.indices().len() / 3;
+    let opaque_triangles = opaque_indices.len() / 3;
+    let cutout_triangles = cutout_indices.len() / 3;
+    let mut opaque_material = material.clone();
+    opaque_material.alpha_mode = MaterialAlphaMode::Opaque;
+
+    if !opaque_indices.is_empty() {
+        let opaque_data = compact_indexed_subset(data.vertices(), &opaque_indices);
+        push_imported_primitive(opaque_data, opaque_material, meshes, materials);
+    }
+    if !cutout_indices.is_empty() {
+        let cutout_data = compact_indexed_subset(data.vertices(), &cutout_indices);
+        push_imported_primitive(cutout_data, material, meshes, materials);
+    }
+
+    tracing::trace!(
+        original_triangles,
+        opaque_triangles,
+        cutout_triangles,
+        transparent_triangles,
+        "specialized glTF alpha-mask triangles"
+    );
+}
+
+/// Appends one imported indexed primitive and its matching material in lockstep.
+fn push_imported_primitive(
+    data: ImportedMeshData,
+    material: ImportedMaterial,
+    meshes: &mut Vec<ImportedMesh>,
+    materials: &mut Vec<ImportedMaterial>,
+) {
+    meshes.push(ImportedMesh::Indexed(data));
+    materials.push(material);
+}
+
+/// Remaps one triangle subset to the smallest vertex array while preserving source index order,
+/// winding, and every imported vertex attribute.
+fn compact_indexed_subset(vertices: &[ImportedVertex], indices: &[u32]) -> ImportedMeshData {
+    let mut remap = vec![u32::MAX; vertices.len()];
+    let mut compact_vertices = Vec::new();
+    let mut compact_indices = Vec::with_capacity(indices.len());
+
+    for &source_index in indices {
+        let source = source_index as usize;
+        let mapped = remap[source];
+        if mapped != u32::MAX {
+            compact_indices.push(mapped);
+            continue;
+        }
+
+        let mapped = compact_vertices.len() as u32;
+        compact_vertices.push(vertices[source]);
+        remap[source] = mapped;
+        compact_indices.push(mapped);
+    }
+
+    ImportedMeshData::new(compact_vertices, compact_indices)
+}
+
+/// Returns whether an imported material needs per-vertex tangents for normal-map shading.
+fn material_uses_normal_map(material: &ImportedMaterial) -> bool {
+    material
+        .texture_slots()
+        .iter()
+        .any(|slot| slot.slot() == MaterialTextureSlot::Normal)
 }
 
 struct GltfSkin {
@@ -1349,10 +1877,210 @@ impl GltfTextureSource for gltf::material::OcclusionTexture<'_> {
     }
 }
 
+const ALPHA_COVERAGE_EPSILON: f64 = 1.0 / 65_536.0;
+const TEXTURE_COORD_EPSILON: f64 = 1.0e-7;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AlphaVisibilityKey {
+    texture_index: usize,
+    alpha_cutoff_milli: u16,
+    factor_alpha_bits: u32,
+}
+
+#[derive(Clone)]
+enum CutoutAlphaClassifier {
+    Constant(TriangleAlphaCoverage),
+    Texture(Rc<AlphaVisibilityMap>),
+}
+
+impl CutoutAlphaClassifier {
+    fn triangle_coverage(&self, uvs: [[f32; 2]; 3]) -> TriangleAlphaCoverage {
+        match self {
+            Self::Constant(coverage) => *coverage,
+            Self::Texture(map) => map.triangle_coverage(uvs),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TriangleAlphaCoverage {
+    Opaque,
+    Transparent,
+    Mixed,
+}
+
+/// Summed-area classification of one alpha texture at one material cutoff. Each source texel is
+/// zero for definitely discarded, one for numerically uncertain, or two for definitely kept.
+/// Rectangle sums therefore prove a whole bilinear footprint without scanning it per triangle.
+struct AlphaVisibilityMap {
+    width: usize,
+    height: usize,
+    prefix_stride: usize,
+    state_prefix: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct WrappedSegments {
+    values: [(usize, usize); 2],
+    len: usize,
+}
+
+impl WrappedSegments {
+    fn as_slice(&self) -> &[(usize, usize)] {
+        &self.values[..self.len]
+    }
+}
+
+impl AlphaVisibilityMap {
+    fn new(texture: &ImportedTexture, factor_alpha: f32, alpha_cutoff_milli: u16) -> Option<Self> {
+        let descriptor = texture.descriptor();
+        if descriptor.format() != TextureFormat::Rgba8Srgb || !factor_alpha.is_finite() {
+            return None;
+        }
+        let width = usize::try_from(descriptor.width()).ok()?;
+        let height = usize::try_from(descriptor.height()).ok()?;
+        let texel_count = width.checked_mul(height)?;
+        if texel_count.checked_mul(2)? > u32::MAX as usize {
+            return None;
+        }
+        let row_bytes = width.checked_mul(4)?;
+        let prefix_stride = width.checked_add(1)?;
+        let prefix_len = prefix_stride.checked_mul(height.checked_add(1)?)?;
+        let mut state_prefix = vec![0_u32; prefix_len];
+        let cutoff = f64::from(alpha_cutoff_milli) / 1000.0;
+        let factor_alpha = f64::from(factor_alpha);
+
+        for (y, row) in descriptor.pixels().chunks_exact(row_bytes).enumerate() {
+            let mut row_sum = 0_u32;
+            let output_row = (y + 1) * prefix_stride;
+            let previous_row = y * prefix_stride;
+            for (x, pixel) in row.chunks_exact(4).enumerate() {
+                let effective_alpha = f64::from(pixel[3]) / 255.0 * factor_alpha;
+                let state = if effective_alpha > cutoff + ALPHA_COVERAGE_EPSILON {
+                    2
+                } else if effective_alpha <= cutoff - ALPHA_COVERAGE_EPSILON {
+                    0
+                } else {
+                    1
+                };
+                row_sum += state;
+                state_prefix[output_row + x + 1] = state_prefix[previous_row + x + 1] + row_sum;
+            }
+        }
+
+        Some(Self {
+            width,
+            height,
+            prefix_stride,
+            state_prefix,
+        })
+    }
+
+    fn global_coverage(&self) -> TriangleAlphaCoverage {
+        self.coverage_for_ranges((0, self.width - 1), (0, self.height - 1))
+    }
+
+    fn triangle_coverage(&self, uvs: [[f32; 2]; 3]) -> TriangleAlphaCoverage {
+        if !uvs.iter().flatten().all(|value| value.is_finite()) {
+            return TriangleAlphaCoverage::Mixed;
+        }
+        let min_u = uvs.iter().map(|uv| uv[0]).fold(f32::INFINITY, f32::min);
+        let max_u = uvs.iter().map(|uv| uv[0]).fold(f32::NEG_INFINITY, f32::max);
+        let min_v = uvs.iter().map(|uv| uv[1]).fold(f32::INFINITY, f32::min);
+        let max_v = uvs.iter().map(|uv| uv[1]).fold(f32::NEG_INFINITY, f32::max);
+        let Some(u_range) = filtered_sample_range(min_u, max_u, self.width) else {
+            return TriangleAlphaCoverage::Mixed;
+        };
+        let Some(v_range) = filtered_sample_range(min_v, max_v, self.height) else {
+            return TriangleAlphaCoverage::Mixed;
+        };
+
+        self.coverage_for_ranges(u_range, v_range)
+    }
+
+    fn coverage_for_ranges(
+        &self,
+        u_range: (usize, usize),
+        v_range: (usize, usize),
+    ) -> TriangleAlphaCoverage {
+        let u_segments = wrapped_segments(u_range, self.width);
+        let v_segments = wrapped_segments(v_range, self.height);
+        let mut state_sum = 0_u64;
+        let mut texel_count = 0_u64;
+
+        for &(min_x, max_x) in u_segments.as_slice() {
+            for &(min_y, max_y) in v_segments.as_slice() {
+                state_sum += self.rectangle_sum(min_x, max_x, min_y, max_y);
+                texel_count += ((max_x - min_x + 1) * (max_y - min_y + 1)) as u64;
+            }
+        }
+
+        if state_sum == 0 {
+            TriangleAlphaCoverage::Transparent
+        } else if state_sum == texel_count * 2 {
+            TriangleAlphaCoverage::Opaque
+        } else {
+            TriangleAlphaCoverage::Mixed
+        }
+    }
+
+    fn rectangle_sum(&self, min_x: usize, max_x: usize, min_y: usize, max_y: usize) -> u64 {
+        let top = min_y * self.prefix_stride;
+        let bottom = (max_y + 1) * self.prefix_stride;
+        let bottom_right = u64::from(self.state_prefix[bottom + max_x + 1]);
+        let top_left = u64::from(self.state_prefix[top + min_x]);
+        let top_right = u64::from(self.state_prefix[top + max_x + 1]);
+        let bottom_left = u64::from(self.state_prefix[bottom + min_x]);
+        (bottom_right + top_left) - (top_right + bottom_left)
+    }
+}
+
+/// Returns the inclusive unwrapped source-texel range touched by linear filtering. A range that
+/// spans a complete repeat period or cannot be represented is deliberately left unspecialized.
+fn filtered_sample_range(min_uv: f32, max_uv: f32, texture_size: usize) -> Option<(usize, usize)> {
+    if texture_size == 0 || !min_uv.is_finite() || !max_uv.is_finite() || min_uv > max_uv {
+        return None;
+    }
+    let size = texture_size as f64;
+    let low = (f64::from(min_uv) * size - 0.5 - TEXTURE_COORD_EPSILON).floor();
+    let high = (f64::from(max_uv) * size - 0.5 + TEXTURE_COORD_EPSILON).floor() + 1.0;
+    if low <= i64::MIN as f64 || high >= i64::MAX as f64 || !low.is_finite() || !high.is_finite() {
+        return None;
+    }
+    let low = low as i64;
+    let high = high as i64;
+    let span = high.checked_sub(low)?.checked_add(1)?;
+    let texture_size_i64 = i64::try_from(texture_size).ok()?;
+    if span <= 0 || span >= texture_size_i64 {
+        return None;
+    }
+
+    Some((
+        usize::try_from(low.rem_euclid(texture_size_i64)).ok()?,
+        usize::try_from(high.rem_euclid(texture_size_i64)).ok()?,
+    ))
+}
+
+/// Splits one wrapped inclusive range into one or two ordinary texture rectangles.
+fn wrapped_segments(range: (usize, usize), texture_size: usize) -> WrappedSegments {
+    if range.0 <= range.1 {
+        WrappedSegments {
+            values: [range, (0, 0)],
+            len: 1,
+        }
+    } else {
+        WrappedSegments {
+            values: [(range.0, texture_size - 1), (0, range.1)],
+            len: 2,
+        }
+    }
+}
+
 struct GltfImportedTextures {
     textures: Vec<ImportedTexture>,
     srgb_indices: Vec<Option<usize>>,
     linear_indices: Vec<Option<usize>>,
+    alpha_visibility: RefCell<BTreeMap<AlphaVisibilityKey, Rc<AlphaVisibilityMap>>>,
 }
 
 impl GltfImportedTextures {
@@ -1366,6 +2094,7 @@ impl GltfImportedTextures {
             textures,
             srgb_indices,
             linear_indices,
+            alpha_visibility: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -1381,9 +2110,71 @@ impl GltfImportedTextures {
         }
     }
 
+    /// Builds or reuses one material-specific alpha classification table. Missing textures,
+    /// unexpected formats, and invalid factors all return `None` so callers retain cutout work.
+    fn cutout_alpha_classifier(
+        &self,
+        material: &ImportedMaterial,
+    ) -> Option<CutoutAlphaClassifier> {
+        if material.alpha_mode() != MaterialAlphaMode::Cutout {
+            return None;
+        }
+        let cutoff = f64::from(material.alpha_cutoff_milli()) / 1000.0;
+        let factor_alpha = material.base_color_factor()[3];
+        if !factor_alpha.is_finite() {
+            return None;
+        }
+        let Some(texture_index) = material
+            .texture_slots()
+            .iter()
+            .find(|slot| slot.slot() == MaterialTextureSlot::BaseColor)
+            .map(|slot| slot.texture_index())
+        else {
+            let factor_alpha = f64::from(factor_alpha);
+            return Some(CutoutAlphaClassifier::Constant(
+                if factor_alpha > cutoff + ALPHA_COVERAGE_EPSILON {
+                    TriangleAlphaCoverage::Opaque
+                } else if factor_alpha <= cutoff - ALPHA_COVERAGE_EPSILON {
+                    TriangleAlphaCoverage::Transparent
+                } else {
+                    TriangleAlphaCoverage::Mixed
+                },
+            ));
+        };
+        let key = AlphaVisibilityKey {
+            texture_index,
+            alpha_cutoff_milli: material.alpha_cutoff_milli(),
+            factor_alpha_bits: factor_alpha.to_bits(),
+        };
+        if let Some(map) = self.alpha_visibility.borrow().get(&key).cloned() {
+            return Some(classifier_from_alpha_map(map));
+        }
+
+        let texture = self.textures.get(texture_index)?;
+        let map = Rc::new(AlphaVisibilityMap::new(
+            texture,
+            factor_alpha,
+            material.alpha_cutoff_milli(),
+        )?);
+        self.alpha_visibility.borrow_mut().insert(key, map.clone());
+        Some(classifier_from_alpha_map(map))
+    }
+
     /// Moves the imported texture payloads into the final scene intermediate.
     fn into_textures(self) -> Vec<ImportedTexture> {
         self.textures
+    }
+}
+
+fn classifier_from_alpha_map(map: Rc<AlphaVisibilityMap>) -> CutoutAlphaClassifier {
+    match map.global_coverage() {
+        TriangleAlphaCoverage::Opaque => {
+            CutoutAlphaClassifier::Constant(TriangleAlphaCoverage::Opaque)
+        }
+        TriangleAlphaCoverage::Transparent => {
+            CutoutAlphaClassifier::Constant(TriangleAlphaCoverage::Transparent)
+        }
+        TriangleAlphaCoverage::Mixed => CutoutAlphaClassifier::Texture(map),
     }
 }
 
@@ -1391,25 +2182,29 @@ impl GltfImportedTextures {
 fn import_gltf_textures(
     path: &Path,
     document: &gltf::Document,
-    images: &[gltf::image::Data],
+    images: Vec<gltf::image::Data>,
 ) -> Result<GltfImportedTextures, ImportError> {
     let usages = gltf_image_usages(document, images.len());
     let mut textures = Vec::new();
     let mut srgb_indices = vec![None; images.len()];
     let mut linear_indices = vec![None; images.len()];
+    let converted = convert_gltf_images(path, images, &usages)?;
 
-    for (index, image) in images.iter().enumerate() {
+    for (index, image) in converted.into_iter().enumerate() {
         let usage = usages[index];
-        if !usage.srgb && !usage.linear {
+        let Some(image) = image else {
             continue;
-        }
+        };
 
-        let pixels = image_to_rgba8(path, image)?;
+        let width = image.width;
+        let height = image.height;
+        let pixels = image.pixels;
         if usage.srgb {
             srgb_indices[index] = Some(push_gltf_texture_descriptor(
                 path,
                 &mut textures,
-                image,
+                width,
+                height,
                 pixels.clone(),
                 GltfImageColorSpace::Srgb,
             )?);
@@ -1418,7 +2213,8 @@ fn import_gltf_textures(
             linear_indices[index] = Some(push_gltf_texture_descriptor(
                 path,
                 &mut textures,
-                image,
+                width,
+                height,
                 pixels,
                 GltfImageColorSpace::Linear,
             )?);
@@ -1444,21 +2240,129 @@ struct GltfImageUsage {
     linear: bool,
 }
 
+struct ConvertedGltfImage {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+/// Expands independent source images concurrently while preserving glTF source-index order.
+fn convert_gltf_images(
+    path: &Path,
+    images: Vec<gltf::image::Data>,
+    usages: &[GltfImageUsage],
+) -> Result<Vec<Option<ConvertedGltfImage>>, ImportError> {
+    let image_count = images.len();
+    let mut jobs = images
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            usages
+                .get(*index)
+                .is_some_and(|usage| usage.srgb || usage.linear)
+        })
+        .collect::<Vec<_>>();
+    let total_pixels = jobs.iter().fold(0_usize, |total, (_, image)| {
+        total.saturating_add(image_pixel_count(image))
+    });
+    let worker_count = image_convert_worker_count(jobs.len(), total_pixels);
+
+    let mut results = if worker_count == 1 {
+        jobs.into_iter()
+            .map(|(index, image)| (index, convert_gltf_image(path, image)))
+            .collect::<Vec<_>>()
+    } else {
+        jobs.sort_unstable_by(|(_, left), (_, right)| {
+            image_pixel_count(right).cmp(&image_pixel_count(left))
+        });
+        let mut buckets = (0..worker_count)
+            .map(|_| Vec::<(usize, gltf::image::Data)>::new())
+            .collect::<Vec<_>>();
+        let mut bucket_pixels = vec![0_usize; worker_count];
+        for (index, image) in jobs {
+            let bucket = bucket_pixels
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, pixels)| **pixels)
+                .map_or(0, |(index, _)| index);
+            bucket_pixels[bucket] = bucket_pixels[bucket].saturating_add(image_pixel_count(&image));
+            buckets[bucket].push((index, image));
+        }
+
+        thread::scope(|scope| {
+            let workers = buckets
+                .into_iter()
+                .map(|bucket| {
+                    scope.spawn(move || {
+                        bucket
+                            .into_iter()
+                            .map(|(index, image)| (index, convert_gltf_image(path, image)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .flat_map(|worker| {
+                    worker
+                        .join()
+                        .expect("glTF image conversion worker should not panic")
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    results.sort_unstable_by_key(|(index, _)| *index);
+    let mut converted = std::iter::repeat_with(|| None)
+        .take(image_count)
+        .collect::<Vec<_>>();
+    for (index, result) in results {
+        converted[index] = Some(result?);
+    }
+    Ok(converted)
+}
+
+fn image_convert_worker_count(image_count: usize, total_pixels: usize) -> usize {
+    if image_count <= 1 || total_pixels < PARALLEL_IMAGE_CONVERT_MIN_PIXELS {
+        return 1;
+    }
+    thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_IMAGE_CONVERT_WORKERS)
+        .min(image_count)
+        .max(1)
+}
+
+fn image_pixel_count(image: &gltf::image::Data) -> usize {
+    (image.width as usize).saturating_mul(image.height as usize)
+}
+
+fn convert_gltf_image(
+    path: &Path,
+    image: gltf::image::Data,
+) -> Result<ConvertedGltfImage, ImportError> {
+    let width = image.width;
+    let height = image.height;
+    let pixels = image_to_rgba8(path, image)?;
+    Ok(ConvertedGltfImage {
+        width,
+        height,
+        pixels,
+    })
+}
+
 /// Adds one texture descriptor and returns its imported texture index.
 fn push_gltf_texture_descriptor(
     path: &Path,
     textures: &mut Vec<ImportedTexture>,
-    image: &gltf::image::Data,
+    width: u32,
+    height: u32,
     pixels: Vec<u8>,
     color_space: GltfImageColorSpace,
 ) -> Result<usize, ImportError> {
     let descriptor = match color_space {
-        GltfImageColorSpace::Srgb => {
-            TextureDescriptor::rgba8_srgb(image.width, image.height, pixels)
-        }
-        GltfImageColorSpace::Linear => {
-            TextureDescriptor::rgba8_linear(image.width, image.height, pixels)
-        }
+        GltfImageColorSpace::Srgb => TextureDescriptor::rgba8_srgb(width, height, pixels),
+        GltfImageColorSpace::Linear => TextureDescriptor::rgba8_linear(width, height, pixels),
     };
     let texture = descriptor
         .map(ImportedTexture::new)
@@ -1524,9 +2428,9 @@ fn mark_gltf_texture_usage<T>(
 }
 
 /// Expands common glTF image formats into RGBA8 while rejecting unsupported formats explicitly.
-fn image_to_rgba8(path: &Path, image: &gltf::image::Data) -> Result<Vec<u8>, ImportError> {
+fn image_to_rgba8(path: &Path, image: gltf::image::Data) -> Result<Vec<u8>, ImportError> {
     match image.format {
-        gltf::image::Format::R8G8B8A8 => Ok(image.pixels.clone()),
+        gltf::image::Format::R8G8B8A8 => Ok(image.pixels),
         gltf::image::Format::R8G8B8 => Ok(image
             .pixels
             .chunks_exact(3)
@@ -1556,130 +2460,6 @@ fn scene_bounds_from_meshes(meshes: &[ImportedMesh]) -> Option<SceneBounds> {
     let radius = mesh_radius(meshes, center)?;
 
     SceneBounds::new(center, radius)
-}
-
-/// Converts emissive mesh primitives into explicit local lights for loaded model assets.
-fn emissive_mesh_local_lights(
-    meshes: &[ImportedMesh],
-    materials: &[ImportedMaterial],
-) -> Vec<LocalLightPacket> {
-    const MIN_EMISSIVE_BRIGHTNESS: f32 = 0.02;
-    const EMISSIVE_LIGHT_COLOR_SCALE: f32 = 1.35;
-    const EMISSIVE_LIGHT_RADIUS_SCALE: f32 = 10.0;
-    const EMISSIVE_LIGHT_BRIGHTNESS_RANGE_SCALE: f32 = 6.0;
-    const EMISSIVE_LIGHT_MIN_RADIUS: f32 = 4.0;
-    const EMISSIVE_LIGHT_MAX_RADIUS: f32 = 192.0;
-    const EMISSIVE_SPOT_INNER_ANGLE: f32 = 1.05;
-    const EMISSIVE_SPOT_OUTER_ANGLE: f32 = 1.48;
-
-    meshes
-        .iter()
-        .zip(materials.iter())
-        .filter_map(|(mesh, material)| {
-            let emissive = material.emissive_factor();
-            let brightness = max3(emissive);
-            if brightness <= MIN_EMISSIVE_BRIGHTNESS {
-                return None;
-            }
-
-            let bounds = mesh_bounds(mesh)?;
-            let center = bounds.center();
-            let source_radius = bounds.radius();
-            let brightness_gain = brightness.sqrt();
-            let range = (source_radius * (EMISSIVE_LIGHT_RADIUS_SCALE + brightness_gain * 2.0)
-                + brightness_gain * EMISSIVE_LIGHT_BRIGHTNESS_RANGE_SCALE)
-                .clamp(EMISSIVE_LIGHT_MIN_RADIUS, EMISSIVE_LIGHT_MAX_RADIUS);
-            let color = [
-                emissive[0] * EMISSIVE_LIGHT_COLOR_SCALE,
-                emissive[1] * EMISSIVE_LIGHT_COLOR_SCALE,
-                emissive[2] * EMISSIVE_LIGHT_COLOR_SCALE,
-            ];
-
-            if let Some(direction) = mesh_emission_direction(mesh) {
-                let offset = (source_radius * 0.35).clamp(0.03, range * 0.08);
-                let position = [
-                    center[0] + direction[0] * offset,
-                    center[1] + direction[1] * offset,
-                    center[2] + direction[2] * offset,
-                ];
-                LocalLightPacket::spot(
-                    position,
-                    color,
-                    1.0,
-                    range,
-                    direction,
-                    EMISSIVE_SPOT_INNER_ANGLE,
-                    EMISSIVE_SPOT_OUTER_ANGLE,
-                )
-            } else {
-                LocalLightPacket::sphere(
-                    center,
-                    color,
-                    1.0,
-                    range,
-                    source_radius.clamp(0.05, range * 0.45),
-                )
-            }
-        })
-        .collect()
-}
-
-fn mesh_emission_direction(mesh: &ImportedMesh) -> Option<[f32; 3]> {
-    const MIN_COHERENCE: f32 = 0.25;
-
-    match mesh {
-        ImportedMesh::Plane => Some([0.0, 0.0, 1.0]),
-        ImportedMesh::Indexed(data) => {
-            let mut normal_sum = [0.0; 3];
-            let mut normal_count = 0usize;
-            for vertex in data.vertices() {
-                let normal = vertex.normal();
-                if !normal.iter().all(|value| value.is_finite()) {
-                    continue;
-                }
-                normal_sum = add3(normal_sum, normal);
-                normal_count += 1;
-            }
-            if normal_count == 0 {
-                return None;
-            }
-
-            let coherence = dot3(normal_sum, normal_sum).sqrt() / normal_count as f32;
-            (coherence >= MIN_COHERENCE).then(|| normalize_or(normal_sum, [0.0, 1.0, 0.0]))
-        }
-    }
-}
-
-fn mesh_bounds(mesh: &ImportedMesh) -> Option<SceneBounds> {
-    let positions = mesh_positions(mesh);
-    let mut min = [f32::INFINITY; 3];
-    let mut max = [f32::NEG_INFINITY; 3];
-    let mut found = false;
-    for position in positions {
-        if !position.iter().all(|value| value.is_finite()) {
-            continue;
-        }
-        for axis in 0..3 {
-            min[axis] = min[axis].min(position[axis]);
-            max[axis] = max[axis].max(position[axis]);
-        }
-        found = true;
-    }
-    if !found {
-        return None;
-    }
-
-    let center = [
-        (min[0] + max[0]) * 0.5,
-        (min[1] + max[1]) * 0.5,
-        (min[2] + max[2]) * 0.5,
-    ];
-    let radius = mesh_radius(std::slice::from_ref(mesh), center)?;
-    SceneBounds::new(center, radius)
-}
-
-fn max3(value: [f32; 3]) -> f32 {
-    value[0].max(value[1]).max(value[2])
 }
 
 /// Returns aggregate min/max bounds for imported mesh positions.
@@ -2389,6 +3169,49 @@ fn invalid_directive(path: &Path, line: usize, message: String) -> ImportError {
 mod tests {
     use super::*;
 
+    fn test_triangle(offset_x: f32) -> ImportedMesh {
+        ImportedMesh::Indexed(ImportedMeshData::new(
+            vec![
+                ImportedVertex::new(
+                    [offset_x, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0],
+                    [1.0, 0.0, 0.0, 1.0],
+                    [1.0; 4],
+                ),
+                ImportedVertex::new(
+                    [offset_x + 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0],
+                    [1.0, 0.0, 0.0, 1.0],
+                    [1.0; 4],
+                ),
+                ImportedVertex::new(
+                    [offset_x, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 1.0],
+                    [1.0, 0.0, 0.0, 1.0],
+                    [1.0; 4],
+                ),
+            ],
+            vec![0, 1, 2],
+        ))
+    }
+
+    fn alpha_test_vertex(id: usize, uv: [f32; 2], alpha: f32) -> ImportedVertex {
+        ImportedVertex::new(
+            [id as f32, id as f32 * 0.25, id as f32 * -0.5],
+            [0.1 + id as f32, 0.3, 1.0],
+            uv,
+            [0.4, 0.2 + id as f32, 0.8, -1.0],
+            [0.2, 0.4, 0.6, alpha],
+        )
+    }
+
+    fn split_test_textures(texture: ImportedTexture) -> GltfImportedTextures {
+        GltfImportedTextures::new(vec![texture], vec![Some(0)], vec![None])
+    }
+
     // Verifies that unsupported paths do not trigger hidden placeholder creation.
     #[test]
     fn import_rejects_unsupported_extension() {
@@ -2397,6 +3220,212 @@ mod tests {
         let result = import_asset(&path);
 
         assert!(matches!(result, Err(ImportError::UnsupportedFormat(_))));
+    }
+
+    // Nearby opaque primitives with the same complete material become one indexed batch.
+    #[test]
+    fn static_batch_merges_nearby_equal_materials_and_rebases_indices() {
+        let material = ImportedMaterial::opaque();
+        let (meshes, materials) = batch_static_gltf_primitives(
+            vec![test_triangle(0.0), test_triangle(1.0)],
+            vec![material.clone(), material],
+        );
+
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(materials.len(), 1);
+        let ImportedMesh::Indexed(data) = &meshes[0] else {
+            panic!("batched glTF geometry remains indexed");
+        };
+        assert_eq!(data.vertices().len(), 6);
+        assert_eq!(data.indices(), &[0, 1, 2, 3, 4, 5]);
+    }
+
+    // Spatial batching must preserve useful camera and shadow-cascade culling boundaries.
+    #[test]
+    fn static_batch_keeps_distant_primitives_separate() {
+        let material = ImportedMaterial::opaque();
+        let (meshes, _) = batch_static_gltf_primitives(
+            vec![test_triangle(0.0), test_triangle(100.0)],
+            vec![material.clone(), material],
+        );
+
+        assert_eq!(meshes.len(), 2);
+    }
+
+    // Alpha-blended triangles need per-primitive depth ordering and are never combined.
+    #[test]
+    fn static_batch_keeps_transparent_primitives_separate() {
+        let material = ImportedMaterial::new(MaterialAlphaMode::Transparent, 500, Vec::new());
+        let (meshes, _) = batch_static_gltf_primitives(
+            vec![test_triangle(0.0), test_triangle(0.25)],
+            vec![material.clone(), material],
+        );
+
+        assert_eq!(meshes.len(), 2);
+    }
+
+    #[test]
+    fn cutout_specialization_splits_opaque_and_drops_transparent_triangles() {
+        let mut pixels = Vec::with_capacity(8 * 8 * 4);
+        for _y in 0..8 {
+            for x in 0..8 {
+                pixels.extend_from_slice(&[255, 255, 255, if x < 4 { 255 } else { 0 }]);
+            }
+        }
+        let textures = split_test_textures(
+            ImportedTexture::rgba8_srgb(8, 8, pixels).expect("test texture is valid"),
+        );
+        let material = ImportedMaterial::with_pbr(
+            MaterialAlphaMode::Cutout,
+            500,
+            [0.8, 0.7, 0.6, 1.0],
+            250,
+            750,
+            [0.1, 0.2, 0.3],
+            900,
+            800,
+            true,
+            vec![ImportedMaterialTextureSlot::new(
+                MaterialTextureSlot::BaseColor,
+                0,
+            )],
+        );
+        let vertices = vec![
+            alpha_test_vertex(0, [0.1875, 0.1875], 1.0),
+            alpha_test_vertex(1, [0.3125, 0.1875], 1.0),
+            alpha_test_vertex(2, [0.1875, 0.3125], 1.0),
+            alpha_test_vertex(3, [0.6875, 0.1875], 1.0),
+            alpha_test_vertex(4, [0.8125, 0.1875], 1.0),
+            alpha_test_vertex(5, [0.6875, 0.3125], 1.0),
+            alpha_test_vertex(6, [0.4375, 0.1875], 1.0),
+            alpha_test_vertex(7, [0.5625, 0.1875], 1.0),
+            alpha_test_vertex(8, [0.4375, 0.3125], 1.0),
+        ];
+        let original = vertices.clone();
+        let data = ImportedMeshData::new(vertices, (0_u32..9).collect());
+        let mut meshes = Vec::new();
+        let mut materials = Vec::new();
+
+        push_gltf_primitive_by_alpha_coverage(
+            data,
+            material.clone(),
+            &textures,
+            &mut meshes,
+            &mut materials,
+        );
+
+        assert_eq!(meshes.len(), 2);
+        assert_eq!(materials.len(), 2);
+        assert_eq!(materials[0].alpha_mode(), MaterialAlphaMode::Opaque);
+        assert_eq!(materials[1].alpha_mode(), MaterialAlphaMode::Cutout);
+        assert_eq!(
+            materials[0].base_color_factor(),
+            material.base_color_factor()
+        );
+        assert_eq!(materials[0].texture_slots(), material.texture_slots());
+        assert_eq!(materials[0].double_sided(), material.double_sided());
+        let ImportedMesh::Indexed(opaque) = &meshes[0] else {
+            panic!("opaque specialization remains indexed");
+        };
+        let ImportedMesh::Indexed(cutout) = &meshes[1] else {
+            panic!("mixed specialization remains indexed");
+        };
+        assert_eq!(opaque.vertices(), &original[0..3]);
+        assert_eq!(opaque.indices(), &[0, 1, 2]);
+        assert_eq!(cutout.vertices(), &original[6..9]);
+        assert_eq!(cutout.indices(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn cutout_specialization_fails_closed_for_vertex_alpha_and_uv_uncertainty() {
+        let texture =
+            ImportedTexture::rgba8_srgb(8, 8, vec![255; 8 * 8 * 4]).expect("test texture is valid");
+        let textures = split_test_textures(texture);
+        let material = ImportedMaterial::new(
+            MaterialAlphaMode::Cutout,
+            500,
+            vec![ImportedMaterialTextureSlot::new(
+                MaterialTextureSlot::BaseColor,
+                0,
+            )],
+        );
+        let vertices = vec![
+            alpha_test_vertex(0, [0.2, 0.2], 1.0),
+            alpha_test_vertex(1, [0.3, 0.2], 0.75),
+            alpha_test_vertex(2, [0.2, 0.3], 1.0),
+        ];
+        let data = ImportedMeshData::new(vertices.clone(), vec![0, 1, 2]);
+        let mut meshes = Vec::new();
+        let mut materials = Vec::new();
+
+        push_gltf_primitive_by_alpha_coverage(
+            data,
+            material,
+            &textures,
+            &mut meshes,
+            &mut materials,
+        );
+
+        assert_eq!(materials[0].alpha_mode(), MaterialAlphaMode::Cutout);
+        let ImportedMesh::Indexed(data) = &meshes[0] else {
+            panic!("fail-closed primitive remains indexed");
+        };
+        assert_eq!(data.vertices(), vertices);
+
+        let map = AlphaVisibilityMap::new(&textures.textures[0], 1.0, 500)
+            .expect("sRGB alpha map is supported");
+        assert_eq!(
+            map.triangle_coverage([[f32::NAN, 0.2], [0.3, 0.2], [0.2, 0.3]]),
+            TriangleAlphaCoverage::Mixed
+        );
+        assert_eq!(
+            map.triangle_coverage([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]]),
+            TriangleAlphaCoverage::Mixed
+        );
+    }
+
+    #[test]
+    fn alpha_visibility_queries_single_texels_and_repeat_seams_without_underflow() {
+        let mut pixels = Vec::with_capacity(4 * 2 * 4);
+        for _y in 0..2 {
+            for alpha in [255, 0, 0, 255] {
+                pixels.extend_from_slice(&[255, 255, 255, alpha]);
+            }
+        }
+        let texture = ImportedTexture::rgba8_srgb(4, 2, pixels).expect("test texture is valid");
+        let map = AlphaVisibilityMap::new(&texture, 1.0, 500).expect("sRGB alpha map is supported");
+
+        assert_eq!(map.rectangle_sum(0, 0, 0, 0), 2);
+        assert_eq!(map.rectangle_sum(1, 1, 0, 0), 0);
+        assert_eq!(map.rectangle_sum(0, 3, 0, 1), 8);
+        assert_eq!(
+            map.coverage_for_ranges((3, 0), (0, 0)),
+            TriangleAlphaCoverage::Opaque
+        );
+        assert_eq!(
+            map.coverage_for_ranges((0, 1), (0, 0)),
+            TriangleAlphaCoverage::Mixed
+        );
+        assert_eq!(
+            map.coverage_for_ranges((1, 2), (0, 1)),
+            TriangleAlphaCoverage::Transparent
+        );
+        assert_eq!(filtered_sample_range(0.0, 0.1, 0), None);
+        assert_eq!(filtered_sample_range(0.0, 1.0, 4), None);
+    }
+
+    #[test]
+    fn compact_subset_preserves_winding_order_and_all_vertex_attributes() {
+        let vertices = (0..4)
+            .map(|id| alpha_test_vertex(id, [id as f32 * 0.1, 0.25], 1.0))
+            .collect::<Vec<_>>();
+        let compact = compact_indexed_subset(&vertices, &[2, 0, 1, 2, 1, 3]);
+
+        assert_eq!(
+            compact.vertices(),
+            &[vertices[2], vertices[0], vertices[1], vertices[3]]
+        );
+        assert_eq!(compact.indices(), &[0, 1, 2, 0, 2, 3]);
     }
 
     // Verifies that Stage 6 material slots and alpha mode survive import.
@@ -2435,9 +3464,62 @@ mod tests {
         assert_eq!(texture.pixels().len(), 16);
     }
 
-    // Verifies that emissive model geometry becomes an explicit local light on load.
     #[test]
-    fn emissive_meshes_create_local_lights() {
+    fn parallel_image_conversion_preserves_source_order_and_unused_slots() {
+        let rgba = |value| gltf::image::Data {
+            pixels: vec![value; 1024 * 1024 * 4],
+            format: gltf::image::Format::R8G8B8A8,
+            width: 1024,
+            height: 1024,
+        };
+        let usages = [
+            GltfImageUsage {
+                srgb: true,
+                linear: false,
+            },
+            GltfImageUsage::default(),
+            GltfImageUsage {
+                srgb: false,
+                linear: true,
+            },
+        ];
+
+        let converted = convert_gltf_images(
+            Path::new("parallel-images.glb"),
+            vec![rgba(17), rgba(99), rgba(231)],
+            &usages,
+        )
+        .expect("independent RGBA8 images should convert");
+
+        assert_eq!(converted.len(), 3);
+        assert_eq!(converted[0].as_ref().unwrap().pixels[0], 17);
+        assert!(converted[1].is_none());
+        assert_eq!(converted[2].as_ref().unwrap().pixels[0], 231);
+    }
+
+    #[test]
+    fn gltf_image_decode_workers_are_bounded_and_skip_small_inputs() {
+        assert_eq!(gltf_image_decode_worker_count(0, usize::MAX), 1);
+        assert_eq!(gltf_image_decode_worker_count(1, usize::MAX), 1);
+        assert_eq!(
+            gltf_image_decode_worker_count(16, PARALLEL_IMAGE_DECODE_MIN_BYTES - 1),
+            1
+        );
+
+        let workers = gltf_image_decode_worker_count(16, PARALLEL_IMAGE_DECODE_MIN_BYTES);
+        assert!((1..=MAX_GLTF_IMAGE_DECODE_WORKERS).contains(&workers));
+        assert!(
+            workers
+                <= thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1)
+        );
+    }
+
+    // Emissive material is self-illumination only; it must not introduce an implicit per-pixel
+    // local-light loop. Authored punctual lights remain in the explicit `local_lights` input.
+    #[test]
+    fn emissive_meshes_do_not_create_implicit_local_lights() {
         let material = ImportedMaterial::with_pbr(
             MaterialAlphaMode::Opaque,
             500,
@@ -2455,28 +3537,6 @@ mod tests {
             "emissive.r1scene".into(),
             vec![ImportedMesh::Plane],
             vec![material],
-            Vec::new(),
-            Vec::new(),
-        );
-
-        assert_eq!(scene.local_lights().len(), 1);
-        let light = scene.local_lights()[0];
-        assert_eq!(light.kind, crate::protocol::LocalLightKind::Spot);
-        assert_eq!(light.color, [5.4, 2.7, 1.35]);
-        assert_eq!(light.intensity, 1.0);
-        assert_eq!(light.direction, [0.0, 0.0, 1.0]);
-        assert!(light.position[2] > 0.0);
-        assert!(light.range > 16.0);
-        assert!(light.casts_shadow);
-    }
-
-    // Verifies that non-emissive geometry does not inflate the local light list.
-    #[test]
-    fn non_emissive_meshes_do_not_create_local_lights() {
-        let scene = ImportedScene::from_parts(
-            "plain.r1scene".into(),
-            vec![ImportedMesh::Plane],
-            vec![ImportedMaterial::opaque()],
             Vec::new(),
             Vec::new(),
         );

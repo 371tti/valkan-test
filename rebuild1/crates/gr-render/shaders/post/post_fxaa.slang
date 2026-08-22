@@ -21,7 +21,7 @@ float normal_edge_from_depth(
         return 0.0;
     }
 
-    float4 sample_meta = sample_texture(scene_normal_roughness, sample_uv);
+    float4 sample_meta = opaque_metadata_at(sample_uv);
     float3 sample_normal = oct_decode(sample_meta.xy);
 
     return saturate((1.0 - dot(center_normal, sample_normal)) * 2.4);
@@ -185,4 +185,3 @@ float3 high_quality_fxaa_scene_color(
 
     return lerp(center, resolved, blend);
 }
-

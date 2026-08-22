@@ -33,7 +33,10 @@ pub(super) struct MaterialDrawInfo {
     pub(super) descriptor_set: vk::DescriptorSet,
     pub(super) uses_any_texture: bool,
     pub(super) uses_base_color_texture: bool,
+    pub(super) uses_shadow_alpha_texture: bool,
+    pub(super) uses_shadow_alpha_test: bool,
     pub(super) double_sided: bool,
+    pub(super) fully_opaque: bool,
     pub(super) transparent: bool,
     pub(super) casts_opaque_shadow: bool,
     pub(super) casts_translucent_shadow: bool,
@@ -152,13 +155,6 @@ impl VulkanMaterialStore {
         self.materials.get(&material).map(VulkanMaterial::draw_info)
     }
 
-    /// Returns the imported emissive RGB factor for CPU-side emissive light extraction.
-    pub(super) fn emissive_factor(&self, material: MaterialHandle) -> Option<[f32; 3]> {
-        self.materials
-            .get(&material)
-            .map(VulkanMaterial::emissive_factor)
-    }
-
     /// Destroys backend material and texture resources whose protocol handles have retired.
     pub(super) fn destroy_retired(&mut self, device: &Device, retired: &[AssetHandle]) {
         for asset in retired {
@@ -248,7 +244,6 @@ struct VulkanMaterial {
     descriptor_set: vk::DescriptorSet,
     texture_flags: MaterialTextureFlags,
     alpha_mode: MaterialAlphaMode,
-    emissive_factor: [f32; 3],
     double_sided: bool,
 }
 
@@ -291,7 +286,6 @@ impl VulkanMaterial {
             descriptor_set,
             texture_flags,
             alpha_mode: descriptor.alpha_mode(),
-            emissive_factor: descriptor.emissive_factor(),
             double_sided: descriptor.double_sided(),
         })
     }
@@ -299,11 +293,16 @@ impl VulkanMaterial {
     /// Packs material state needed by per-frame draw list preparation.
     fn draw_info(&self) -> MaterialDrawInfo {
         let transparent = matches!(self.alpha_mode, MaterialAlphaMode::Transparent);
+        let uses_base_color_texture = self.texture_flags.has(MaterialTextureSlot::BaseColor);
         MaterialDrawInfo {
             descriptor_set: self.descriptor_set,
             uses_any_texture: self.texture_flags.any(),
-            uses_base_color_texture: self.texture_flags.has(MaterialTextureSlot::BaseColor),
+            uses_base_color_texture,
+            uses_shadow_alpha_texture: uses_base_color_texture
+                && matches!(self.alpha_mode, MaterialAlphaMode::Cutout),
+            uses_shadow_alpha_test: matches!(self.alpha_mode, MaterialAlphaMode::Cutout),
             double_sided: self.double_sided,
+            fully_opaque: matches!(self.alpha_mode, MaterialAlphaMode::Opaque),
             transparent,
             casts_opaque_shadow: matches!(
                 self.alpha_mode,
@@ -311,11 +310,6 @@ impl VulkanMaterial {
             ),
             casts_translucent_shadow: transparent,
         }
-    }
-
-    /// Returns the imported emissive RGB factor.
-    fn emissive_factor(&self) -> [f32; 3] {
-        self.emissive_factor
     }
 
     /// Destroys the material parameter buffer after GPU use has retired.

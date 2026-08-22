@@ -1,25 +1,26 @@
-use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use ash::{Device, khr, vk};
 
 use crate::{
     math::{dot3, normalize_or, sub3},
     protocol::{
-        CameraSnapshot, FrameSnapshot, LocalLightKind, LocalLightPacket, RenderItemPacket,
-        RenderQualitySettings,
+        CameraSnapshot, FrameSnapshot, LightPacket, LocalLightPacket, RenderItemPacket,
+        RenderQualitySettings, SceneBounds,
     },
     renderer::graph::{
         BarrierLocation, FrameGraphPlan, GOD_RAY_MASK_PASS, GOD_RAY_PREFILTER_PASS,
         GOD_RAY_RADIAL_PASS, GOD_RAY_TEMPORAL_PASS, GraphPass, PassOutput, ResourceBarrier,
-        ResourceState, SHADOW_CASCADE_COUNT, bloom_downsample_pass_index,
-        bloom_upsample_pass_index, shadow_blur_h_pass_index, shadow_blur_v_pass_index,
-        shadow_pass_index, translucent_shadow_pass_index,
+        ResourceState, SHADOW_CASCADE_COUNT, TAA_RESOLVE_PASS, bloom_downsample_pass_index,
+        bloom_upsample_pass_index, shadow_pass_index, translucent_shadow_pass_index,
     },
+    renderer::visibility::MeshLodLevel,
 };
 
 use super::{
     VulkanDevice, VulkanError,
     god_rays::{GodRayPushConstants, frame_god_ray_sources},
+    gpu_timing::GpuFrameTimer,
     material::{MaterialDrawInfo, VulkanMaterialStore},
     mesh::{
         EmissiveLightUniforms, LOCAL_SHADOW_FACE_COUNT, MAX_LOCAL_LIGHTS, MeshDrawOptions,
@@ -29,8 +30,9 @@ use super::{
     readback::{FramebufferReadbackCopy, FramebufferReadbackSample, record_image_to_buffer},
     shadow::{
         LocalShadowFrameData, LocalShadowLightData, has_local_shadow_light,
-        local_shadow_frame_data, mesh_frame_uniform_for_frame, shadow_cascade_cull,
-        shadow_frame_data, shadow_frame_signature,
+        local_shadow_face_contains_bounds_cached, local_shadow_face_culls, local_shadow_frame_data,
+        local_shadow_frame_signature, mesh_frame_uniform_for_light, shadow_cascade_cull,
+        stable_csm_frame_data_for_resolution,
     },
     swapchain::{ShadowResources, VulkanSwapchain},
 };
@@ -43,7 +45,11 @@ pub(super) struct VulkanFrames {
     command_pool: vk::CommandPool,
     slots: Vec<VulkanFrameSlot>,
     image_render_finished: Vec<vk::Semaphore>,
+    gpu_timer: Option<GpuFrameTimer>,
     cursor: usize,
+    next_submission_serial: u64,
+    last_submitted_serial: u64,
+    completed_submission_serial: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +58,8 @@ struct VulkanFrameSlot {
     image_available: vk::Semaphore,
     in_flight: vk::Fence,
     submitted: bool,
+    submitted_frame_id: Option<u64>,
+    submitted_serial: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -62,6 +70,7 @@ pub(super) struct ActiveFrame {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
+    submission_serial: u64,
 }
 
 pub(super) enum FrameAcquire {
@@ -78,7 +87,12 @@ pub(super) enum FramePresentStatus {
 
 impl VulkanFrames {
     /// Creates reusable command buffers and sync objects for bounded frames in flight.
-    pub(super) fn create(device: &Device, queue_family_index: u32) -> Result<Self, VulkanError> {
+    pub(super) fn create(
+        device: &Device,
+        queue_family_index: u32,
+        timestamp_period_ns: f32,
+        timestamp_valid_bits: u32,
+    ) -> Result<Self, VulkanError> {
         let command_pool = create_command_pool(device, queue_family_index)?;
         let command_buffers =
             match allocate_command_buffers(device, command_pool, MAX_FRAMES_IN_FLIGHT as u32) {
@@ -96,6 +110,13 @@ impl VulkanFrames {
             }
         };
 
+        let gpu_timer = GpuFrameTimer::create_if_enabled(
+            device,
+            slots.len(),
+            timestamp_period_ns,
+            timestamp_valid_bits,
+        );
+
         tracing::info!(
             frames_in_flight = slots.len(),
             queue_family_index,
@@ -106,7 +127,11 @@ impl VulkanFrames {
             command_pool,
             slots,
             image_render_finished: Vec::new(),
+            gpu_timer,
             cursor: 0,
+            next_submission_serial: 1,
+            last_submitted_serial: 0,
+            completed_submission_serial: 0,
         })
     }
 
@@ -126,6 +151,16 @@ impl VulkanFrames {
         self.slots.len()
     }
 
+    /// Returns the newest frame serial successfully queued to the graphics queue.
+    pub(super) fn last_submitted_serial(&self) -> u64 {
+        self.last_submitted_serial
+    }
+
+    /// Returns the newest serial proven complete by a reused frame-slot fence.
+    pub(super) fn completed_submission_serial(&self) -> u64 {
+        self.completed_submission_serial
+    }
+
     /// Acquires the next swapchain image and returns the current reusable frame slot.
     fn acquire(
         &mut self,
@@ -139,7 +174,15 @@ impl VulkanFrames {
         let slot = self.slots[slot_index];
         if slot.submitted {
             wait_for_fences(device, &[slot.in_flight])?;
+            if let Some(gpu_timer) = &mut self.gpu_timer {
+                gpu_timer.trace_completed(device, slot_index, slot.submitted_frame_id);
+            }
+            if let Some(serial) = slot.submitted_serial {
+                self.completed_submission_serial = self.completed_submission_serial.max(serial);
+            }
             self.slots[slot_index].submitted = false;
+            self.slots[slot_index].submitted_frame_id = None;
+            self.slots[slot_index].submitted_serial = None;
         }
 
         let image =
@@ -158,6 +201,8 @@ impl VulkanFrames {
 
         reset_command_buffer(device, slot.command_buffer)?;
         let render_finished = self.render_finished_for_image(image)?;
+        let submission_serial = self.next_submission_serial;
+        self.next_submission_serial = self.next_submission_serial.saturating_add(1);
 
         Ok(FrameAcquire::Ready(ActiveFrame {
             slot_index,
@@ -166,6 +211,7 @@ impl VulkanFrames {
             image_available: slot.image_available,
             render_finished,
             in_flight: slot.in_flight,
+            submission_serial,
         }))
     }
 
@@ -175,8 +221,16 @@ impl VulkanFrames {
     }
 
     /// Marks the frame slot as queued so future reuse waits for its fence.
-    fn mark_submitted(&mut self, frame: ActiveFrame) {
+    fn mark_submitted(&mut self, frame: ActiveFrame, frame_id: u64) {
         self.slots[frame.slot_index].submitted = true;
+        self.slots[frame.slot_index].submitted_frame_id = Some(frame_id);
+        self.slots[frame.slot_index].submitted_serial = Some(frame.submission_serial);
+        self.last_submitted_serial = self.last_submitted_serial.max(frame.submission_serial);
+    }
+
+    /// Returns the optional timestamp recorder used while this frame's command buffer is open.
+    fn gpu_timer_mut(&mut self) -> Option<&mut GpuFrameTimer> {
+        self.gpu_timer.as_mut()
     }
 
     /// Rebuilds per-swapchain-image render completion semaphores when image count changes.
@@ -219,6 +273,14 @@ impl VulkanFrames {
             "destroying Vulkan frame resources"
         );
 
+        if let Some(mut gpu_timer) = self.gpu_timer {
+            for (slot_index, slot) in self.slots.iter().enumerate() {
+                if slot.submitted {
+                    gpu_timer.trace_completed(device, slot_index, slot.submitted_frame_id);
+                }
+            }
+            gpu_timer.destroy(device);
+        }
         destroy_frame_slots(device, self.slots);
         destroy_semaphores(device, self.image_render_finished);
         destroy_command_pool(device, self.command_pool);
@@ -234,43 +296,14 @@ impl VulkanDevice {
     ) -> Result<FramePresentStatus, VulkanError> {
         let features = frame_feature_flags(&self.materials, &snapshot.render_items);
         let camera = active_camera(snapshot);
-        let scene_metadata_required = scene_material_metadata_required(self.quality);
-        let emissive_lights =
-            emissive_light_uniforms(&self.materials, &self.meshes, snapshot, camera);
+        let emissive_lights = local_light_uniforms(snapshot, camera);
+        // TAA reprojection requires a fresh normal target every frame.
+        let use_full_scene_pass = true;
         let wants_local_shadow =
             features.has_opaque_shadow_casters && has_local_shadow_light(&emissive_lights);
         if features.has_shadow_casters || wants_local_shadow {
             self.ensure_shadow_resources()?;
         }
-        let shadow_signature = features.has_shadow_casters.then(|| {
-            shadow_frame_signature(
-                camera,
-                &snapshot.render_items,
-                features.has_translucent_shadow_casters,
-            )
-        });
-        let refresh_shadows = self.shadow_cache.needs_refresh(shadow_signature);
-        let cached_shadow_data = self.shadow_cache.frame_data();
-        let current_shadow_data =
-            if refresh_shadows || (features.has_shadow_casters && cached_shadow_data.is_none()) {
-                features
-                    .has_shadow_casters
-                    .then(|| shadow_frame_data(camera, swapchain.extent_2d()))
-            } else {
-                None
-            };
-        let shadow_data = if refresh_shadows {
-            current_shadow_data
-        } else {
-            cached_shadow_data.or(current_shadow_data)
-        };
-        let local_shadow_data = if wants_local_shadow {
-            self.shadows.as_ref().and_then(|shadows| {
-                local_shadow_frame_data(&emissive_lights, shadows.local_extent_2d())
-            })
-        } else {
-            None
-        };
         let frame = match self
             .frames
             .acquire(&self.device, &self.swapchain_loader, swapchain)?
@@ -278,107 +311,179 @@ impl VulkanDevice {
             FrameAcquire::Ready(frame) => frame,
             FrameAcquire::SwapchainOutOfDate => return Ok(FramePresentStatus::SwapchainOutOfDate),
         };
-
         tracing::trace!(
             frame_slot = frame.slot_index,
             image_index = frame.image_index,
             "building swapchain render graph"
         );
+        let taa_frame = swapchain.prepare_taa_frame(
+            &self.device,
+            frame.slot_index,
+            snapshot,
+            camera,
+            self.quality,
+            use_full_scene_pass,
+        )?;
+        let volumetric_god_rays_active =
+            self.quality.bloom().volumetric_god_rays() || self.quality.fog().enabled();
+        if volumetric_god_rays_active && taa_frame.reset_reprojection_history {
+            // Volumetric God Rays and Fog are accumulated on the low-resolution screen grid. A
+            // camera cut, scene discontinuity, or TAA reset must not retain the old ray field.
+            swapchain.invalidate_god_ray_history();
+        }
+        let directional_light = frame_global_light(snapshot);
+        let stable_quality = self.quality.stable_csm_pcss();
+        let refresh_shadows = features.has_shadow_casters;
+        tracing::trace!(
+            refresh_shadows,
+            blocker_search_samples = stable_quality.blocker_search_samples(),
+            filter_samples = stable_quality.filter_samples(),
+            "selected stable CSM + PCSS directional shadow frame"
+        );
+        let shadow_data = features.has_shadow_casters.then(|| {
+            stable_csm_frame_data_for_resolution(
+                camera,
+                swapchain.extent_2d(),
+                directional_light,
+                self.shadow_map_resolution(),
+            )
+        });
+        let local_shadow_signature = wants_local_shadow
+            .then(|| local_shadow_frame_signature(&snapshot.render_items, &emissive_lights));
+        let refresh_local_shadows = self
+            .shadow_cache
+            .local_needs_refresh(local_shadow_signature);
+        let cached_local_shadow_data = self.shadow_cache.local_frame_data();
+        let current_local_shadow_data = if refresh_local_shadows {
+            self.shadows.as_ref().and_then(|shadows| {
+                local_shadow_frame_data(&emissive_lights, shadows.local_extent_2d())
+            })
+        } else {
+            None
+        };
+        let local_shadow_data = if refresh_local_shadows {
+            current_local_shadow_data
+        } else {
+            cached_local_shadow_data.or(current_local_shadow_data)
+        };
+        let local_shadow_render_data = refresh_local_shadows.then_some(local_shadow_data).flatten();
         let readback = self
             .readback
             .prepare_frame(&self.device, frame.image_index)?;
         let shadows = self.shadows.as_ref();
         let initial_states = swapchain.graph_initial_states(frame.image_index, shadows)?;
-        let directional_light_intensity = frame_light_intensity(snapshot);
+        let draw_lists = FrameDrawLists::new(
+            &self.materials,
+            &self.meshes,
+            snapshot,
+            swapchain.extent_2d(),
+            features,
+            refresh_shadows,
+            shadow_data,
+            local_shadow_render_data,
+        );
+        let translucent_shadow_cascades = if features.has_translucent_shadow_casters {
+            draw_lists.translucent_shadow_cascades()
+        } else {
+            [false; SHADOW_CASCADE_COUNT]
+        };
+        tracing::trace!(
+            translucent_shadow_cascades = ?translucent_shadow_cascades,
+            "selected cascade-local translucent shadow work"
+        );
         let bloom_enabled = self.quality.bloom().intensity() > 0.0;
         let god_ray_sources = frame_god_ray_sources(
             camera,
             swapchain.god_ray_extent_2d(),
             self.quality,
-            directional_light_intensity,
+            directional_light,
             emissive_lights,
         );
-        let god_rays_enabled = god_ray_sources.iter().any(|source| source.source[3] > 0.0);
+        let volumetric_god_rays = volumetric_god_rays_active;
+        // The legacy path is source-gated, while the volumetric path represents the directional
+        // sun field and must run even when the source projects outside the camera frustum.
+        let god_rays_enabled =
+            volumetric_god_rays || god_ray_sources.iter().any(|source| source.source[3] > 0.0);
         let god_ray_history_write_index = swapchain.god_ray_history_write_index();
-        let graph = if refresh_shadows {
-            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
+        let graph =
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa_mode(
                 DEFAULT_CLEAR_COLOR,
                 initial_states,
                 readback.copy.is_some(),
                 features.has_shadow_casters,
-                features.has_translucent_shadow_casters,
+                translucent_shadow_cascades,
+                refresh_shadows,
+                use_full_scene_pass,
+                bloom_enabled,
+                god_rays_enabled,
+                god_ray_history_write_index,
                 true,
-                scene_metadata_required,
-                bloom_enabled,
-                god_rays_enabled,
-                god_ray_history_write_index,
+                taa_frame.write_history_index,
+                volumetric_god_rays,
             )
-        } else {
-            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
-                DEFAULT_CLEAR_COLOR,
-                initial_states,
-                readback.copy.is_some(),
-                features.has_shadow_casters,
-                features.has_translucent_shadow_casters,
-                false,
-                scene_metadata_required,
-                bloom_enabled,
-                god_rays_enabled,
-                god_ray_history_write_index,
-            )
-        }
-        .map_err(|error| VulkanError::GraphCompile(error.to_string()))?;
+            .map_err(|error| VulkanError::GraphCompile(error.to_string()))?;
         trace_compiled_graph("standard_frame_executor", &graph);
 
-        self.meshes.write_frame_uniform(
-            &self.device,
-            frame.slot_index,
-            mesh_frame_uniform_for_frame(
-                camera,
-                directional_light_intensity,
-                self.quality,
-                swapchain.extent_2d(),
-                features.has_shadow_casters,
-                features.has_translucent_shadow_casters,
-                shadow_data,
-                local_shadow_data,
-                emissive_lights,
-            ),
-        )?;
+        let mut mesh_frame_uniform = mesh_frame_uniform_for_light(
+            camera,
+            directional_light,
+            swapchain.extent_2d(),
+            features.has_shadow_casters,
+            translucent_shadow_cascades,
+            shadow_data,
+            stable_quality,
+            local_shadow_data,
+            emissive_lights,
+            snapshot.debug_draw.view_mode,
+        );
+        mesh_frame_uniform.view_proj = taa_frame.jittered_view_projection;
+        self.meshes
+            .write_frame_uniform(&self.device, frame.slot_index, mesh_frame_uniform)?;
         let scene_pass_resources = shadows.map_or_else(
             || self.shadow_fallback.mesh_pass_resources(),
             ShadowResources::mesh_pass_resources,
         );
+        let directional_shadow_view = scene_pass_resources.directional_shadow_view();
+        if swapchain.god_ray_shadow_view() != directional_shadow_view {
+            // Descriptor updates are not allowed while an older command buffer may still be
+            // reading the set. This transition happens only when lazy CSM resources are created
+            // or resized, so the one-time device wait keeps all in-flight frames safe.
+            self.wait_idle()?;
+            swapchain.update_god_ray_shadow_view(&self.device, directional_shadow_view);
+        }
+        let gpu_timer = self.frames.gpu_timer_mut();
         record_graph_command_buffer(
             &self.device,
+            gpu_timer,
             frame,
             swapchain,
             shadows,
             scene_pass_resources,
             &graph,
-            &self.materials,
-            &self.meshes,
+            &mut self.meshes,
             snapshot,
+            draw_lists,
             readback.copy,
             features,
             self.quality,
+            use_full_scene_pass,
             emissive_lights,
-            local_shadow_data,
+            local_shadow_render_data,
         )?;
         submit_frame(&self.device, self.graphics_queue, frame)?;
         swapchain.apply_graph_final_states(frame.image_index, &graph)?;
         if let Some(shadows) = self.shadows.as_mut() {
             shadows.apply_graph_final_states(&graph);
         }
-        if refresh_shadows {
+        if refresh_local_shadows {
             self.shadow_cache
-                .mark_refreshed(shadow_signature, current_shadow_data);
+                .mark_local_refreshed(local_shadow_signature, current_local_shadow_data);
         }
         if readback.copy.is_some() {
             self.readback
                 .mark_copy_recorded(frame.image_index, snapshot.frame_id);
         }
-        self.frames.mark_submitted(frame);
+        self.frames.mark_submitted(frame, snapshot.frame_id.raw());
         let status = match present_frame(
             &self.swapchain_loader,
             self.graphics_queue,
@@ -412,8 +517,13 @@ impl VulkanDevice {
         }
 
         self.shadows = Some(self.create_shadow_resources()?);
-        self.shadow_cache.invalidate();
+        self.invalidate_shadow_state();
         Ok(())
+    }
+
+    /// Invalidates cached local-light shadow state after the fixed shadow resources are recreated.
+    pub(super) fn invalidate_shadow_state(&mut self) {
+        self.shadow_cache.invalidate();
     }
 }
 
@@ -490,6 +600,8 @@ fn create_frame_slot(
         image_available,
         in_flight,
         submitted: false,
+        submitted_frame_id: None,
+        submitted_serial: None,
     })
 }
 
@@ -554,17 +666,19 @@ fn acquire_swapchain_image(
 /// Records the current graph plan into one frame command buffer.
 fn record_graph_command_buffer(
     device: &Device,
+    mut gpu_timer: Option<&mut GpuFrameTimer>,
     frame: ActiveFrame,
     swapchain: &VulkanSwapchain,
     shadows: Option<&ShadowResources>,
     scene_pass_resources: &MeshPassResources,
     graph: &FrameGraphPlan,
-    materials: &VulkanMaterialStore,
-    meshes: &VulkanMeshStore,
+    meshes: &mut VulkanMeshStore,
     snapshot: &FrameSnapshot,
+    draw_lists: FrameDrawLists<'_>,
     readback: Option<FramebufferReadbackCopy>,
     features: FrameFeatureFlags,
     quality: RenderQualitySettings,
+    use_full_scene_pass: bool,
     emissive_lights: EmissiveLightUniforms,
     local_shadow_data: Option<LocalShadowFrameData>,
 ) -> Result<(), VulkanError> {
@@ -580,20 +694,15 @@ fn record_graph_command_buffer(
     // Safety: the command buffer belongs to the current frame slot and is reset before recording.
     unsafe {
         device.begin_command_buffer(frame.command_buffer, &begin_info)?;
-        let record_shadow_draws = graph.passes().iter().any(|pass| {
-            shadow_pass_index(pass.name()).is_some()
-                || translucent_shadow_pass_index(pass.name()).is_some()
-        }) || local_shadow_data.is_some();
+        if let Some(gpu_timer) = gpu_timer.as_deref_mut() {
+            gpu_timer.record_start(device, frame.command_buffer, frame.slot_index);
+        }
         let mut state = FrameRecordState::new(
             features,
             quality,
+            use_full_scene_pass,
             emissive_lights,
-            materials,
-            meshes,
-            snapshot,
-            swapchain.extent_2d(),
-            record_shadow_draws,
-            local_shadow_data,
+            draw_lists,
         );
         if let (Some(shadows), Some(local_shadow)) = (shadows, local_shadow_data) {
             record_local_shadow_passes(
@@ -604,6 +713,14 @@ fn record_graph_command_buffer(
                 &state.draw_lists.local_shadow,
                 local_shadow,
             )?;
+            if let Some(gpu_timer) = gpu_timer.as_deref_mut() {
+                gpu_timer.record_checkpoint(
+                    device,
+                    frame.command_buffer,
+                    frame.slot_index,
+                    "local_shadow",
+                );
+            }
         }
         for pass in graph.passes() {
             record_barriers_for_location(
@@ -627,6 +744,14 @@ fn record_graph_command_buffer(
                 readback,
                 &mut state,
             )?;
+            if let Some(gpu_timer) = gpu_timer.as_deref_mut() {
+                gpu_timer.record_checkpoint(
+                    device,
+                    frame.command_buffer,
+                    frame.slot_index,
+                    pass.name(),
+                );
+            }
         }
         record_barriers_for_location(
             device,
@@ -637,6 +762,9 @@ fn record_graph_command_buffer(
             graph,
             BarrierLocation::AfterGraph,
         )?;
+        if let Some(gpu_timer) = gpu_timer.as_deref_mut() {
+            gpu_timer.record_end(device, frame.command_buffer, frame.slot_index);
+        }
         device.end_command_buffer(frame.command_buffer)?;
     }
 
@@ -654,6 +782,7 @@ struct FrameFeatureFlags {
 struct FrameRecordState<'a> {
     features: FrameFeatureFlags,
     quality: RenderQualitySettings,
+    use_full_scene_pass: bool,
     emissive_lights: EmissiveLightUniforms,
     draw_lists: FrameDrawLists<'a>,
 }
@@ -663,27 +792,16 @@ impl<'a> FrameRecordState<'a> {
     fn new(
         features: FrameFeatureFlags,
         quality: RenderQualitySettings,
+        use_full_scene_pass: bool,
         emissive_lights: EmissiveLightUniforms,
-        materials: &VulkanMaterialStore,
-        meshes: &VulkanMeshStore,
-        snapshot: &'a FrameSnapshot,
-        extent: vk::Extent2D,
-        record_shadow_draws: bool,
-        local_shadow_data: Option<LocalShadowFrameData>,
+        draw_lists: FrameDrawLists<'a>,
     ) -> Self {
         Self {
             features,
             quality,
+            use_full_scene_pass,
             emissive_lights,
-            draw_lists: FrameDrawLists::new(
-                materials,
-                meshes,
-                snapshot,
-                extent,
-                features,
-                record_shadow_draws,
-                local_shadow_data,
-            ),
+            draw_lists,
         }
     }
 }
@@ -693,12 +811,26 @@ struct SceneDrawItem<'a> {
     options: MeshDrawOptions,
     pipeline_key: MeshPipelineKey,
     material_descriptor_set: vk::DescriptorSet,
+    transparent_sort_depth: f32,
 }
 
 struct ShadowDrawItem<'a> {
     item: &'a RenderItemPacket,
     pipeline_key: MeshPipelineKey,
     material_descriptor_set: vk::DescriptorSet,
+    lod: MeshLodLevel,
+}
+
+/// Hot draw facts resolved once before scene and shadow list filtering begins.
+///
+/// Bounds intentionally remain optional: scene and directional-shadow rendering fail open for
+/// incomplete mesh metadata, while local shadows retain their existing fail-closed behavior.
+#[derive(Clone, Copy)]
+struct ResolvedDrawItem<'a> {
+    item: &'a RenderItemPacket,
+    material: MaterialDrawInfo,
+    bounds: Option<SceneBounds>,
+    scene_options: Option<MeshDrawOptions>,
 }
 
 struct FrameDrawLists<'a> {
@@ -706,7 +838,7 @@ struct FrameDrawLists<'a> {
     transparent_scene: Vec<SceneDrawItem<'a>>,
     opaque_shadow: [Vec<ShadowDrawItem<'a>>; SHADOW_CASCADE_COUNT],
     translucent_shadow: [Vec<ShadowDrawItem<'a>>; SHADOW_CASCADE_COUNT],
-    local_shadow: [Vec<ShadowDrawItem<'a>>; MAX_LOCAL_LIGHTS],
+    local_shadow: [[Vec<ShadowDrawItem<'a>>; LOCAL_SHADOW_FACE_COUNT]; MAX_LOCAL_LIGHTS],
 }
 
 impl<'a> FrameDrawLists<'a> {
@@ -717,61 +849,104 @@ impl<'a> FrameDrawLists<'a> {
         snapshot: &'a FrameSnapshot,
         extent: vk::Extent2D,
         features: FrameFeatureFlags,
-        record_shadow_draws: bool,
+        record_directional_shadow_draws: bool,
+        shadow_data: Option<crate::renderer::vulkan::shadow::ShadowFrameData>,
         local_shadow_data: Option<LocalShadowFrameData>,
     ) -> Self {
         let camera = active_camera(snapshot);
         let camera_forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
-        let opaque_scene = scene_draw_items(
-            materials,
-            meshes,
-            snapshot,
-            extent,
-            camera,
-            camera_forward,
-            false,
-        );
-        let transparent_scene = scene_draw_items(
-            materials,
-            meshes,
-            snapshot,
-            extent,
-            camera,
-            camera_forward,
-            true,
-        );
+        let resolved_items = resolve_draw_items(materials, meshes, snapshot, extent, camera);
+        let opaque_scene = scene_draw_items(&resolved_items, camera, camera_forward, false);
+        let transparent_scene = scene_draw_items(&resolved_items, camera, camera_forward, true);
 
-        let opaque_shadow = if record_shadow_draws && features.has_opaque_shadow_casters {
-            std::array::from_fn(|cascade_index| {
-                shadow_draw_items(
-                    materials,
-                    meshes,
-                    &snapshot.render_items,
-                    shadow_cascade_cull(camera, cascade_index),
-                    MeshDrawFilter::OpaqueShadowCasters,
-                )
-            })
+        // Directional shadow preparation used to scan the resolved items twice per cascade and
+        // rebuild the same light-space cull for opaque and translucent passes.  Keep the two pass
+        // lists separate, but classify/cull/choose the LOD in one pass so the expensive projection
+        // test and mesh metadata lookup are shared.  This is CPU-only and leaves the submitted
+        // geometry, sort keys, sample counts, and map resolution unchanged.
+        let mut opaque_shadow = std::array::from_fn(|_| Vec::new());
+        let mut translucent_shadow = std::array::from_fn(|_| Vec::new());
+        if record_directional_shadow_draws
+            && (features.has_opaque_shadow_casters || features.has_translucent_shadow_casters)
+        {
+            if let Some(shadow_data) = shadow_data.as_ref() {
+                // ShadowCascadeCull is Copy, but it contains the full projection payload. Build it
+                // once per cascade instead of once for each material class.
+                let cascade_culls: [ShadowCascadeCull; SHADOW_CASCADE_COUNT] =
+                    std::array::from_fn(|cascade_index| {
+                        shadow_cascade_cull(camera, cascade_index, shadow_data)
+                    });
+                for cascade_index in 0..SHADOW_CASCADE_COUNT {
+                    let (opaque, translucent) = shadow_draw_items_for_cascade(
+                        &resolved_items,
+                        meshes,
+                        cascade_index,
+                        shadow_data.texel_world[cascade_index],
+                        shadow_data.cascade_resolution[cascade_index] as u32,
+                        cascade_culls[cascade_index],
+                        features.has_opaque_shadow_casters,
+                        features.has_translucent_shadow_casters,
+                    );
+                    opaque_shadow[cascade_index] = opaque;
+                    translucent_shadow[cascade_index] = translucent;
+                }
+            }
+        }
+        let local_shadow = if local_shadow_data.is_some() {
+            local_shadow_draw_items(&resolved_items, local_shadow_data)
         } else {
-            std::array::from_fn(|_| Vec::new())
+            std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()))
         };
-        let translucent_shadow = if record_shadow_draws && features.has_translucent_shadow_casters {
-            std::array::from_fn(|cascade_index| {
-                shadow_draw_items(
-                    materials,
-                    meshes,
-                    &snapshot.render_items,
-                    shadow_cascade_cull(camera, cascade_index),
-                    MeshDrawFilter::TranslucentShadowCasters,
-                )
-            })
-        } else {
-            std::array::from_fn(|_| Vec::new())
-        };
-        let local_shadow = if record_shadow_draws {
-            local_shadow_draw_items(materials, meshes, &snapshot.render_items, local_shadow_data)
-        } else {
-            std::array::from_fn(|_| Vec::new())
-        };
+
+        if record_directional_shadow_draws && tracing::enabled!(tracing::Level::TRACE) {
+            let opaque_indices: [usize; SHADOW_CASCADE_COUNT] =
+                std::array::from_fn(|cascade_index| {
+                    opaque_shadow[cascade_index]
+                        .iter()
+                        .map(|draw| meshes.shadow_index_count(draw.item.mesh, draw.lod))
+                        .sum::<usize>()
+                });
+            let translucent_indices: [usize; SHADOW_CASCADE_COUNT] =
+                std::array::from_fn(|cascade_index| {
+                    translucent_shadow[cascade_index]
+                        .iter()
+                        .map(|draw| meshes.shadow_index_count(draw.item.mesh, draw.lod))
+                        .sum::<usize>()
+                });
+            let opaque_lods: [[usize; 4]; SHADOW_CASCADE_COUNT] =
+                std::array::from_fn(|cascade_index| {
+                    let mut counts = [0; 4];
+                    for draw in &opaque_shadow[cascade_index] {
+                        counts[draw.lod.index()] += 1;
+                    }
+                    counts
+                });
+            let translucent_lods: [[usize; 4]; SHADOW_CASCADE_COUNT] =
+                std::array::from_fn(|cascade_index| {
+                    let mut counts = [0; 4];
+                    for draw in &translucent_shadow[cascade_index] {
+                        counts[draw.lod.index()] += 1;
+                    }
+                    counts
+                });
+            let opaque_fast_counts: [usize; SHADOW_CASCADE_COUNT] =
+                std::array::from_fn(|cascade_index| {
+                    opaque_shadow[cascade_index]
+                        .iter()
+                        .filter(|draw| draw.pipeline_key.opaque_shadow)
+                        .count()
+                });
+            tracing::trace!(
+                opaque_counts = ?opaque_shadow.each_ref().map(Vec::len),
+                translucent_counts = ?translucent_shadow.each_ref().map(Vec::len),
+                opaque_indices = ?opaque_indices,
+                translucent_indices = ?translucent_indices,
+                opaque_lods = ?opaque_lods,
+                translucent_lods = ?translucent_lods,
+                opaque_fast_counts = ?opaque_fast_counts,
+                "built light-space culled directional shadow draw lists"
+            );
+        }
 
         Self {
             opaque_scene,
@@ -781,67 +956,121 @@ impl<'a> FrameDrawLists<'a> {
             local_shadow,
         }
     }
+
+    /// Returns exactly which persistent transmittance maps receive draws on this refresh.
+    fn translucent_shadow_cascades(&self) -> [bool; SHADOW_CASCADE_COUNT] {
+        self.translucent_shadow
+            .each_ref()
+            .map(|draws| !draws.is_empty())
+    }
 }
 
-fn scene_draw_items<'a>(
+/// Resolves the material, bounds, and camera LOD exactly once for list preparation.
+fn resolve_draw_items<'a>(
     materials: &VulkanMaterialStore,
     meshes: &VulkanMeshStore,
     snapshot: &'a FrameSnapshot,
     extent: vk::Extent2D,
     camera: CameraSnapshot,
-    camera_forward: [f32; 3],
-    transparent: bool,
-) -> Vec<SceneDrawItem<'a>> {
-    let mut draws = snapshot
+) -> Vec<ResolvedDrawItem<'a>> {
+    snapshot
         .render_items
         .iter()
         .filter_map(|item| {
+            if !item.flags.visible {
+                return None;
+            }
             let material = materials.draw_info(item.material)?;
+            let mesh = meshes.scene_draw_info(item.mesh, extent, camera, snapshot.optimization);
+            Some(ResolvedDrawItem {
+                item,
+                material,
+                bounds: mesh.bounds,
+                scene_options: mesh.options,
+            })
+        })
+        .collect()
+}
+
+fn scene_draw_items<'a>(
+    items: &[ResolvedDrawItem<'a>],
+    camera: CameraSnapshot,
+    camera_forward: [f32; 3],
+    transparent: bool,
+) -> Vec<SceneDrawItem<'a>> {
+    if transparent {
+        let mut draws = items
+            .iter()
+            .filter_map(|resolved| {
+                let item = resolved.item;
+                let material = resolved.material;
+                if !material.transparent {
+                    return None;
+                }
+                let options = resolved.scene_options?;
+                Some(SceneDrawItem {
+                    item,
+                    options,
+                    pipeline_key: MeshPipelineKey {
+                        uses_textures: material.uses_any_texture,
+                        double_sided: material.double_sided,
+                        opaque_scene: material.fully_opaque,
+                        opaque_shadow: false,
+                    },
+                    material_descriptor_set: material.descriptor_set,
+                    transparent_sort_depth: transparent_scene_depth(
+                        resolved.bounds,
+                        camera,
+                        camera_forward,
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        draws.sort_by(|left, right| {
+            right
+                .transparent_sort_depth
+                .total_cmp(&left.transparent_sort_depth)
+                .then_with(|| left.item.material.raw().cmp(&right.item.material.raw()))
+                .then_with(|| left.item.mesh.raw().cmp(&right.item.mesh.raw()))
+        });
+        return draws;
+    }
+
+    let mut draws = items
+        .iter()
+        .filter_map(|resolved| {
+            let item = resolved.item;
+            let material = resolved.material;
             if material.transparent != transparent {
                 return None;
             }
-            let options =
-                meshes.scene_draw_options(item.mesh, extent, camera, snapshot.optimization)?;
+            let options = resolved.scene_options?;
             let pipeline_key = MeshPipelineKey {
                 uses_textures: material.uses_any_texture,
                 double_sided: material.double_sided,
+                opaque_scene: material.fully_opaque,
+                opaque_shadow: false,
             };
             let draw = SceneDrawItem {
                 item,
                 options,
                 pipeline_key,
                 material_descriptor_set: material.descriptor_set,
+                transparent_sort_depth: f32::NEG_INFINITY,
             };
-
-            if transparent {
-                Some((None, draw))
-            } else {
-                Some((
-                    Some((
-                        opaque_scene_depth_bucket(meshes, camera, camera_forward, item),
-                        pipeline_key.uses_textures,
-                        pipeline_key.double_sided,
-                        item.material.raw(),
-                        item.mesh.raw(),
-                    )),
-                    draw,
-                ))
-            }
+            Some((
+                (
+                    opaque_scene_depth_bucket(resolved.bounds, camera, camera_forward),
+                    pipeline_key.opaque_scene,
+                    pipeline_key.uses_textures,
+                    pipeline_key.double_sided,
+                    item.material.raw(),
+                    item.mesh.raw(),
+                ),
+                draw,
+            ))
         })
         .collect::<Vec<_>>();
-
-    if transparent {
-        let mut transparent_draws = draws.into_iter().map(|(_, draw)| draw).collect::<Vec<_>>();
-        transparent_draws.sort_by(|left, right| {
-            let left_depth = transparent_scene_depth(meshes, camera, camera_forward, left.item);
-            let right_depth = transparent_scene_depth(meshes, camera, camera_forward, right.item);
-            right_depth
-                .total_cmp(&left_depth)
-                .then_with(|| left.item.material.raw().cmp(&right.item.material.raw()))
-                .then_with(|| left.item.mesh.raw().cmp(&right.item.mesh.raw()))
-        });
-        return transparent_draws;
-    }
 
     draws.sort_unstable_by_key(|(key, _)| *key);
     draws.into_iter().map(|(_, draw)| draw).collect()
@@ -853,12 +1082,11 @@ fn scene_draw_items<'a>(
 /// Using the farthest point is conservative for intersecting bounds and avoids ordering flips
 /// when the camera crosses a large thin or double-sided surface.
 fn transparent_scene_depth(
-    meshes: &VulkanMeshStore,
+    bounds: Option<SceneBounds>,
     camera: CameraSnapshot,
     camera_forward: [f32; 3],
-    item: &RenderItemPacket,
 ) -> f32 {
-    let Some(bounds) = meshes.bounds_for(item.mesh) else {
+    let Some(bounds) = bounds else {
         return f32::NEG_INFINITY;
     };
     let depth = dot3(sub3(bounds.center(), camera.eye), camera_forward) + bounds.radius();
@@ -925,14 +1153,6 @@ fn record_graph_pass(
             state.draw_lists.opaque_shadow[cascade_index].as_slice(),
         );
     }
-    if let Some(cascade_index) = shadow_blur_h_pass_index(name) {
-        let shadows = required_shadow_resources(shadows, name)?;
-        return record_shadow_moment_blur_pass(device, frame, shadows, cascade_index, true);
-    }
-    if let Some(cascade_index) = shadow_blur_v_pass_index(name) {
-        let shadows = required_shadow_resources(shadows, name)?;
-        return record_shadow_moment_blur_pass(device, frame, shadows, cascade_index, false);
-    }
     if let Some(cascade_index) = translucent_shadow_pass_index(name) {
         let shadows = required_shadow_resources(shadows, name)?;
         if !state.features.has_translucent_shadow_casters {
@@ -965,7 +1185,9 @@ fn record_graph_pass(
     }
 
     match name {
-        GOD_RAY_MASK_PASS => record_god_ray_mask_pass(device, frame, swapchain, snapshot, state),
+        GOD_RAY_MASK_PASS => {
+            record_god_ray_mask_pass(device, frame, swapchain, snapshot, meshes, state)
+        }
         GOD_RAY_PREFILTER_PASS => {
             record_god_ray_prefilter_pass(device, frame, swapchain, snapshot, state)
         }
@@ -975,6 +1197,7 @@ fn record_graph_pass(
         GOD_RAY_TEMPORAL_PASS => {
             record_god_ray_temporal_pass(device, frame, swapchain, snapshot, state)
         }
+        TAA_RESOLVE_PASS => swapchain.record_taa(device, frame.command_buffer),
         "scene" => record_scene_pass(
             device,
             frame,
@@ -1013,6 +1236,12 @@ fn record_barriers_for_location(
     location: BarrierLocation,
 ) -> Result<(), VulkanError> {
     for &barrier in graph.barriers_at(location) {
+        // The graph models one resource per cascade while Vulkan stores the four cascades in one
+        // array image. Directional shadow recording performs precise per-layer transitions itself;
+        // applying these logical barriers to the full image would touch unrelated cascades.
+        if barrier.resource().shadow_cascade().is_some() {
+            continue;
+        }
         let (image, aspect) = graph_image(swapchain, shadows, barrier.resource(), image_index)?;
         record_graph_barrier(device, command_buffer, image, aspect, barrier);
     }
@@ -1044,14 +1273,6 @@ fn required_shadow_resources<'a>(
             "graph pass {pass_name} requested real shadow resources after they were omitted"
         ))
     })
-}
-
-/// Returns whether post effects will sample scene normal/roughness metadata this frame.
-fn scene_material_metadata_required(quality: RenderQualitySettings) -> bool {
-    quality.ssao().intensity() > 0.0
-        || quality.ssr().intensity() > 0.0
-        || quality.anti_aliasing().blend() > 0.0
-        || quality.bloom().god_rays_intensity() > 0.0
 }
 
 /// Records one graph-owned image barrier outside pass recording.
@@ -1128,7 +1349,7 @@ fn record_image_state_transition_layers(
     }
 }
 
-/// Records scene draws into the graph-owned scene color and depth targets.
+/// Records scene draws into HDR color, material metadata, and depth targets owned by the frame graph.
 fn record_scene_pass(
     device: &Device,
     frame: ActiveFrame,
@@ -1138,7 +1359,7 @@ fn record_scene_pass(
     meshes: &VulkanMeshStore,
     state: &FrameRecordState<'_>,
 ) -> Result<(), VulkanError> {
-    let metadata_required = scene_material_metadata_required(state.quality);
+    let metadata_required = state.use_full_scene_pass;
     let clear_values = scene_clear_values(pass, metadata_required)?;
     let render_area = vk::Rect2D::default()
         .offset(vk::Offset2D { x: 0, y: 0 })
@@ -1225,7 +1446,7 @@ fn record_scene_pass(
     Ok(())
 }
 
-/// Records moment shadow data for items that explicitly cast shadows.
+/// Records directional shadow depth for items that explicitly cast shadows.
 fn record_shadow_pass(
     device: &Device,
     frame: ActiveFrame,
@@ -1234,52 +1455,16 @@ fn record_shadow_pass(
     meshes: &VulkanMeshStore,
     items: &[ShadowDrawItem<'_>],
 ) -> Result<(), VulkanError> {
-    record_shadow_map_pass(
-        device,
-        frame,
-        shadows,
-        meshes,
-        items,
-        ShadowMapTarget::Cascade(cascade_index),
-        "opaque shadow pass cleared without mesh draws because no casters are live",
-    )
-}
-
-/// Records one separable blur pass over shadow moments for a single cascade.
-fn record_shadow_moment_blur_pass(
-    device: &Device,
-    frame: ActiveFrame,
-    shadows: &ShadowResources,
-    cascade_index: usize,
-    horizontal: bool,
-) -> Result<(), VulkanError> {
-    record_shadow_moment_blur_target_pass(
-        device,
-        frame,
-        shadows,
-        ShadowMapTarget::Cascade(cascade_index),
-        horizontal,
-    )
-}
-
-/// Records raw moment data for either a global cascade or the local-light shadow map.
-fn record_shadow_map_pass(
-    device: &Device,
-    frame: ActiveFrame,
-    shadows: &ShadowResources,
-    meshes: &VulkanMeshStore,
-    items: &[ShadowDrawItem<'_>],
-    target: ShadowMapTarget,
-    empty_message: &'static str,
-) -> Result<(), VulkanError> {
-    let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0]), depth_clear_value()];
-    let shadow_extent = shadow_map_target_extent(shadows, target)?;
+    let shadow_extent = shadows.shadow_extent_2d();
     let render_area = vk::Rect2D::default()
         .offset(vk::Offset2D { x: 0, y: 0 })
         .extent(shadow_extent);
+    let clear_values = [depth_clear_value()];
+    shadows.transition_shadow_layer_to_attachment(device, frame.command_buffer, cascade_index)?;
+
     let render_pass_info = vk::RenderPassBeginInfo::default()
         .render_pass(shadows.shadow_render_pass())
-        .framebuffer(shadow_map_target_framebuffer(shadows, target)?)
+        .framebuffer(shadows.shadow_framebuffer(cascade_index)?)
         .render_area(render_area)
         .clear_values(&clear_values);
 
@@ -1297,62 +1482,18 @@ fn record_shadow_map_pass(
             None,
             items,
             shadow_extent,
-            shadow_map_target_pipeline_index(target),
+            cascade_index,
         )?;
         if caster_count == 0 {
-            tracing::trace!(target = shadow_map_target_name(target), "{}", empty_message);
-        }
-        device.cmd_end_render_pass(frame.command_buffer);
-    }
-
-    Ok(())
-}
-
-/// Records one separable blur pass for either a global cascade or the local-light shadow map.
-fn record_shadow_moment_blur_target_pass(
-    device: &Device,
-    frame: ActiveFrame,
-    shadows: &ShadowResources,
-    target: ShadowMapTarget,
-    horizontal: bool,
-) -> Result<(), VulkanError> {
-    let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0])];
-    let shadow_extent = shadow_map_target_extent(shadows, target)?;
-    let render_area = vk::Rect2D::default()
-        .offset(vk::Offset2D { x: 0, y: 0 })
-        .extent(shadow_extent);
-    let render_pass_info = vk::RenderPassBeginInfo::default()
-        .render_pass(shadows.blur_render_pass())
-        .framebuffer(shadow_map_target_blur_framebuffer(
-            shadows, target, horizontal,
-        )?)
-        .render_area(render_area)
-        .clear_values(&clear_values);
-    let pipeline_index = shadow_map_target_pipeline_index(target);
-
-    unsafe {
-        device.cmd_begin_render_pass(
-            frame.command_buffer,
-            &render_pass_info,
-            vk::SubpassContents::INLINE,
-        );
-        if horizontal {
-            shadows.blur_pipeline().draw_horizontal(
-                device,
-                frame.command_buffer,
-                pipeline_index,
-                shadow_extent,
-            );
-        } else {
-            shadows.blur_pipeline().draw_vertical(
-                device,
-                frame.command_buffer,
-                pipeline_index,
-                shadow_extent,
+            tracing::trace!(
+                cascade_index,
+                "stable CSM shadow cascade cleared without mesh draws"
             );
         }
         device.cmd_end_render_pass(frame.command_buffer);
     }
+
+    shadows.transition_shadow_layer_to_shader_read(device, frame.command_buffer, cascade_index)?;
 
     Ok(())
 }
@@ -1363,7 +1504,7 @@ fn record_local_shadow_passes(
     frame: ActiveFrame,
     shadows: &ShadowResources,
     meshes: &VulkanMeshStore,
-    items: &[Vec<ShadowDrawItem<'_>>; MAX_LOCAL_LIGHTS],
+    items: &[[Vec<ShadowDrawItem<'_>>; LOCAL_SHADOW_FACE_COUNT]; MAX_LOCAL_LIGHTS],
     local_shadow: LocalShadowFrameData,
 ) -> Result<(), VulkanError> {
     let command_buffer = frame.command_buffer;
@@ -1385,7 +1526,7 @@ fn record_local_shadow_passes(
                 frame,
                 shadows,
                 meshes,
-                &items[light_index],
+                &items[light_index][face_index],
                 light_index,
                 face_index,
             )?;
@@ -1403,7 +1544,8 @@ fn record_local_shadow_passes(
 
         tracing::trace!(
             light_index,
-            caster_count = items[light_index].len(),
+            caster_count = items[light_index].iter().map(Vec::len).sum::<usize>(),
+            face_counts = ?items[light_index].each_ref().map(Vec::len),
             source_radius = local_light.source_radius,
             "recorded local-light cubemap shadow"
         );
@@ -1468,7 +1610,7 @@ fn record_translucent_shadow_pass(
     meshes: &VulkanMeshStore,
     items: &[ShadowDrawItem<'_>],
 ) -> Result<(), VulkanError> {
-    let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0])];
+    let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0]), depth_clear_value()];
     let shadow_extent = shadows.extent_2d(cascade_index)?;
     let render_area = vk::Rect2D::default()
         .offset(vk::Offset2D { x: 0, y: 0 })
@@ -1479,8 +1621,9 @@ fn record_translucent_shadow_pass(
         .render_area(render_area)
         .clear_values(&clear_values);
 
-    // Safety: graph barriers place transmittance in color attachment layout and opaque cascade
-    // depth in shader-read layout. The fragment shader samples opaque depth explicitly.
+    // Safety: graph barriers place transmittance in color-attachment layout. A dedicated cleared
+    // depth target keeps the nearest translucent layer; the fragment shader rejects samples behind
+    // the immutable opaque blocker-depth map.
     unsafe {
         device.cmd_begin_render_pass(
             frame.command_buffer,
@@ -1544,6 +1687,7 @@ fn record_bloom_downsample_pass(
             source_extent,
             target_extent,
             quality.bloom(),
+            swapchain.taa_history_write_index(),
         )?;
         device.cmd_end_render_pass(frame.command_buffer);
     }
@@ -1594,14 +1738,22 @@ fn god_ray_push_constants(
     snapshot: &FrameSnapshot,
     state: &FrameRecordState,
 ) -> GodRayPushConstants {
+    let extent = swapchain.extent_2d();
+    let jitter_pixels = swapchain.taa_jitter_pixels();
+    let jitter_ndc = [
+        jitter_pixels[0] * 2.0 / extent.width.max(1) as f32,
+        jitter_pixels[1] * 2.0 / extent.height.max(1) as f32,
+    ];
     GodRayPushConstants::new(
         active_camera(snapshot),
         swapchain.god_ray_extent_2d(),
         state.quality,
-        frame_light_intensity(snapshot),
+        frame_global_light(snapshot),
         state.emissive_lights,
         state.features.has_transparent_scene_items,
         swapchain.god_ray_history_valid(),
+        snapshot.frame_id.raw(),
+        jitter_ndc,
     )
 }
 
@@ -1623,6 +1775,7 @@ fn record_god_ray_mask_pass(
     frame: ActiveFrame,
     swapchain: &VulkanSwapchain,
     snapshot: &FrameSnapshot,
+    meshes: &VulkanMeshStore,
     state: &FrameRecordState,
 ) -> Result<(), VulkanError> {
     let push = god_ray_push_constants(swapchain, snapshot, state);
@@ -1639,6 +1792,7 @@ fn record_god_ray_mask_pass(
             device,
             frame.command_buffer,
             swapchain.god_ray_extent_2d(),
+            meshes.frame_descriptor_set(frame.slot_index)?,
             push,
         );
         device.cmd_end_render_pass(frame.command_buffer);
@@ -1772,9 +1926,12 @@ fn record_post_pass(
             active_camera(snapshot),
             state.quality,
             state.features.has_transparent_scene_items,
+            swapchain.taa_history_write_index(),
             swapchain.god_ray_history_write_index(),
-            frame_light_intensity(snapshot),
+            frame_global_light(snapshot),
             state.emissive_lights,
+            snapshot.debug_draw.view_mode,
+            swapchain.taa_jitter_pixels(),
         );
         device.cmd_end_render_pass(frame.command_buffer);
     }
@@ -1812,52 +1969,6 @@ enum MeshDrawFilter {
     TranslucentShadowCasters,
 }
 
-#[derive(Clone, Copy)]
-enum ShadowMapTarget {
-    Cascade(usize),
-}
-
-fn shadow_map_target_extent(
-    shadows: &ShadowResources,
-    target: ShadowMapTarget,
-) -> Result<vk::Extent2D, VulkanError> {
-    match target {
-        ShadowMapTarget::Cascade(index) => shadows.extent_2d(index),
-    }
-}
-
-fn shadow_map_target_framebuffer(
-    shadows: &ShadowResources,
-    target: ShadowMapTarget,
-) -> Result<vk::Framebuffer, VulkanError> {
-    match target {
-        ShadowMapTarget::Cascade(index) => shadows.shadow_framebuffer(index),
-    }
-}
-
-fn shadow_map_target_blur_framebuffer(
-    shadows: &ShadowResources,
-    target: ShadowMapTarget,
-    horizontal: bool,
-) -> Result<vk::Framebuffer, VulkanError> {
-    match (target, horizontal) {
-        (ShadowMapTarget::Cascade(index), true) => shadows.blur_h_framebuffer(index),
-        (ShadowMapTarget::Cascade(index), false) => shadows.blur_v_framebuffer(index),
-    }
-}
-
-fn shadow_map_target_pipeline_index(target: ShadowMapTarget) -> usize {
-    match target {
-        ShadowMapTarget::Cascade(index) => index,
-    }
-}
-
-fn shadow_map_target_name(target: ShadowMapTarget) -> &'static str {
-    match target {
-        ShadowMapTarget::Cascade(_) => "cascade",
-    }
-}
-
 /// Records mesh-only passes without duplicating per-pass draw loops.
 fn record_mesh_draws(
     device: &Device,
@@ -1871,8 +1982,8 @@ fn record_mesh_draws(
 ) -> Result<usize, VulkanError> {
     let mut drawn = 0;
     let mut draw_state = MeshDrawState::default();
-    let draw_options = MeshDrawOptions::shadow_preculled(extent, cascade_index);
     for draw in items {
+        let draw_options = MeshDrawOptions::shadow_preculled(extent, cascade_index, draw.lod);
         if meshes.bind_and_draw(
             device,
             frame.command_buffer,
@@ -1892,135 +2003,56 @@ fn record_mesh_draws(
     Ok(drawn)
 }
 
-/// Builds the cascade-local shadow draw list before Vulkan command recording.
-fn shadow_draw_items<'a>(
-    materials: &VulkanMaterialStore,
+/// Builds both cascade-local shadow draw lists before Vulkan command recording.
+///
+/// Opaque and translucent casters are still submitted to their original independent passes.  The
+/// shared walk only avoids repeating the bounds projection and directional LOD query for the same
+/// resolved item; the opaque list keeps its original state sort and the translucent list keeps its
+/// original extraction order.
+fn shadow_draw_items_for_cascade<'a>(
+    items: &[ResolvedDrawItem<'a>],
     meshes: &VulkanMeshStore,
-    items: &'a [RenderItemPacket],
+    cascade_index: usize,
+    texel_world: f32,
+    shadow_resolution: u32,
     shadow_cull: ShadowCascadeCull,
-    filter: MeshDrawFilter,
-) -> Vec<ShadowDrawItem<'a>> {
-    match filter {
-        MeshDrawFilter::OpaqueShadowCasters => {
-            let mut draw_items = items
-                .iter()
-                .filter_map(|item| {
-                    let material = materials.draw_info(item.material)?;
-                    if !shadow_filter_accepts(filter, material, item)
-                        || !meshes.accepts_shadow_cascade(item.mesh, shadow_cull)
-                    {
-                        return None;
-                    }
-                    let pipeline_key = MeshPipelineKey {
-                        uses_textures: material.uses_base_color_texture,
-                        double_sided: material.double_sided,
-                    };
+    include_opaque: bool,
+    include_translucent: bool,
+) -> (Vec<ShadowDrawItem<'a>>, Vec<ShadowDrawItem<'a>>) {
+    let mut opaque = Vec::new();
+    let mut translucent = Vec::new();
+    // Many render items are instances of the same mesh. LOD selection only depends on the mesh and
+    // cascade metrics, so memoize it for this one cascade while retaining the existing per-frame
+    // list lifetime (no persistent shadow-map cache is introduced).
+    let mut lod_by_mesh = HashMap::new();
 
-                    Some((
-                        (
-                            pipeline_key.uses_textures,
-                            pipeline_key.double_sided,
-                            item.material.raw(),
-                            item.mesh.raw(),
-                        ),
-                        ShadowDrawItem {
-                            item,
-                            pipeline_key,
-                            material_descriptor_set: material.descriptor_set,
-                        },
-                    ))
-                })
-                .collect::<Vec<_>>();
-            draw_items.sort_unstable_by_key(|(key, _)| *key);
-            draw_items.into_iter().map(|(_, draw)| draw).collect()
+    for resolved in items {
+        let item = resolved.item;
+        let material = resolved.material;
+        let accepts_opaque = include_opaque
+            && shadow_filter_accepts(MeshDrawFilter::OpaqueShadowCasters, material, item);
+        let accepts_translucent = include_translucent
+            && shadow_filter_accepts(MeshDrawFilter::TranslucentShadowCasters, material, item);
+        if !(accepts_opaque || accepts_translucent) || !shadow_cull.contains_bounds(resolved.bounds)
+        {
+            continue;
         }
-        MeshDrawFilter::TranslucentShadowCasters => items
-            .iter()
-            .filter_map(|item| {
-                let material = materials.draw_info(item.material)?;
-                if !shadow_filter_accepts(filter, material, item)
-                    || !meshes.accepts_shadow_cascade(item.mesh, shadow_cull)
-                {
-                    return None;
-                }
-                Some(ShadowDrawItem {
-                    item,
-                    pipeline_key: MeshPipelineKey {
-                        uses_textures: material.uses_base_color_texture,
-                        double_sided: material.double_sided,
-                    },
-                    material_descriptor_set: material.descriptor_set,
-                })
-            })
-            .collect(),
-    }
-}
 
-/// Builds local-light shadow draw lists for every enabled cubemap light.
-fn local_shadow_draw_items<'a>(
-    materials: &VulkanMaterialStore,
-    meshes: &VulkanMeshStore,
-    items: &'a [RenderItemPacket],
-    local_shadow: Option<LocalShadowFrameData>,
-) -> [Vec<ShadowDrawItem<'a>>; MAX_LOCAL_LIGHTS] {
-    let Some(local_shadow) = local_shadow else {
-        return std::array::from_fn(|_| Vec::new());
-    };
-
-    std::array::from_fn(|light_index| {
-        let Some(local_light) = local_shadow.lights[light_index] else {
-            return Vec::new();
-        };
-
-        local_shadow_draw_items_for_light(materials, meshes, items, local_light)
-    })
-}
-
-fn local_shadow_draw_items_for_light<'a>(
-    materials: &VulkanMaterialStore,
-    meshes: &VulkanMeshStore,
-    items: &'a [RenderItemPacket],
-    local_shadow: LocalShadowLightData,
-) -> Vec<ShadowDrawItem<'a>> {
-    let light = local_shadow.light_position_radius;
-    let light_position = [light[0], light[1], light[2]];
-    let range = light[3].max(0.0);
-    let source_radius = local_shadow.source_radius.max(0.0);
-    if range <= 0.0 {
-        return Vec::new();
-    }
-
-    let mut draw_items = items
-        .iter()
-        .filter_map(|item| {
-            let material = materials.draw_info(item.material)?;
-            if !shadow_filter_accepts(MeshDrawFilter::OpaqueShadowCasters, material, item) {
-                return None;
-            }
-            let Some(bounds) = meshes.bounds_for(item.mesh) else {
-                return None;
-            };
-            let center = bounds.center();
-            let radius = bounds.radius();
-            if local_shadow_self_occluder(center, radius, light_position, source_radius) {
-                return None;
-            }
-            let dx = center[0] - light_position[0];
-            let dy = center[1] - light_position[1];
-            let dz = center[2] - light_position[2];
-            let influence = range + radius;
-            if dx * dx + dy * dy + dz * dz > influence * influence {
-                return None;
-            }
-
-            // Cubemap shadows see the same caster from every direction, so material-side
-            // backface culling can drop a face of the local shadow map.
+        // A material can only be in one alpha class today, but retain both branches so this
+        // helper remains correct if a future material intentionally writes both shadow targets.
+        let lod = *lod_by_mesh.entry(item.mesh.raw()).or_insert_with(|| {
+            meshes.directional_shadow_lod(item.mesh, cascade_index, texel_world, shadow_resolution)
+        });
+        if accepts_opaque {
             let pipeline_key = MeshPipelineKey {
-                uses_textures: material.uses_base_color_texture,
-                double_sided: true,
+                uses_textures: material.uses_shadow_alpha_texture,
+                double_sided: material.double_sided,
+                opaque_scene: false,
+                opaque_shadow: !material.uses_shadow_alpha_test,
             };
-            Some((
+            opaque.push((
                 (
+                    pipeline_key.opaque_shadow,
                     pipeline_key.uses_textures,
                     pipeline_key.double_sided,
                     item.material.raw(),
@@ -2030,12 +2062,117 @@ fn local_shadow_draw_items_for_light<'a>(
                     item,
                     pipeline_key,
                     material_descriptor_set: material.descriptor_set,
+                    lod,
                 },
-            ))
-        })
-        .collect::<Vec<_>>();
-    draw_items.sort_unstable_by_key(|(key, _)| *key);
-    draw_items.into_iter().map(|(_, draw)| draw).collect()
+            ));
+        }
+        if accepts_translucent {
+            translucent.push(ShadowDrawItem {
+                item,
+                pipeline_key: MeshPipelineKey {
+                    uses_textures: material.uses_base_color_texture,
+                    double_sided: material.double_sided,
+                    opaque_scene: false,
+                    opaque_shadow: false,
+                },
+                material_descriptor_set: material.descriptor_set,
+                lod,
+            });
+        }
+    }
+
+    opaque.sort_unstable_by_key(|(key, _)| *key);
+    (
+        opaque.into_iter().map(|(_, draw)| draw).collect(),
+        translucent,
+    )
+}
+
+/// Builds local-light shadow draw lists for every enabled cubemap light.
+fn local_shadow_draw_items<'a>(
+    items: &[ResolvedDrawItem<'a>],
+    local_shadow: Option<LocalShadowFrameData>,
+) -> [[Vec<ShadowDrawItem<'a>>; LOCAL_SHADOW_FACE_COUNT]; MAX_LOCAL_LIGHTS] {
+    let Some(local_shadow) = local_shadow else {
+        return std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
+    };
+
+    std::array::from_fn(|light_index| {
+        let Some(local_light) = local_shadow.lights[light_index] else {
+            return std::array::from_fn(|_| Vec::new());
+        };
+
+        local_shadow_draw_items_for_light(items, local_light)
+    })
+}
+
+fn local_shadow_draw_items_for_light<'a>(
+    items: &[ResolvedDrawItem<'a>],
+    local_shadow: LocalShadowLightData,
+) -> [Vec<ShadowDrawItem<'a>>; LOCAL_SHADOW_FACE_COUNT] {
+    let light = local_shadow.light_position_radius;
+    let light_position = [light[0], light[1], light[2]];
+    let range = light[3].max(0.0);
+    let source_radius = local_shadow.source_radius.max(0.0);
+    if range <= 0.0 {
+        return std::array::from_fn(|_| Vec::new());
+    }
+
+    let mut face_draws: [Vec<ShadowDrawItem<'a>>; LOCAL_SHADOW_FACE_COUNT] =
+        std::array::from_fn(|_| Vec::new());
+    let face_culls = local_shadow_face_culls(local_shadow);
+    for resolved in items {
+        let item = resolved.item;
+        let material = resolved.material;
+        if !shadow_filter_accepts(MeshDrawFilter::OpaqueShadowCasters, material, item) {
+            continue;
+        }
+        let Some(bounds) = resolved.bounds else {
+            continue;
+        };
+        let center = bounds.center();
+        let radius = bounds.radius();
+        if local_shadow_self_occluder(center, radius, light_position, source_radius) {
+            continue;
+        }
+        let dx = center[0] - light_position[0];
+        let dy = center[1] - light_position[1];
+        let dz = center[2] - light_position[2];
+        let influence = range + radius;
+        if dx * dx + dy * dy + dz * dz > influence * influence {
+            continue;
+        }
+
+        let pipeline_key = MeshPipelineKey {
+            uses_textures: material.uses_shadow_alpha_texture,
+            double_sided: material.double_sided,
+            opaque_scene: false,
+            opaque_shadow: !material.uses_shadow_alpha_test,
+        };
+        for (face_index, draws) in face_draws.iter_mut().enumerate() {
+            if local_shadow_face_contains_bounds_cached(face_culls[face_index], center, radius) {
+                draws.push(ShadowDrawItem {
+                    item,
+                    pipeline_key,
+                    material_descriptor_set: material.descriptor_set,
+                    lod: MeshLodLevel::Medium,
+                });
+            }
+        }
+    }
+
+    for draws in &mut face_draws {
+        draws.sort_unstable_by_key(|draw| {
+            (
+                draw.pipeline_key.opaque_shadow,
+                draw.pipeline_key.uses_textures,
+                draw.pipeline_key.double_sided,
+                draw.item.material.raw(),
+                draw.item.mesh.raw(),
+            )
+        });
+    }
+    face_draws
 }
 
 fn local_shadow_self_occluder(
@@ -2054,12 +2191,11 @@ fn local_shadow_self_occluder(
 /// The bucket is deliberately coarse so each bucket can still group by pipeline/material. That
 /// keeps early depth rejection useful without throwing away the state-bind wins from sorting.
 fn opaque_scene_depth_bucket(
-    meshes: &VulkanMeshStore,
+    bounds: Option<SceneBounds>,
     camera: CameraSnapshot,
     camera_forward: [f32; 3],
-    item: &RenderItemPacket,
 ) -> u16 {
-    let Some(bounds) = meshes.bounds_for(item.mesh) else {
+    let Some(bounds) = bounds else {
         return u16::MAX;
     };
 
@@ -2083,10 +2219,13 @@ fn shadow_filter_accepts(
     item: &crate::protocol::RenderItemPacket,
 ) -> bool {
     item.flags.visible
-        && item.flags.casts_shadow
         && match filter {
-            MeshDrawFilter::OpaqueShadowCasters => material.casts_opaque_shadow,
-            MeshDrawFilter::TranslucentShadowCasters => material.casts_translucent_shadow,
+            MeshDrawFilter::OpaqueShadowCasters => {
+                item.flags.casts_shadow && material.casts_opaque_shadow
+            }
+            MeshDrawFilter::TranslucentShadowCasters => {
+                item.flags.casts_shadow && material.casts_translucent_shadow
+            }
         }
 }
 
@@ -2099,14 +2238,12 @@ fn active_camera(snapshot: &FrameSnapshot) -> CameraSnapshot {
         .unwrap_or_default()
 }
 
-/// Returns the renderer light intensity encoded in the first extracted light packet.
-fn frame_light_intensity(snapshot: &FrameSnapshot) -> f32 {
+fn frame_global_light(snapshot: &FrameSnapshot) -> LightPacket {
     snapshot
         .lights
         .first()
-        .map(|light| light.intensity)
-        .unwrap_or(1.0)
-        .max(0.0)
+        .copied()
+        .unwrap_or_else(|| LightPacket::new(1.0))
 }
 
 #[derive(Clone, Copy)]
@@ -2118,82 +2255,39 @@ struct LocalLightCandidate {
     size_kind: [f32; 4],
 }
 
-/// Extracts a small, stable local-light set from explicit packets and emissive mesh materials.
-fn emissive_light_uniforms(
-    materials: &VulkanMaterialStore,
-    meshes: &VulkanMeshStore,
-    snapshot: &FrameSnapshot,
-    camera: CameraSnapshot,
-) -> EmissiveLightUniforms {
-    const MIN_EMISSIVE_BRIGHTNESS: f32 = 0.02;
-    const EMISSIVE_LIGHT_COLOR_SCALE: f32 = 1.35;
-    const EMISSIVE_LIGHT_RADIUS_SCALE: f32 = 10.0;
-    const EMISSIVE_LIGHT_BRIGHTNESS_RANGE_SCALE: f32 = 6.0;
-    const EMISSIVE_LIGHT_MIN_RADIUS: f32 = 4.0;
-    const EMISSIVE_LIGHT_MAX_RADIUS: f32 = 192.0;
+/// Packs at most four explicit scene lights without deriving extra lights from mesh materials.
+///
+/// Emissive glTF materials illuminate their own surface; treating every emissive mesh as a
+/// nearby light changes asset semantics and costs a local-light branch for every fragment.
+fn local_light_uniforms(snapshot: &FrameSnapshot, camera: CameraSnapshot) -> EmissiveLightUniforms {
+    const MIN_LOCAL_LIGHT_BRIGHTNESS: f32 = 0.02;
 
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(MAX_LOCAL_LIGHTS);
     for light in &snapshot.local_lights {
         let candidate = local_light_candidate(light, camera);
-        if candidate.color[3] > MIN_EMISSIVE_BRIGHTNESS {
+        if candidate.color[3] <= MIN_LOCAL_LIGHT_BRIGHTNESS {
+            continue;
+        }
+        if candidates.len() < MAX_LOCAL_LIGHTS {
             candidates.push(candidate);
+            continue;
+        }
+        let least_important = candidates
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.score.total_cmp(&b.score))
+            .map(|(index, _)| index)
+            .expect("full local-light candidate set has an entry");
+        if candidate
+            .score
+            .total_cmp(&candidates[least_important].score)
+            .is_gt()
+        {
+            candidates[least_important] = candidate;
         }
     }
 
-    if candidates.len() < MAX_LOCAL_LIGHTS {
-        for item in &snapshot.render_items {
-            if !item.flags.visible {
-                continue;
-            }
-
-            let Some(emissive) = materials.emissive_factor(item.material) else {
-                continue;
-            };
-            let brightness = max3(emissive);
-            if brightness <= MIN_EMISSIVE_BRIGHTNESS {
-                continue;
-            }
-
-            let Some(bounds) = meshes.bounds_for(item.mesh) else {
-                continue;
-            };
-            let center = bounds.center();
-            let source_radius = bounds.radius();
-            if has_explicit_local_light_near(&candidates, center, source_radius) {
-                continue;
-            }
-            let brightness_gain = brightness.sqrt();
-            let light_radius = (source_radius
-                * (EMISSIVE_LIGHT_RADIUS_SCALE + brightness_gain * 2.0)
-                + brightness_gain * EMISSIVE_LIGHT_BRIGHTNESS_RANGE_SCALE)
-                .clamp(EMISSIVE_LIGHT_MIN_RADIUS, EMISSIVE_LIGHT_MAX_RADIUS);
-            let area_radius = source_radius.clamp(0.05, light_radius * 0.45);
-            let camera_delta = sub3(center, camera.eye);
-            let camera_distance_sq = dot3(camera_delta, camera_delta).max(1.0);
-            let score =
-                brightness * light_radius * light_radius / (1.0 + camera_distance_sq * 0.0025);
-
-            candidates.push(LocalLightCandidate {
-                score,
-                position_radius: [center[0], center[1], center[2], light_radius],
-                color: [
-                    emissive[0] * EMISSIVE_LIGHT_COLOR_SCALE,
-                    emissive[1] * EMISSIVE_LIGHT_COLOR_SCALE,
-                    emissive[2] * EMISSIVE_LIGHT_COLOR_SCALE,
-                    brightness,
-                ],
-                direction_radius: [0.0, -1.0, 0.0, area_radius],
-                size_kind: [
-                    area_radius,
-                    area_radius,
-                    LocalLightKind::Sphere.shader_code(),
-                    1.0,
-                ],
-            });
-        }
-    }
-
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     let mut uniforms = EmissiveLightUniforms::disabled();
     for (index, candidate) in candidates.iter().take(MAX_LOCAL_LIGHTS).enumerate() {
@@ -2205,20 +2299,6 @@ fn emissive_light_uniforms(
     uniforms.count[0] = candidates.len().min(MAX_LOCAL_LIGHTS) as f32;
 
     uniforms
-}
-
-fn has_explicit_local_light_near(
-    candidates: &[LocalLightCandidate],
-    center: [f32; 3],
-    radius: f32,
-) -> bool {
-    let threshold = (radius * 0.25).max(0.25);
-    let threshold_sq = threshold * threshold;
-    candidates.iter().any(|candidate| {
-        let light = candidate.position_radius;
-        let delta = sub3([light[0], light[1], light[2]], center);
-        dot3(delta, delta) <= threshold_sq
-    })
 }
 
 fn local_light_candidate(light: &LocalLightPacket, camera: CameraSnapshot) -> LocalLightCandidate {
@@ -2402,7 +2482,9 @@ fn stage_for_source_state(state: ResourceState) -> vk::PipelineStageFlags {
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
         }
-        ResourceState::ShaderRead => vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ResourceState::ShaderRead => {
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER
+        }
         ResourceState::TransferSrc => vk::PipelineStageFlags::TRANSFER,
         ResourceState::Present => vk::PipelineStageFlags::BOTTOM_OF_PIPE,
     }
@@ -2417,7 +2499,9 @@ fn stage_for_destination_state(state: ResourceState) -> vk::PipelineStageFlags {
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS
         }
-        ResourceState::ShaderRead => vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ResourceState::ShaderRead => {
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER
+        }
         ResourceState::TransferSrc => vk::PipelineStageFlags::TRANSFER,
         ResourceState::Present => vk::PipelineStageFlags::BOTTOM_OF_PIPE,
     }

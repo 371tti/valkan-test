@@ -1,36 +1,5 @@
 #include "slang_compat.slang"
-
-layout(location = 0) in float2 frag_uv;
-layout(location = 0) out float4 out_color;
-
-[[vk::binding(0, 2)]] Sampler2D scene_color;
-[[vk::binding(1, 2)]] Sampler2D scene_depth;
-[[vk::binding(2, 2)]] Sampler2D scene_normal_roughness;
-[[vk::binding(3, 2)]] Sampler2D scene_transparent_normal_roughness;
-[[vk::binding(4, 2)]] Sampler2D bloom_texture;
-[[vk::binding(5, 2)]] Sampler2D god_ray_texture_0;
-[[vk::binding(6, 2)]] Sampler2D god_ray_texture_1;
-
-struct PostParams {
-    float4 white_balance;
-    float4 camera;
-    float4 depth;
-    float4 ssao;
-    float4 ssr;
-    float4 aa;
-    float4 shadow;
-    float4 bloom;
-    float4 features;
-    float4 god_ray_source0;
-    float4 god_ray_color0;
-    float4 god_ray_source1;
-    float4 god_ray_color1;
-    float exposure;
-    float contrast;
-    float saturation;
-    float enabled;
-};
-[[vk::push_constant]] ConstantBuffer<PostParams> params;
+#include "post_layout.slang"
 
 #include "post_common.slang"
 #include "post_fxaa.slang"
@@ -41,6 +10,11 @@ struct PostParams {
 
 [shader("fragment")]
 void main() {
+    float3 debug_color;
+    if (post_debug_color(frag_uv, debug_color)) {
+        out_color = float4(debug_color, 1.0);
+        return;
+    }
     float3 color = sample_texture(scene_color, frag_uv).rgb;
     bool aa_enabled = post_aa_enabled();
     bool ssao_enabled = post_ssao_enabled();
@@ -95,7 +69,12 @@ void main() {
     }
 
     if (god_rays_enabled) {
-        color += post_god_rays(frag_uv);
+        float4 god_rays = post_god_rays(frag_uv);
+        if (post_volumetric_fog_enabled()) {
+            color = color * god_rays.a + god_rays.rgb;
+        } else {
+            color += god_rays.rgb;
+        }
     }
 
     out_color = float4(apply_camera_effects(color), 1.0);

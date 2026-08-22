@@ -234,6 +234,8 @@ impl RenderItemPacket {
 #[derive(Clone, Copy, Debug)]
 pub struct LightPacket {
     pub intensity: f32,
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
 }
 
 impl LightPacket {
@@ -244,7 +246,26 @@ impl LightPacket {
         } else {
             0.0
         };
-        Self { intensity }
+        Self {
+            intensity,
+            direction: [0.45, -1.0, 0.25],
+            color: [3.00, 2.65, 2.15],
+        }
+    }
+
+    /// Replaces the app-owned direction and linear RGB color.
+    pub fn with_direction_and_color(mut self, direction: [f32; 3], color: [f32; 3]) -> Self {
+        if direction.iter().all(|component| component.is_finite())
+            && direction
+                .iter()
+                .any(|component| component.abs() > f32::EPSILON)
+        {
+            self.direction = direction;
+        }
+        if color.iter().all(|component| component.is_finite()) {
+            self.color = color.map(|component| component.max(0.0));
+        }
+        self
     }
 }
 
@@ -428,9 +449,42 @@ impl LocalLightPacket {
     }
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DebugViewMode {
+    #[default]
+    Disabled = 0,
+    Normals = 1,
+    Depth = 2,
+    PcssFilterRadius = 3,
+}
+
+impl DebugViewMode {
+    pub const COUNT: u32 = 4;
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Disabled => Self::Normals,
+            Self::Normals => Self::Depth,
+            Self::Depth => Self::PcssFilterRadius,
+            Self::PcssFilterRadius => Self::Disabled,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "scene",
+            Self::Normals => "normals",
+            Self::Depth => "linear_depth",
+            Self::PcssFilterRadius => "pcss_filter_radius",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DebugDraw {
     pub show_bounds: bool,
+    pub view_mode: DebugViewMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

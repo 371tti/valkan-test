@@ -18,7 +18,7 @@ pub(super) struct CameraEffectController {
 
 const MIN_OLD_CAMERA_EXPOSURE: f32 = 0.25;
 const MAX_CAMERA_EXPOSURE: f32 = 3.6;
-const TARGET_CAMERA_LUMA: f32 = 0.25;
+const TARGET_CAMERA_LUMA: f32 = 0.65;
 const EXPOSURE_RISE_STOPS_PER_SECOND: f32 = 1.8;
 const EXPOSURE_FALL_STOPS_PER_SECOND: f32 = 5.5;
 const MIN_WHITE_BALANCE: f32 = 0.55;

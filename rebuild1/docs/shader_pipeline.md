@@ -28,10 +28,11 @@ shader source は `crates/gr-render/shaders/` 以下の Slang を source of trut
 shaders/
   shared/             型に依存しない数学・Slang compatibility
   scene/              mesh entrypoint・material sampling・PBR lighting
-  shadow/             cascade/local shadow・moment filtering
-  post/               compose・FXAA・SSAO・SSR
+  shadow/             Stable CSM・PCSS・local/translucent shadow
+  post/               TAA・compose・SSAO・SSR
     bloom/            bloom downsample/upsample
-    god_rays/         mask/prefilter/radial/temporal
+    god_rays/         legacy mask/prefilter/radial/temporal + CSM/Fog volumetric quality branch
+                       blue-noise ray marching + temporally clamped accumulation
 ```
 
 entrypoint と include 専用 module をファイル名だけで区別せず、責務をディレクトリで固定します。`build.rs` の `SHADERS` manifest が entrypoint、stage、SPIR-V output、Rust asset 名を一元管理し、各ディレクトリを明示的な include search path として渡します。
@@ -116,7 +117,7 @@ Stage 8 では `renderer::pipeline::shader_interface` に mesh shader binding co
 
 temporary debug triangle pipeline は削除済みです。first draw 後は `FrameSnapshot.render_items` が唯一の scene draw 入力になり、asset 未ロード時は scene clear frame を present します。
 
-Stage 7 の mesh pipeline は set 0 binding 0 に `CameraSnapshot` 由来の view/projection uniform を持ちます。scene pass は scene color と normal/roughness の MRT を出力し、post pass は scene color / depth / normal-roughness を sampler として読みます。post pass の antialiasing は追加 target を作らず、3x3 luma から edge 方向を推定して edge 方向に沿った resolve sample を読む高品質 FXAA として実行します。edge 判定は tone-map 前 HDR の生 luma ではなく perceptual luma、depth、normal を併用します。SSR / SSAO / AA / lighting wrap / renderer-wide contrast は `SetQualitySettings` で更新される renderer 状態から push constant と frame uniform へ pack します。
+Stage 7 の mesh pipeline は set 0 binding 0 に `CameraSnapshot` 由来の view/projection uniform を持ちます。scene pass は scene HDR、depth、normal/material のMRTを出力し、Stable CSMのPCSS visibilityをその場で反映します。PCSSの最終filterはset 2 binding 9の比較サンプラ（LINEAR + `LESS_OR_EQUAL`）でhardware 2x2 PCFを使い、binding 10のraw depthはblocker探索だけに使います。blocker/filter各タップにはreceiver-planeのlight-space深度勾配を加え、斜面で同じ比較深度を反復する横縞を抑えます。receiver biasはD16量子化の2段余裕、texel/depth-span、法線角度に応じたslope、receiver-planeの1 texel深度勾配を合成し、balanced/highでは各スケールを引き上げます。タップ回転はラスタピクセルとcascadeの整数hashから生成し、連続ワールド座標sinハッシュ由来の短周期パターンを避けます。その後のHDR TAAは16位相のzero-centroid jitter、stable-grid reprojection、depth/normal confidence、YCoCg variance clampで履歴を蓄積します。post pass はTAA済みHDRとscene metadataを読み、SSR / SSAO / camera effects / tone mappingを適用します。FXAAはTAAとの二重適用を避けるためproduction postでは無効です。SSR / SSAO / AA / lighting wrap / renderer-wide contrast は `SetQualitySettings` で更新される renderer 状態からpush constantとframe uniformへpackします。
 
 full descriptor contents と hot reload error handling は shader interface validation / reload 実装時に扱います。
 

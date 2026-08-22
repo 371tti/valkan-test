@@ -10,11 +10,11 @@ use std::{
 
 use gr_render::{
     protocol::{
-        FrameId, FrameSnapshot, FrameSnapshotBuilder, FramebufferReadbackOptions, LightPacket,
-        LoadedAsset, MessageEnvelope, NativeSurfaceHandle, NonZeroExtent, RenderItemPacket,
-        RenderQualitySettings, RendererCommand, RendererEndpoint, RendererEvent, SceneHandle,
-        SnapshotError, SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, ViewId,
-        ViewPacket, Win32SurfaceHandle, WindowId,
+        DebugDraw, DebugViewMode, FrameId, FrameSnapshot, FrameSnapshotBuilder,
+        FramebufferReadbackOptions, LightPacket, LoadedAsset, MessageEnvelope, NativeSurfaceHandle,
+        NonZeroExtent, RenderItemPacket, RenderQualitySettings, RendererCommand, RendererEndpoint,
+        RendererEvent, SceneHandle, SnapshotError, SurfaceDescriptor, SurfaceGeneration, SurfaceId,
+        TransportError, ViewId, ViewPacket, Win32SurfaceHandle, WindowId,
     },
     renderer::{RendererError, RendererThread, VulkanRendererBackend, spawn_renderer_thread},
 };
@@ -45,16 +45,68 @@ const DEFAULT_WINDOW_LIGHT_INTENSITY: f32 = 1.15;
 const MIN_WINDOW_LIGHT_INTENSITY: f32 = 0.0;
 const MAX_WINDOW_LIGHT_INTENSITY: f32 = 24.0;
 const LIGHT_CHANGE_STOPS_PER_SECOND: f32 = 1.6;
+const DAY_NIGHT_CYCLE_SECONDS: f32 = 10.0 * 60.0;
 const WINDOW_ASSET_ENV: &str = "REBUILD1_WINDOW_ASSET";
 const WINDOW_TRANSPORT_CAPACITY: usize = 32;
-const WINDOW_SMOKE_PRESENTED_FRAME_LIMIT: u64 = 6;
+const WINDOW_SMOKE_FRAMES_ENV: &str = "REBUILD1_WINDOW_SMOKE_FRAMES";
+const DEFAULT_WINDOW_SMOKE_FRAMES: u64 = 6;
+const MIN_WINDOW_SMOKE_FRAMES: u64 = 1;
+const MAX_WINDOW_SMOKE_FRAMES: u64 = 600;
 const SHUTDOWN_RETRY_SLEEP: Duration = Duration::from_millis(1);
 const EVENT_PUMP_INTERVAL: Duration = Duration::from_millis(16);
 const WINDOW_MAX_FPS_ENV: &str = "REBUILD1_MAX_FPS";
 const DEFAULT_WINDOW_MAX_FPS: u32 = 120;
 const MIN_WINDOW_MAX_FPS: u32 = 15;
 const MAX_WINDOW_MAX_FPS: u32 = 240;
-const INITIAL_WINDOW_QUALITY: WindowQualityPreset = WindowQualityPreset::HighQuality;
+// Start on the temporally stable path. Performance remains available on key 1 for explicit
+// low-latency work, but it intentionally disables color TAA and should not be the visual default.
+const INITIAL_WINDOW_QUALITY: WindowQualityPreset = WindowQualityPreset::Balanced;
+
+/// Builds the single global directional light for a ten-minute dawn-to-dawn orbit.
+///
+/// Phase zero is sunrise, one quarter is noon, one half is sunset, and three quarters is
+/// midnight. The moon follows the opposite half of the same orbit, while the horizon fade keeps
+/// either light from snapping on when it crosses the horizon.
+fn day_night_light(elapsed_seconds: f32, user_intensity: f32) -> LightPacket {
+    let phase = elapsed_seconds.rem_euclid(DAY_NIGHT_CYCLE_SECONDS) / DAY_NIGHT_CYCLE_SECONDS;
+    let angle = phase * std::f32::consts::TAU;
+    let elevation = angle.sin();
+    let daylight = smoothstep(0.0, 0.12, elevation);
+    let moonlight = smoothstep(0.0, 0.10, -elevation);
+    let is_day = elevation >= 0.0;
+
+    let celestial_x = if is_day { angle.cos() } else { -angle.cos() };
+    let celestial_y = elevation.abs().max(0.02);
+    let celestial_z = if is_day { 0.32 } else { -0.32 };
+    let direction = [-celestial_x, -celestial_y, -celestial_z];
+
+    let horizon = 1.0 - elevation.abs().clamp(0.0, 1.0);
+    let daylight_color = mix3([3.35, 1.55, 0.62], [3.00, 2.65, 2.15], 1.0 - horizon);
+    let moonlight_color = [0.62, 0.78, 1.18];
+    let color = if is_day {
+        daylight_color
+    } else {
+        moonlight_color
+    };
+    let celestial_intensity = if is_day {
+        0.08 + 0.92 * daylight
+    } else {
+        0.025 + 0.095 * moonlight
+    };
+
+    LightPacket::new(user_intensity * celestial_intensity)
+        .with_direction_and_color(direction, color)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    std::array::from_fn(|index| a[index] + (b[index] - a[index]) * t)
+}
 
 #[derive(Debug, Error)]
 pub enum WindowedRunError {
@@ -182,7 +234,7 @@ pub fn run_windowed() -> Result<(), WindowedRunError> {
 pub fn run_windowed_smoke() -> Result<(), WindowedRunError> {
     let config = WindowConfig::default()
         .without_initial_mouse_capture()
-        .with_presented_frame_limit(WINDOW_SMOKE_PRESENTED_FRAME_LIMIT)
+        .with_presented_frame_limit(configured_window_smoke_frames())
         .require_loaded_asset_before_frame_limit();
     run_windowed_with_config(config)
 }
@@ -262,7 +314,9 @@ struct WindowedApp {
     camera_effects: CameraEffectController,
     latest_framebuffer_metering: Option<CameraMetering>,
     quality_preset: WindowQualityPreset,
+    debug_view_mode: DebugViewMode,
     light_intensity: f32,
+    day_night_started_at: Instant,
     light_brighter: bool,
     light_darker: bool,
     last_frame_at: Instant,
@@ -382,7 +436,9 @@ impl WindowedApp {
             camera_effects: CameraEffectController::default(),
             latest_framebuffer_metering: None,
             quality_preset: INITIAL_WINDOW_QUALITY,
+            debug_view_mode: DebugViewMode::Disabled,
             light_intensity: DEFAULT_WINDOW_LIGHT_INTENSITY,
+            day_night_started_at: now,
             light_brighter: false,
             light_darker: false,
             last_frame_at: now,
@@ -681,11 +737,20 @@ impl WindowedApp {
             FrameSnapshotBuilder::new(frame_id, scene, self.config.surface_id, drawable.generation);
         builder
             .add_view(ViewPacket::new(view, drawable.extent).with_camera(self.camera.snapshot()));
-        let light = LightPacket::new(self.light_intensity);
+        let light = day_night_light(
+            self.day_night_started_at.elapsed().as_secs_f32(),
+            self.light_intensity,
+        );
         let screen_metering = self.screen_metering_for_frame();
         let camera_effects: gr_render::prelude::CameraEffects =
             self.camera_effects.update(screen_metering, delta_time);
-        builder.add_light(light).set_camera_effects(camera_effects);
+        builder
+            .add_light(light)
+            .set_camera_effects(camera_effects)
+            .set_debug_draw(DebugDraw {
+                show_bounds: false,
+                view_mode: self.debug_view_mode,
+            });
         self.add_loaded_model_items(&mut builder);
         Ok(builder.build()?)
     }
@@ -1107,6 +1172,14 @@ impl WindowedApp {
             }
 
             match physical_key {
+                PhysicalKey::Code(KeyCode::F12) => {
+                    self.debug_view_mode = self.debug_view_mode.next();
+                    tracing::info!(
+                        mode = self.debug_view_mode.label(),
+                        "changed renderer debug view"
+                    );
+                    return Ok(());
+                }
                 PhysicalKey::Code(KeyCode::PageUp) => {
                     self.adjust_camera_smoothing(1);
                     return Ok(());
@@ -1258,6 +1331,18 @@ fn configured_frame_interval() -> Duration {
     Duration::from_secs_f64(1.0 / fps as f64)
 }
 
+/// Returns the loaded-asset frame budget used by the bounded native smoke run.
+fn configured_window_smoke_frames() -> u64 {
+    parse_window_smoke_frames(std::env::var(WINDOW_SMOKE_FRAMES_ENV).ok().as_deref())
+}
+
+fn parse_window_smoke_frames(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WINDOW_SMOKE_FRAMES)
+        .clamp(MIN_WINDOW_SMOKE_FRAMES, MAX_WINDOW_SMOKE_FRAMES)
+}
+
 /// Copies winit raw handles into a sendable protocol surface handle.
 fn native_surface_handle(window: &Window) -> Result<NativeSurfaceHandle, WindowedRunError> {
     let raw_display = window.display_handle()?.as_raw();
@@ -1364,6 +1449,9 @@ impl ApplicationHandler<WindowUserEvent> for WindowedApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::F12) {
+                    return;
+                }
                 if let Err(error) = self.handle_keyboard(event.physical_key, event.state) {
                     self.fail_and_exit(error.into(), event_loop);
                 }
@@ -1436,6 +1524,15 @@ mod tests {
     use gr_render::protocol::renderer_transport;
 
     #[test]
+    fn window_smoke_frame_override_defaults_and_clamps() {
+        assert_eq!(parse_window_smoke_frames(None), 6);
+        assert_eq!(parse_window_smoke_frames(Some("invalid")), 6);
+        assert_eq!(parse_window_smoke_frames(Some("0")), 1);
+        assert_eq!(parse_window_smoke_frames(Some("240")), 240);
+        assert_eq!(parse_window_smoke_frames(Some("601")), 600);
+    }
+
+    #[test]
     fn number_keys_select_window_quality_presets() {
         assert_eq!(
             WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Digit1)),
@@ -1502,6 +1599,25 @@ mod tests {
         app.handle_keyboard(PhysicalKey::Code(KeyCode::PageDown), ElementState::Pressed)
             .expect("page down should keep lowering local camera smoothing");
         assert!(app.camera.smoothing_seconds() < initial);
+    }
+
+    #[test]
+    fn f12_cycles_all_debug_views_and_returns_to_scene() {
+        let config = WindowConfig::default();
+        let (endpoint, _inbox) = renderer_transport(1);
+        let mut app = WindowedApp::new(endpoint, config);
+
+        let expected = [
+            DebugViewMode::Normals,
+            DebugViewMode::Depth,
+            DebugViewMode::PcssFilterRadius,
+            DebugViewMode::Disabled,
+        ];
+        for mode in expected {
+            app.handle_keyboard(PhysicalKey::Code(KeyCode::F12), ElementState::Pressed)
+                .expect("F12 debug view change should remain app-local");
+            assert_eq!(app.debug_view_mode, mode);
+        }
     }
 
     // Verifies that window shutdown does not use tokio's blocking send inside a runtime.
@@ -1571,5 +1687,22 @@ mod tests {
         app.light_darker = true;
         app.update_light_for_frame(1.0);
         assert!(app.light_intensity < initial);
+    }
+
+    #[test]
+    fn day_night_cycle_switches_from_sun_to_moon_and_wraps_at_ten_minutes() {
+        let sunrise = day_night_light(0.0, 1.0);
+        let noon = day_night_light(DAY_NIGHT_CYCLE_SECONDS * 0.25, 1.0);
+        let midnight = day_night_light(DAY_NIGHT_CYCLE_SECONDS * 0.75, 1.0);
+        let wrapped = day_night_light(DAY_NIGHT_CYCLE_SECONDS, 1.0);
+
+        assert!(noon.intensity > midnight.intensity);
+        assert!(noon.color[0] > noon.color[2]);
+        assert!(midnight.color[2] > midnight.color[0]);
+        assert!(noon.direction[1] < -0.9);
+        assert!(midnight.direction[1] < -0.9);
+        assert_eq!(sunrise.direction, wrapped.direction);
+        assert_eq!(sunrise.color, wrapped.color);
+        assert_eq!(sunrise.intensity, wrapped.intensity);
     }
 }

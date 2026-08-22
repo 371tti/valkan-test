@@ -1,7 +1,5 @@
 #include "slang_compat.slang"
 
-#include "shadow_alpha.slang"
-
 layout(location = 0) in float2 frag_uv;
 layout(location = 1) in float4 frag_color;
 
@@ -16,9 +14,7 @@ struct MaterialParams {
 [shader("fragment")]
 void main() {
     float alpha = frag_color.a * material.base_color_factor.a;
-    discard_opaque_shadow_alpha(
-        material.flags.x,
-        material.pbr_alpha.z,
-        alpha
-    );
+    if (alpha <= material.pbr_alpha.z) {
+        discard;
+    }
 }

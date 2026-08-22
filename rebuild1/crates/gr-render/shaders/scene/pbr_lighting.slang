@@ -204,11 +204,9 @@ float local_shadow_sample_depth(int shadow_index, float3 direction) {
 float local_shadow_compare(
     int shadow_index,
     float3 direction,
-    float compare_depth,
-    float bias
+    float compare_depth
 ) {
-    float shadow_depth = compare_depth - bias;
-    return step(shadow_depth, local_shadow_sample_depth(shadow_index, direction));
+    return step(compare_depth, local_shadow_sample_depth(shadow_index, direction));
 }
 
 float local_light_visibility(
@@ -242,14 +240,41 @@ float local_light_visibility(
         near_plane,
         far_plane
     );
-    float slope_bias = 0.0012 + 0.0045 * (1.0 - clamp(ndotl, 0.0, 1.0));
-    float source_bias = clamp(source_radius * rcp_safe(far_plane, 0.0001) * 0.015, 0.0, 0.006);
+    float slope_bias = 0.00075 + 0.0028 * (1.0 - clamp(ndotl, 0.0, 1.0));
+    float source_bias = clamp(source_radius * rcp_safe(far_plane, 0.0001) * 0.012, 0.0, 0.003);
     float bias = slope_bias + source_bias;
-    float visibility = local_shadow_compare(
-        shadow_index,
-        light_to_receiver,
-        receiver_depth,
-        bias
+
+    float3 sample_direction = light_to_receiver;
+    float3 basis_axis = abs(sample_direction.z) < 0.999
+        ? float3(0.0, 0.0, 1.0)
+        : float3(0.0, 1.0, 0.0);
+    float3 tangent = normalize_fast(cross(basis_axis, sample_direction));
+    float3 bitangent = cross(sample_direction, tangent);
+    float diagonal_offset = max(shadow_params.y, 0.0) * 0.70710678;
+    float3 tangent_offset = tangent * diagonal_offset;
+    float3 bitangent_offset = bitangent * diagonal_offset;
+    float compare_depth = receiver_depth - bias;
+    float visibility = 0.25 * (
+        local_shadow_compare(
+            shadow_index,
+            sample_direction + tangent_offset + bitangent_offset,
+            compare_depth
+        ) +
+        local_shadow_compare(
+            shadow_index,
+            sample_direction + tangent_offset - bitangent_offset,
+            compare_depth
+        ) +
+        local_shadow_compare(
+            shadow_index,
+            sample_direction - tangent_offset + bitangent_offset,
+            compare_depth
+        ) +
+        local_shadow_compare(
+            shadow_index,
+            sample_direction - tangent_offset - bitangent_offset,
+            compare_depth
+        )
     );
 
     return lerp(1.0, clamp(visibility, 0.04, 1.0), clamp(shadow_strength * 1.12, 0.0, 1.0));
@@ -276,19 +301,11 @@ float3 local_light_resolved_lighting(
     float sample_weight,
     int light_index
 ) {
-    if (emission_facing <= 0.0001 || sample_weight <= 0.0001) {
-        return float3(0.0);
-    }
-
-    if (ndotl <= 0.0001) {
+    if (min(min(emission_facing, sample_weight), ndotl) <= 0.0001) {
         return float3(0.0);
     }
 
     float falloff = local_light_falloff_in_range(distance_sq, range_sq);
-    if (falloff <= 0.000001) {
-        return float3(0.0);
-    }
-
     float visibility = local_light_visibility(
         light_index,
         light,
@@ -442,7 +459,6 @@ float3 rectangular_area_light_lighting(
     float range_sq,
     float reach_sq,
     float3 direction,
-    float2 half_size,
     float source_radius,
     float shadow_strength,
     int light_index
@@ -480,7 +496,7 @@ float3 rectangular_area_light_lighting(
         center_ndotl,
         radiance_color,
         range_sq,
-        max(source_radius, length(half_size)),
+        source_radius,
         0.0,
         facing,
         visibility,
@@ -538,7 +554,6 @@ float3 emissive_mesh_lighting(
                 range_sq,
                 reach * reach,
                 light_direction_radius.xyz,
-                half_size,
                 rect_source_radius,
                 shadow_strength,
                 i
@@ -587,54 +602,79 @@ float3 emissive_mesh_lighting(
     return direct;
 }
 
-float4 pbr_shadow(float3 normal, float ndotl) {
-    float camera_depth = max(frag_view_depth, 0.0);
+float3 pbr_shadow(
+    float3 shadow_normal,
+    float3 light,
+    float2 shadow_sample_seed,
+    out float opaque_visibility,
+    out float3 transmittance
+) {
+    float camera_depth = frag_view_depth;
     return shadow_factor(
-        shadow_cascade_0,
-        shadow_cascade_1,
-        shadow_cascade_2,
-        shadow_cascade_3,
-        raw_shadow_cascade_0,
-        raw_shadow_cascade_1,
-        raw_shadow_cascade_2,
-        raw_shadow_cascade_3,
+        shadow_depth_raw,
+        shadow_depth,
         translucent_shadow_0,
         translucent_shadow_1,
         translucent_shadow_2,
         translucent_shadow_3,
         frame_camera.shadow_view_proj,
         frag_world_pos,
-        normal,
+        shadow_sample_seed,
+        shadow_normal,
+        light,
         camera_depth,
         frame_camera.shadow_cascade_splits,
         frame_camera.shadow_cascade_texel_world,
         frame_camera.shadow_cascade_depth_span,
-        frame_camera.contact_shadow,
+        frame_camera.shadow_cascade_resolution,
+        frame_camera.stable_csm_pcss_params,
+        frame_camera.stable_csm_receiver_params,
         frame_camera.light_color.w,
-        ndotl
+        opaque_visibility,
+        transmittance
     );
 }
 
 bool scene_lighting_disabled() {
     bool directional =
-        frame_camera.light_dir.w > 0.5 &&
         dot(frame_camera.light_color.rgb, frame_camera.light_color.rgb) > 0.000001;
     bool environment =
         frame_camera.ambient_color.w > 0.000001 ||
         dot(frame_camera.ambient_color.rgb, frame_camera.ambient_color.rgb) > 0.000001;
+#ifdef SCENE_FAST_PATH
+    return !directional && !environment;
+#else
     bool local = frame_camera.emissive_light_count.x > 0.5;
     return !directional && !environment && !local;
+#endif
 }
 
 float3 shade_pbr(
     float3 base_color,
     float3 normal,
+    float3 shadow_normal,
     float metallic,
     float roughness,
     float occlusion,
     float3 emissive,
-    float alpha
+    float alpha,
+    float2 shadow_sample_seed
 ) {
+    bool debug_filter_radius = frame_camera.debug_view.x > 2.5 && frame_camera.debug_view.x < 3.5;
+    if (debug_filter_radius) {
+        float debug_visibility;
+        float3 debug_transmittance;
+        if (frame_camera.light_dir.w > 0.5) {
+            return pbr_shadow(
+                shadow_normal,
+                -frame_camera.light_dir.xyz,
+                shadow_sample_seed,
+                debug_visibility,
+                debug_transmittance
+            );
+        }
+        return float3(0.0);
+    }
     base_color = max(base_color, float3(0.0));
     roughness = clamp(roughness, 0.04, 1.0);
     metallic = clamp(metallic, 0.0, 1.0);
@@ -652,10 +692,9 @@ float3 shade_pbr(
 
     float3 direct = float3(0.0);
     float3 light = float3(0.0, 1.0, 0.0);
-    float4 shadow = float4(1.0);
     float directional_visibility = 1.0;
+    float3 directional_transmittance = float3(1.0);
     bool has_directional_light =
-        frame_camera.light_dir.w > 0.5 &&
         dot(frame_camera.light_color.rgb, frame_camera.light_color.rgb) > 0.000001;
 
     if (has_directional_light) {
@@ -663,8 +702,19 @@ float3 shade_pbr(
         float ndotl = saturate(dot(normal, light));
 
         if (ndotl > 0.0001) {
-            shadow = pbr_shadow(normal, ndotl);
-            directional_visibility = shadow_visibility(shadow.rgb);
+            // `light_dir.w` reports shadow-map availability, not whether the light exists. A
+            // caster-free scene still receives direct light and skips all cascade samples.
+            if (frame_camera.light_dir.w > 0.5 && direct_lighting_weight > 0.0001) {
+                pbr_shadow(
+                    shadow_normal,
+                    light,
+                    shadow_sample_seed,
+                    directional_visibility,
+                    directional_transmittance
+                );
+            } else {
+                directional_visibility = 1.0;
+            }
 
             if (direct_lighting_weight > 0.0001) {
                 float3 half_vector = normalize_fast(light + view);
@@ -683,31 +733,18 @@ float3 shade_pbr(
                     rcp_safe(4.0 * ndotv * ndotl, 0.0001);
                 specular *= spec_boost;
 
-                float diffuse_contact = clamp(shadow.a, 0.0, 1.0);
-                float contact_occlusion = 1.0 - diffuse_contact;
-                float specular_contact_strength =
-                    lerp(0.62, 1.0, roughness) *
-                    (1.0 - metallic * smoothness * 0.32);
-                float specular_contact =
-                    1.0 - contact_occlusion * specular_contact_strength;
-                float3 specular_shadow =
-                    direct_specular_shadow(
-                        shadow.rgb,
-                        roughness,
-                        directional_visibility
-                    );
-
-                direct = (
-                        diffuse * diffuse_contact * shadow.rgb +
-                        specular * specular_contact * specular_shadow
+                float3 directional_radiance = (
+                        diffuse + specular
                     ) *
+                    directional_transmittance *
                     frame_camera.light_color.rgb *
                     ndotl;
+                direct = directional_radiance * directional_visibility;
             }
         }
     }
-
     if (direct_lighting_weight > 0.0001) {
+#ifndef SCENE_FAST_PATH
         direct += emissive_mesh_lighting(
             base_color,
             normal,
@@ -718,6 +755,7 @@ float3 shade_pbr(
             roughness,
             spec_boost
         );
+#endif
         direct *= direct_lighting_weight;
     }
 
@@ -754,22 +792,12 @@ float3 shade_pbr(
 
     float3 indirect_specular = float3(0.0);
     if (dot(specular_env, specular_env) > 0.000001) {
-        float reflected_light_shadow = has_directional_light
-            ? reflected_directional_shadow(
-                reflection,
-                light,
-                shadow.rgb,
-                roughness,
-                directional_visibility
-            )
-            : 1.0;
         indirect_specular =
             specular_env *
             fresnel_schlick_roughness(ndotv, f0, roughness) *
             (0.18 + smoothness * smoothness * 0.82) *
             specular_occlusion(ndotv, occlusion, roughness) *
-            spec_boost *
-            reflected_light_shadow;
+            spec_boost;
     }
 
     return indirect_diffuse + indirect_specular + direct + emissive;

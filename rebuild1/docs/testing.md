@@ -95,6 +95,19 @@ message protocol は unit test します。renderer を実際に動かさなく�
 
 ## Current manual checks
 
+影の目視確認では、通常シーンで次を順に確認します。
+
+- キー `1`〜`4` を切り替え、CSMの段数・split位置は変わらず、`4`だけ全カスケードが8192²へ上がること。切替時にログの `rebuilding Stable CSM resources for shared quality resolution` が一度だけ出ること。
+- 各splitの前後をカメラで横切り、境界でshadowが段差・点滅せず隣接cascadeへ滑らかにblendすること。
+- 平面や斜面を太陽方向へ向け、PCSS tap数を高品質へ上げても規則的な横縞が増えず、receiver-plane補正後にacneが細い帯へ増幅されないこと。
+- 影の自己接触部でD16量子化余裕を含むslope bias/normal offsetが効き、acneが消えつつ輪郭が大きく浮かないこと。キー`3`/`4`ではreceiver-planeの1 texel勾配も加わるため、横縞の低減と過剰なpeter-panningの両方を確認する。
+- F12を順に切り替え、`normals` → `linear_depth` → `pcss_filter_radius` → `scene`となること。`pcss_filter_radius`では各fragmentの `filter_radius_uv * cascade_resolution / 20` がグレースケール表示され、blockerがない領域は黒になること。
+- `high_quality()` ではgod rayがCSMで遮蔽され、遮蔽された建物や柱の後ろで光束が切れること。balancedでは従来の画面空間近似のまま、highでは放射ブラーの二重掛けや画面中心固定の光線が出ないこと。
+- highのFogは太陽が画面外でも薄く残り、異方性の筋だけが光源方向へ変化すること。遮蔽物の手前ではFogが連続し、表面を貫通して明るくならないこと。
+- 高品質god rayのカメラ移動時に、CSM境界・画面端・背景からジオメトリへ入る箇所で点滅や急な露出ジャンプがないこと。
+- 高品質god rayの平坦な霧で、固定深度サンプル由来の層状バンドが視認できず、カメラを静止したまま数フレーム待つとblue-noiseの粒状感がTAAで均されること。カメラを急旋回した直後に古い層が残らないこと。
+- 葉や細い枝のような複雑なcutoutシルエットを横切っても、葉の隙間だけFogが消えたり、輪郭の外側へ薄いFogの膜が漏れたりしないこと。特に前景・背景を交互に含む細かい葉群で、数フレーム後もエッジが安定していること。
+
 Stage 8 の手元確認は次を使います。
 
 ```powershell
@@ -102,6 +115,20 @@ cargo run -- --headless
 $env:RUST_LOG='rebuild1=info,winit=info'; cargo run -- --window-smoke
 $env:REBUILD1_WINDOW_ASSET='assets/stage8_textured_cutout.r1scene'; $env:RUST_LOG='rebuild1=info,winit=info'; cargo run -- --window-smoke
 $env:REBUILD1_WINDOW_ASSET='assets/stage9_translucent_shadow.r1scene'; $env:RUST_LOG='rebuild1=info,winit=info'; cargo run -- --window-smoke
+```
+
+まとめて確認する場合（format check、workspace check、gr-render unit test、Vulkan smoke）:
+
+```powershell
+.\scripts\verify-renderer.ps1
+```
+
+個別実行やsmokeフレーム数の変更もできます。
+
+```powershell
+.\scripts\verify-renderer.ps1 -Mode check
+.\scripts\verify-renderer.ps1 -Mode smoke -SmokeFrames 12
+.\scripts\verify-renderer.ps1 -Mode smoke -SmokeFrames 6 -Asset assets/stage9_translucent_shadow.r1scene
 ```
 
 確認対象:

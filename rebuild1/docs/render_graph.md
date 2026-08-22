@@ -37,12 +37,18 @@ Resource は graph 上の名前付き handle として扱います。
 SwapchainImage
 SceneColor
 SceneDepth
-ShadowCascade0
-ShadowCascade1
-ShadowCascade2
+SceneNormalRoughness
+SceneDirectionalShadowResponse
+DirectionalShadowDepthArray
 TranslucentShadow0
 TranslucentShadow1
 TranslucentShadow2
+TranslucentShadow3
+TemporalShadowCurrent
+TemporalShadowHistory0
+TemporalShadowHistory1
+TaaHistory0
+TaaHistory1
 FrameUniformBuffer
 MaterialBuffer
 TextureArray
@@ -82,14 +88,15 @@ RenderPass
 
 | Order | Pass | Reads | Writes | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | `shadow_cascade_0..2` | mesh packets | shadow cascade depth | cascade ごとに opaque/cutout caster を depth-only pipeline で描く。 |
-| 2 | `translucent_shadow_0..2` | shadow cascade depth, mesh packets | transmittance color | opaque depth を shader sample し、transparent caster を multiplicative blend で描く。 |
-| 3 | `scene` | render items, shadow cascades, transmittance maps | scene color, scene normal/roughness, scene depth | main camera。mesh indexed draw をここで描く。 |
-| 4 | `post` | scene color, scene depth, scene normal/roughness | swapchain image | SSR、tone mapping、camera effects、gamma。 |
-| 5 | `framebuffer_readback` | swapchain image | CPU readback buffer | request がある frame だけ final framebuffer summary を返す。 |
-| 6 | `present` | swapchain image | external presentation | side effect pass として culling から守る。 |
+| 1 | `shadow_direction_0..3/cascade_0..3` | mesh packets | D16 array layer | 4 cascadeをstable light-space gridへ描き、各層は1回だけ更新する。 |
+| 2 | `translucent_shadow_0..3` | CSM depth, mesh packets | nearest transmittance/depth | 基準方向だけを使い、depth test/writeで最前面のtransparent casterだけを残す。 |
+| 3 | `scene` | D16 array, transmittance maps | scene HDR, normal/roughness, depth | blocker探索はraw depth、PCSSの最終filterは比較サンプラのhardware 2x2 PCFで評価し、cascade境界をblendする。 |
+| 4 | `taa` | scene HDR、opaque depth/normal、transparent metadata、previous TAA history | HDR TAA history | stable-grid reprojection、同一surfaceのhistory count、YCoCg variance clampで蓄積する。transparent coverageの不一致は棄却し、一致時はreactive blendする。 |
+| 6 | `post` | TAA history, jittered scene metadata, bloom/god-ray histories | swapchain image | stable output UVをjittered metadata UVへ明示変換し、SSAO、SSR、bloom、god rays、tone mapping、camera effectsを適用する。 |
+| 7 | `framebuffer_readback` | swapchain image | CPU readback buffer | requestがあるframeだけfinal framebuffer summaryを返す。 |
+| 8 | `present` | swapchain image | external presentation | side effect passとしてcullingから守る。 |
 
-transparent shadow は shader variant だけではなく、graph pass と resource として明示します。opaque depth と translucent transmittance を別 resource にすることで、layout transition と descriptor indexing を追える状態にします。
+Directional depthは一つのD16 arrayとして管理し、同じ方向を全cascadeで共有します。soft shadowは空間的な大半径filterではなく、太陽円盤上の方向jitterと時間履歴で収束させます。shadow historyはTAAと同じprevious view-projection、linear depth、world-space normal判定を使います。
 
 ## Resize
 
@@ -110,7 +117,7 @@ resize では swapchain dependent resource だけを破棄して作り直しま�
 - imported scene
 - CPU scene state
 - shader source watcher
-- fixed cascade shadow depth/transmittance targets
+- fixed directional D16 array and transmittance targets
 
 ## Pass schedule
 
@@ -123,7 +130,7 @@ shadow を light 変化時だけ更新する、readback を request frame だけ
 
 ## Stage 7.5 compiler gate
 
-Stage 7.5 では fixed swapchain graph をやめ、pass/resource 宣言から plan を生成します。現在の executor はこの plan を実際に使い、cascade shadow、translucent shadow、scene、post、readback、present の image layout transition を graph barrier から記録します。
+Stage 7.5 では fixed swapchain graph をやめ、pass/resource 宣言から plan を生成します。現在のexecutorはこのplanを実際に使い、Stable CSM depth array、translucent shadow、scene、TAA、post、readback、presentのimage layout transitionをgraph barrierから記録します。
 
 compiler が行うこと:
 
@@ -138,23 +145,26 @@ compiler が行うこと:
 現在の標準実行 graph:
 
 ```text
-shadow_cascade_0
-shadow_cascade_1
-shadow_cascade_2
-  writes: shadow_cascade_N
+shadow_direction_0..3 / cascade_0..3
+  writes: directional_shadow_depth_array[layer]
 
 translucent_shadow_0
 translucent_shadow_1
 translucent_shadow_2
-  reads: shadow_cascade_N as shader_read
+translucent_shadow_3
+  reads: direction_0 depth layer as sampled D16
   writes: translucent_shadow_N
 
 scene
-  reads: shadow_cascade_0..2, translucent_shadow_0..2
-  writes: scene_color, scene_depth
+  reads: stable_csm_depth_array, translucent_shadow_0..3
+  writes: scene_color, scene_depth, scene_normal
+
+taa
+  reads: scene HDR, scene depth/normal/transparent metadata, previous TAA history
+  writes: taa_history[current]
 
 post
-  reads: scene_color
+  reads: taa_history[current]
   writes: swapchain_image
 
 present

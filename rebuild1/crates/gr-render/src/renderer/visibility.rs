@@ -8,6 +8,7 @@ pub(crate) enum MeshLodLevel {
     Full,
     Medium,
     Low,
+    VeryLow,
 }
 
 impl MeshLodLevel {
@@ -17,6 +18,7 @@ impl MeshLodLevel {
             Self::Full => 0,
             Self::Medium => 1,
             Self::Low => 2,
+            Self::VeryLow => 3,
         }
     }
 }
@@ -41,6 +43,7 @@ pub(crate) fn classify_mesh(
     aspect: f32,
     viewport_height: u32,
     bounds: Option<SceneBounds>,
+    triangle_count: usize,
     settings: RenderOptimizationSettings,
 ) -> MeshVisibility {
     let Some(bounds) = bounds else {
@@ -57,7 +60,15 @@ pub(crate) fn classify_mesh(
     }
 
     MeshVisibility::Visible {
-        lod: choose_lod(camera, basis, viewport_height, bounds, settings),
+        lod: choose_lod(
+            camera,
+            basis,
+            aspect,
+            viewport_height,
+            bounds,
+            triangle_count,
+            settings,
+        ),
     }
 }
 
@@ -109,25 +120,70 @@ fn sphere_intersects_frustum(
 fn choose_lod(
     camera: CameraSnapshot,
     basis: CameraBasis,
+    aspect: f32,
     viewport_height: u32,
     bounds: SceneBounds,
+    triangle_count: usize,
     settings: RenderOptimizationSettings,
 ) -> MeshLodLevel {
     if !settings.distance_lod() {
         return MeshLodLevel::Full;
     }
 
-    let Some(radius_px) = projected_radius_px(camera, basis, viewport_height, bounds) else {
-        return MeshLodLevel::Full;
-    };
-
-    if radius_px >= settings.high_detail_screen_radius_px() {
-        MeshLodLevel::Full
-    } else if radius_px >= settings.medium_detail_screen_radius_px() {
-        MeshLodLevel::Medium
+    let viewport_area_px = viewport_pixel_area(aspect, viewport_height);
+    let projected_radius = projected_radius_px(camera, basis, viewport_height, bounds);
+    let (size_lod, projected_area_px) = if let Some(radius_px) = projected_radius {
+        let size_lod = if radius_px >= settings.high_detail_screen_radius_px() {
+            MeshLodLevel::Full
+        } else if radius_px >= settings.medium_detail_screen_radius_px() {
+            MeshLodLevel::Medium
+        } else if radius_px >= settings.medium_detail_screen_radius_px() * 0.25 {
+            MeshLodLevel::Low
+        } else {
+            MeshLodLevel::VeryLow
+        };
+        let circle_area = std::f32::consts::PI * radius_px * radius_px;
+        (size_lod, circle_area.min(viewport_area_px))
     } else {
-        MeshLodLevel::Low
+        // A sphere crossing the near plane (including a camera inside the bounds) has no finite
+        // perspective radius. It can cover the screen, but it must not bypass triangle-density
+        // LOD: high-poly camera shells were otherwise forced to full detail at the worst moment.
+        (MeshLodLevel::Full, viewport_area_px)
+    };
+    let density_lod = triangle_density_lod(projected_area_px, triangle_count);
+    if size_lod.index() >= density_lod.index() {
+        size_lod
+    } else {
+        density_lod
     }
+}
+
+/// Prevents sub-pixel triangles from keeping an otherwise large high-poly mesh at full detail.
+fn triangle_density_lod(projected_area_px: f32, triangle_count: usize) -> MeshLodLevel {
+    // One source triangle per covered pixel is deliberately conservative: closed meshes normally
+    // rasterize only their front-facing subset, while thin double-sided geometry needs the full
+    // budget. Values above one retain geometry that is already sub-pixel before rasterization.
+    const TRIANGLES_PER_PIXEL: f32 = 1.0;
+    const MIN_TRIANGLE_BUDGET: f32 = 128.0;
+    let budget = (projected_area_px * TRIANGLES_PER_PIXEL).max(MIN_TRIANGLE_BUDGET);
+    let triangles = triangle_count as f32;
+
+    if triangles <= budget {
+        MeshLodLevel::Full
+    } else if triangles * 0.60 <= budget {
+        MeshLodLevel::Medium
+    } else if triangles * 0.30 <= budget {
+        MeshLodLevel::Low
+    } else {
+        MeshLodLevel::VeryLow
+    }
+}
+
+/// Returns the actual viewport pixel budget reconstructed from its height and aspect ratio.
+fn viewport_pixel_area(aspect: f32, viewport_height: u32) -> f32 {
+    let height = viewport_height.max(1) as f32;
+    let width = (height * aspect.max(0.001)).max(1.0);
+    width * height
 }
 
 /// Projects a sphere radius into pixels using the active vertical field of view.
@@ -181,6 +237,7 @@ mod tests {
             16.0 / 9.0,
             720,
             Some(bounds([0.0, 0.0, 2.0], 0.5)),
+            300,
             RenderOptimizationSettings::balanced(),
         );
 
@@ -194,19 +251,20 @@ mod tests {
 
     // Verifies that distant small objects select the coarsest generated index LOD.
     #[test]
-    fn distant_small_sphere_uses_low_lod() {
+    fn distant_small_sphere_uses_very_low_lod() {
         let decision = classify_mesh(
             camera(),
             16.0 / 9.0,
             720,
             Some(bounds([0.0, 0.0, -90.0], 0.5)),
+            300,
             RenderOptimizationSettings::balanced(),
         );
 
         assert_eq!(
             decision,
             MeshVisibility::Visible {
-                lod: MeshLodLevel::Low
+                lod: MeshLodLevel::VeryLow
             }
         );
     }
@@ -219,6 +277,7 @@ mod tests {
             16.0 / 9.0,
             720,
             Some(bounds([0.0, 0.0, -3.0], 1.0)),
+            300,
             RenderOptimizationSettings::balanced(),
         );
 
@@ -238,6 +297,7 @@ mod tests {
             16.0 / 9.0,
             720,
             Some(bounds([0.0, 0.0, -8.0], 1.0)),
+            300,
             RenderOptimizationSettings::balanced(),
         );
 
@@ -257,7 +317,88 @@ mod tests {
             16.0 / 9.0,
             720,
             Some(bounds([0.0, 0.0, -90.0], 0.5)),
+            1_000_000,
             RenderOptimizationSettings::disabled(),
+        );
+
+        assert_eq!(
+            decision,
+            MeshVisibility::Visible {
+                lod: MeshLodLevel::Full
+            }
+        );
+    }
+
+    #[test]
+    fn dense_near_mesh_avoids_subpixel_full_detail_triangles() {
+        let decision = classify_mesh(
+            camera(),
+            16.0 / 9.0,
+            720,
+            Some(bounds([0.0, 0.0, -3.0], 1.0)),
+            500_000,
+            RenderOptimizationSettings::balanced(),
+        );
+
+        assert_eq!(
+            decision,
+            MeshVisibility::Visible {
+                lod: MeshLodLevel::VeryLow
+            }
+        );
+    }
+
+    // A sphere larger than the screen must not invent off-screen pixels to justify full geometry.
+    #[test]
+    fn ten_million_triangle_closeup_is_bounded_by_viewport_pixels() {
+        let decision = classify_mesh(
+            camera(),
+            16.0 / 9.0,
+            720,
+            Some(bounds([0.0, 0.0, -0.2], 1.0)),
+            10_000_000,
+            RenderOptimizationSettings::balanced(),
+        );
+
+        assert_eq!(
+            decision,
+            MeshVisibility::Visible {
+                lod: MeshLodLevel::VeryLow
+            }
+        );
+    }
+
+    // Near-plane projection is singular when the camera sits inside a mesh. Treating the object
+    // as full-screen preserves a finite density budget instead of falling back to full detail.
+    #[test]
+    fn camera_inside_dense_mesh_still_uses_density_lod() {
+        let decision = classify_mesh(
+            camera(),
+            16.0 / 9.0,
+            720,
+            Some(bounds([0.0, 0.0, 0.0], 2.0)),
+            10_000_000,
+            RenderOptimizationSettings::balanced(),
+        );
+
+        assert_eq!(
+            decision,
+            MeshVisibility::Visible {
+                lod: MeshLodLevel::VeryLow
+            }
+        );
+    }
+
+    // Camera-inside handling remains quality-first for geometry below the viewport budget.
+    #[test]
+    fn camera_inside_modest_mesh_keeps_full_lod() {
+        let decision = classify_mesh(
+            camera(),
+            16.0 / 9.0,
+            720,
+            Some(bounds([0.0, 0.0, 0.0], 2.0)),
+            100_000,
+            RenderOptimizationSettings::balanced(),
         );
 
         assert_eq!(

@@ -10,6 +10,7 @@ pub(crate) const GOD_RAY_MASK_PASS: &str = "god_ray_mask";
 pub(crate) const GOD_RAY_PREFILTER_PASS: &str = "god_ray_prefilter";
 pub(crate) const GOD_RAY_RADIAL_PASS: &str = "god_ray_radial";
 pub(crate) const GOD_RAY_TEMPORAL_PASS: &str = "god_ray_temporal";
+pub(crate) const TAA_RESOLVE_PASS: &str = "taa_resolve";
 const BLOOM_DOWNSAMPLE_PASSES: [&str; BLOOM_MIP_COUNT] = [
     "bloom_downsample_0",
     "bloom_downsample_1",
@@ -29,18 +30,6 @@ const SHADOW_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
     "shadow_cascade_2",
     "shadow_cascade_3",
 ];
-const SHADOW_BLUR_H_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
-    "shadow_blur_h_0",
-    "shadow_blur_h_1",
-    "shadow_blur_h_2",
-    "shadow_blur_h_3",
-];
-const SHADOW_BLUR_V_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
-    "shadow_blur_v_0",
-    "shadow_blur_v_1",
-    "shadow_blur_v_2",
-    "shadow_blur_v_3",
-];
 const TRANSLUCENT_SHADOW_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
     "translucent_shadow_0",
     "translucent_shadow_1",
@@ -51,18 +40,11 @@ const TRANSLUCENT_SHADOW_PASSES: [&str; SHADOW_CASCADE_COUNT] = [
 pub(crate) const SHADOW_CASCADE_COUNT: usize = 4;
 pub(crate) const BLOOM_MIP_COUNT: usize = 5;
 pub(crate) const GOD_RAY_HISTORY_COUNT: usize = 2;
+pub(crate) const TAA_HISTORY_COUNT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum GraphResource {
     SwapchainImage,
-    ShadowMomentRaw0,
-    ShadowMomentRaw1,
-    ShadowMomentRaw2,
-    ShadowMomentRaw3,
-    ShadowMomentBlur0,
-    ShadowMomentBlur1,
-    ShadowMomentBlur2,
-    ShadowMomentBlur3,
     ShadowCascade0,
     ShadowCascade1,
     ShadowCascade2,
@@ -85,31 +67,16 @@ pub(crate) enum GraphResource {
     GodRayBlur,
     GodRayHistory0,
     GodRayHistory1,
+    TaaHistory0,
+    TaaHistory1,
+    TaaDepthHistory0,
+    TaaDepthHistory1,
+    TaaNormalHistory0,
+    TaaNormalHistory1,
+    MotionVectors,
 }
 
 impl GraphResource {
-    /// Returns the opaque raw moment cascade index for the shadow pass output.
-    pub(crate) fn shadow_moment_raw_cascade(self) -> Option<usize> {
-        match self {
-            Self::ShadowMomentRaw0 => Some(0),
-            Self::ShadowMomentRaw1 => Some(1),
-            Self::ShadowMomentRaw2 => Some(2),
-            Self::ShadowMomentRaw3 => Some(3),
-            _ => None,
-        }
-    }
-
-    /// Returns the opaque horizontal blur cascade index for the blur scratch output.
-    pub(crate) fn shadow_moment_blur_cascade(self) -> Option<usize> {
-        match self {
-            Self::ShadowMomentBlur0 => Some(0),
-            Self::ShadowMomentBlur1 => Some(1),
-            Self::ShadowMomentBlur2 => Some(2),
-            Self::ShadowMomentBlur3 => Some(3),
-            _ => None,
-        }
-    }
-
     /// Returns the opaque shadow cascade index when this resource belongs to one cascade.
     pub(crate) fn shadow_cascade(self) -> Option<usize> {
         match self {
@@ -134,10 +101,7 @@ impl GraphResource {
 
     /// Returns whether the resource is owned by the fixed shadow system instead of the swapchain.
     pub(crate) fn is_shadow_resource(self) -> bool {
-        self.shadow_moment_raw_cascade().is_some()
-            || self.shadow_moment_blur_cascade().is_some()
-            || self.shadow_cascade().is_some()
-            || self.translucent_shadow_cascade().is_some()
+        self.shadow_cascade().is_some() || self.translucent_shadow_cascade().is_some()
     }
 
     /// Returns the bloom mip index for graph-owned post-processing resources.
@@ -161,14 +125,35 @@ impl GraphResource {
         }
     }
 
+    /// Returns the HDR temporal color-history index for one ping-pong resource.
+    pub(crate) fn taa_history(self) -> Option<usize> {
+        match self {
+            Self::TaaHistory0 => Some(0),
+            Self::TaaHistory1 => Some(1),
+            _ => None,
+        }
+    }
+
+    /// Returns the linear-depth temporal-history index for one ping-pong resource.
+    pub(crate) fn taa_depth_history(self) -> Option<usize> {
+        match self {
+            Self::TaaDepthHistory0 => Some(0),
+            Self::TaaDepthHistory1 => Some(1),
+            _ => None,
+        }
+    }
+
+    /// Returns the packed-normal temporal-history index for one ping-pong resource.
+    pub(crate) fn taa_normal_history(self) -> Option<usize> {
+        match self {
+            Self::TaaNormalHistory0 => Some(0),
+            Self::TaaNormalHistory1 => Some(1),
+            _ => None,
+        }
+    }
+
     /// Returns the stable resource name used in graph logs and diagnostics.
     pub(crate) fn name(self) -> &'static str {
-        if let Some(index) = self.shadow_moment_raw_cascade() {
-            return shadow_moment_raw_name(index);
-        }
-        if let Some(index) = self.shadow_moment_blur_cascade() {
-            return shadow_moment_blur_name(index);
-        }
         if let Some(index) = self.shadow_cascade() {
             return shadow_pass_name(index);
         }
@@ -192,15 +177,14 @@ impl GraphResource {
             Self::GodRayBlur => "god_ray_blur",
             Self::GodRayHistory0 => "god_ray_history_0",
             Self::GodRayHistory1 => "god_ray_history_1",
-            Self::ShadowMomentRaw0
-            | Self::ShadowMomentRaw1
-            | Self::ShadowMomentRaw2
-            | Self::ShadowMomentRaw3
-            | Self::ShadowMomentBlur0
-            | Self::ShadowMomentBlur1
-            | Self::ShadowMomentBlur2
-            | Self::ShadowMomentBlur3
-            | Self::ShadowCascade0
+            Self::TaaHistory0 => "taa_history_0",
+            Self::TaaHistory1 => "taa_history_1",
+            Self::TaaDepthHistory0 => "taa_depth_history_0",
+            Self::TaaDepthHistory1 => "taa_depth_history_1",
+            Self::TaaNormalHistory0 => "taa_normal_history_0",
+            Self::TaaNormalHistory1 => "taa_normal_history_1",
+            Self::MotionVectors => "motion_vectors",
+            Self::ShadowCascade0
             | Self::ShadowCascade1
             | Self::ShadowCascade2
             | Self::ShadowCascade3
@@ -210,16 +194,6 @@ impl GraphResource {
             | Self::TranslucentShadow3 => unreachable!("shadow resources return early above"),
         }
     }
-}
-
-/// Returns the stable raw moment resource name for one opaque cascade.
-pub(crate) fn shadow_moment_raw_name(index: usize) -> &'static str {
-    SHADOW_MOMENT_RAW_NAMES[index]
-}
-
-/// Returns the stable horizontal moment blur resource name for one opaque cascade.
-pub(crate) fn shadow_moment_blur_name(index: usize) -> &'static str {
-    SHADOW_MOMENT_BLUR_NAMES[index]
 }
 
 /// Returns the stable opaque shadow pass name for one cascade index.
@@ -237,16 +211,6 @@ pub(crate) fn shadow_pass_names() -> [&'static str; SHADOW_CASCADE_COUNT] {
     SHADOW_PASSES
 }
 
-/// Returns the horizontal moment blur pass names used by the frame graph compiler.
-pub(crate) fn shadow_blur_h_pass_names() -> [&'static str; SHADOW_CASCADE_COUNT] {
-    SHADOW_BLUR_H_PASSES
-}
-
-/// Returns the vertical moment blur pass names used by the frame graph compiler.
-pub(crate) fn shadow_blur_v_pass_names() -> [&'static str; SHADOW_CASCADE_COUNT] {
-    SHADOW_BLUR_V_PASSES
-}
-
 /// Returns the translucent shadow pass names used by the frame graph compiler.
 pub(crate) fn translucent_shadow_pass_names() -> [&'static str; SHADOW_CASCADE_COUNT] {
     TRANSLUCENT_SHADOW_PASSES
@@ -255,16 +219,6 @@ pub(crate) fn translucent_shadow_pass_names() -> [&'static str; SHADOW_CASCADE_C
 /// Returns the opaque shadow cascade index encoded in one graph pass name.
 pub(crate) fn shadow_pass_index(pass_name: &str) -> Option<usize> {
     indexed_pass_index(pass_name, "shadow_cascade_").filter(|index| *index < SHADOW_CASCADE_COUNT)
-}
-
-/// Returns the horizontal moment blur pass index encoded in one graph pass name.
-pub(crate) fn shadow_blur_h_pass_index(pass_name: &str) -> Option<usize> {
-    indexed_pass_index(pass_name, "shadow_blur_h_").filter(|index| *index < SHADOW_CASCADE_COUNT)
-}
-
-/// Returns the vertical moment blur pass index encoded in one graph pass name.
-pub(crate) fn shadow_blur_v_pass_index(pass_name: &str) -> Option<usize> {
-    indexed_pass_index(pass_name, "shadow_blur_v_").filter(|index| *index < SHADOW_CASCADE_COUNT)
 }
 
 /// Returns the translucent shadow cascade index encoded in one graph pass name.
@@ -278,34 +232,6 @@ fn indexed_pass_index(pass_name: &str, prefix: &str) -> Option<usize> {
         .strip_prefix(prefix)
         .and_then(|value| value.parse::<usize>().ok())
 }
-
-const SHADOW_MOMENT_RAW_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
-    "shadow_moment_raw_0",
-    "shadow_moment_raw_1",
-    "shadow_moment_raw_2",
-    "shadow_moment_raw_3",
-];
-
-const SHADOW_MOMENT_BLUR_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
-    "shadow_moment_blur_0",
-    "shadow_moment_blur_1",
-    "shadow_moment_blur_2",
-    "shadow_moment_blur_3",
-];
-
-pub(crate) const SHADOW_MOMENT_RAW_RESOURCES: [GraphResource; SHADOW_CASCADE_COUNT] = [
-    GraphResource::ShadowMomentRaw0,
-    GraphResource::ShadowMomentRaw1,
-    GraphResource::ShadowMomentRaw2,
-    GraphResource::ShadowMomentRaw3,
-];
-
-pub(crate) const SHADOW_MOMENT_BLUR_RESOURCES: [GraphResource; SHADOW_CASCADE_COUNT] = [
-    GraphResource::ShadowMomentBlur0,
-    GraphResource::ShadowMomentBlur1,
-    GraphResource::ShadowMomentBlur2,
-    GraphResource::ShadowMomentBlur3,
-];
 
 pub(crate) const SHADOW_CASCADE_RESOURCES: [GraphResource; SHADOW_CASCADE_COUNT] = [
     GraphResource::ShadowCascade0,
@@ -331,6 +257,18 @@ pub(crate) const BLOOM_MIP_RESOURCES: [GraphResource; BLOOM_MIP_COUNT] = [
 
 pub(crate) const GOD_RAY_HISTORY_RESOURCES: [GraphResource; GOD_RAY_HISTORY_COUNT] =
     [GraphResource::GodRayHistory0, GraphResource::GodRayHistory1];
+
+pub(crate) const TAA_HISTORY_RESOURCES: [GraphResource; TAA_HISTORY_COUNT] =
+    [GraphResource::TaaHistory0, GraphResource::TaaHistory1];
+pub(crate) const TAA_DEPTH_HISTORY_RESOURCES: [GraphResource; TAA_HISTORY_COUNT] = [
+    GraphResource::TaaDepthHistory0,
+    GraphResource::TaaDepthHistory1,
+];
+pub(crate) const TAA_NORMAL_HISTORY_RESOURCES: [GraphResource; TAA_HISTORY_COUNT] = [
+    GraphResource::TaaNormalHistory0,
+    GraphResource::TaaNormalHistory1,
+];
+pub(crate) const TAA_MOTION_RESOURCE: GraphResource = GraphResource::MotionVectors;
 
 pub(crate) fn bloom_downsample_pass_index(pass_name: &str) -> Option<usize> {
     indexed_pass_index(pass_name, "bloom_downsample_").filter(|index| *index < BLOOM_MIP_COUNT)
@@ -366,6 +304,7 @@ impl ResourceState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LoadOp {
+    DontCare,
     Clear,
     Load,
 }
@@ -374,6 +313,7 @@ impl LoadOp {
     /// Returns the compact load operation name used in graph trace logs.
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::DontCare => "dont_care",
             Self::Clear => "clear",
             Self::Load => "load",
         }
@@ -464,6 +404,17 @@ pub(crate) struct PassOutput {
 }
 
 impl PassOutput {
+    /// Creates one color output whose prior contents are discarded before a full overwrite.
+    pub(crate) fn color_overwrite(resource: GraphResource) -> Self {
+        Self {
+            resource,
+            state: ResourceState::ColorAttachment,
+            load: LoadOp::DontCare,
+            store: StoreOp::Store,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
     /// Creates one color output written by a graph pass.
     pub(crate) fn color_clear(resource: GraphResource, clear_color: [f32; 4]) -> Self {
         Self {
@@ -725,8 +676,6 @@ pub(crate) struct FrameGraphPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FrameGraphInitialStates {
     swapchain_image: ResourceState,
-    shadow_moment_raw: [ResourceState; SHADOW_CASCADE_COUNT],
-    shadow_moment_blur: [ResourceState; SHADOW_CASCADE_COUNT],
     shadow_cascades: [ResourceState; SHADOW_CASCADE_COUNT],
     translucent_shadows: [ResourceState; SHADOW_CASCADE_COUNT],
     scene_color: ResourceState,
@@ -738,14 +687,16 @@ pub(crate) struct FrameGraphInitialStates {
     god_ray_prefilter: ResourceState,
     god_ray_blur: ResourceState,
     god_ray_histories: [ResourceState; GOD_RAY_HISTORY_COUNT],
+    taa_histories: [ResourceState; TAA_HISTORY_COUNT],
+    taa_depth_histories: [ResourceState; TAA_HISTORY_COUNT],
+    taa_normal_histories: [ResourceState; TAA_HISTORY_COUNT],
+    motion_vectors: ResourceState,
 }
 
 impl FrameGraphInitialStates {
     /// Captures the actual image layouts known by the Vulkan executor before graph compilation.
     pub(crate) fn new(
         swapchain_image: ResourceState,
-        shadow_moment_raw: [ResourceState; SHADOW_CASCADE_COUNT],
-        shadow_moment_blur: [ResourceState; SHADOW_CASCADE_COUNT],
         shadow_cascades: [ResourceState; SHADOW_CASCADE_COUNT],
         translucent_shadows: [ResourceState; SHADOW_CASCADE_COUNT],
         scene_color: ResourceState,
@@ -755,8 +706,6 @@ impl FrameGraphInitialStates {
     ) -> Self {
         Self {
             swapchain_image,
-            shadow_moment_raw,
-            shadow_moment_blur,
             shadow_cascades,
             translucent_shadows,
             scene_color,
@@ -768,6 +717,10 @@ impl FrameGraphInitialStates {
             god_ray_prefilter: ResourceState::Undefined,
             god_ray_blur: ResourceState::Undefined,
             god_ray_histories: [ResourceState::Undefined; GOD_RAY_HISTORY_COUNT],
+            taa_histories: [ResourceState::Undefined; TAA_HISTORY_COUNT],
+            taa_depth_histories: [ResourceState::Undefined; TAA_HISTORY_COUNT],
+            taa_normal_histories: [ResourceState::Undefined; TAA_HISTORY_COUNT],
+            motion_vectors: ResourceState::Undefined,
         }
     }
 
@@ -792,22 +745,27 @@ impl FrameGraphInitialStates {
         self
     }
 
+    /// Overrides persistent TAA color/depth/normal history and motion-vector states.
+    pub(crate) fn with_taa(
+        mut self,
+        histories: [ResourceState; TAA_HISTORY_COUNT],
+        depth_histories: [ResourceState; TAA_HISTORY_COUNT],
+        normal_histories: [ResourceState; TAA_HISTORY_COUNT],
+        motion_vectors: ResourceState,
+    ) -> Self {
+        self.taa_histories = histories;
+        self.taa_depth_histories = depth_histories;
+        self.taa_normal_histories = normal_histories;
+        self.motion_vectors = motion_vectors;
+        self
+    }
+
     /// Returns the current state of the acquired swapchain image.
     pub(crate) fn swapchain_image(self) -> ResourceState {
         self.swapchain_image
     }
 
-    /// Returns the current state of every persistent raw moment cascade map.
-    pub(crate) fn shadow_moment_raw(self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
-        self.shadow_moment_raw
-    }
-
-    /// Returns the current state of every persistent horizontal moment blur scratch map.
-    pub(crate) fn shadow_moment_blur(self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
-        self.shadow_moment_blur
-    }
-
-    /// Returns the current state of every persistent shadow cascade moment map.
+    /// Returns the current state of every persistent directional shadow map.
     pub(crate) fn shadow_cascades(self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
         self.shadow_cascades
     }
@@ -860,6 +818,22 @@ impl FrameGraphInitialStates {
     /// Returns the current state of both temporal god-ray history targets.
     pub(crate) fn god_ray_histories(self) -> [ResourceState; GOD_RAY_HISTORY_COUNT] {
         self.god_ray_histories
+    }
+
+    pub(crate) fn taa_histories(self) -> [ResourceState; TAA_HISTORY_COUNT] {
+        self.taa_histories
+    }
+
+    pub(crate) fn taa_depth_histories(self) -> [ResourceState; TAA_HISTORY_COUNT] {
+        self.taa_depth_histories
+    }
+
+    pub(crate) fn taa_normal_histories(self) -> [ResourceState; TAA_HISTORY_COUNT] {
+        self.taa_normal_histories
+    }
+
+    pub(crate) fn motion_vectors(self) -> ResourceState {
+        self.motion_vectors
     }
 }
 
@@ -960,58 +934,74 @@ impl FrameGraphPlan {
         scene_metadata: bool,
         bloom: bool,
     ) -> Result<Self, GraphCompileError> {
-        Self::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
+        Self::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa(
             clear_color,
             initial,
             framebuffer_readback,
             shadow_casters,
-            translucent_shadows,
+            [translucent_shadows; SHADOW_CASCADE_COUNT],
             refresh_shadows,
             scene_metadata,
             bloom,
             false,
             0,
+            false,
+            0,
         )
     }
 
-    /// Builds the executable frame graph with optional bloom and low-resolution god-ray passes.
-    pub(crate) fn standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
+    /// Builds the executable frame graph with HDR TAA before bloom and final post processing.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa(
         clear_color: [f32; 4],
         initial: FrameGraphInitialStates,
         framebuffer_readback: bool,
         shadow_casters: bool,
-        translucent_shadows: bool,
+        translucent_shadow_cascades: [bool; SHADOW_CASCADE_COUNT],
         refresh_shadows: bool,
         scene_metadata: bool,
         bloom: bool,
         god_rays: bool,
         god_ray_history_write_index: usize,
+        taa: bool,
+        taa_history_write_index: usize,
+    ) -> Result<Self, GraphCompileError> {
+        Self::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa_mode(
+            clear_color,
+            initial,
+            framebuffer_readback,
+            shadow_casters,
+            translucent_shadow_cascades,
+            refresh_shadows,
+            scene_metadata,
+            bloom,
+            god_rays,
+            god_ray_history_write_index,
+            taa,
+            taa_history_write_index,
+            false,
+        )
+    }
+
+    /// Builds the frame graph with the optional CSM dependency used by true volumetric god rays.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa_mode(
+        clear_color: [f32; 4],
+        initial: FrameGraphInitialStates,
+        framebuffer_readback: bool,
+        shadow_casters: bool,
+        translucent_shadow_cascades: [bool; SHADOW_CASCADE_COUNT],
+        refresh_shadows: bool,
+        scene_metadata: bool,
+        bloom: bool,
+        god_rays: bool,
+        god_ray_history_write_index: usize,
+        taa: bool,
+        taa_history_write_index: usize,
+        volumetric_god_rays: bool,
     ) -> Result<Self, GraphCompileError> {
         let mut builder = FrameGraphBuilder::new();
-        if shadow_casters {
-            for (resource, state) in SHADOW_MOMENT_RAW_RESOURCES
-                .into_iter()
-                .zip(initial.shadow_moment_raw())
-            {
-                builder = builder.resource(GraphResourceDecl::new(
-                    resource,
-                    state,
-                    ResourceState::ShaderRead,
-                ));
-            }
-        }
-        if shadow_casters && refresh_shadows {
-            for (resource, state) in SHADOW_MOMENT_BLUR_RESOURCES
-                .into_iter()
-                .zip(initial.shadow_moment_blur())
-            {
-                builder = builder.resource(GraphResourceDecl::new(
-                    resource,
-                    state,
-                    ResourceState::ShaderRead,
-                ));
-            }
-        }
         if shadow_casters {
             for (resource, state) in SHADOW_CASCADE_RESOURCES
                 .into_iter()
@@ -1024,11 +1014,15 @@ impl FrameGraphPlan {
                 ));
             }
         }
-        if shadow_casters && translucent_shadows {
-            for (resource, state) in TRANSLUCENT_SHADOW_RESOURCES
+        if shadow_casters {
+            for ((resource, state), enabled) in TRANSLUCENT_SHADOW_RESOURCES
                 .into_iter()
                 .zip(initial.translucent_shadows())
+                .zip(translucent_shadow_cascades)
             {
+                if !enabled {
+                    continue;
+                }
                 builder = builder.resource(GraphResourceDecl::new(
                     resource,
                     state,
@@ -1099,52 +1093,71 @@ impl FrameGraphPlan {
                 ResourceState::ShaderRead,
             ));
         }
-
+        if taa {
+            for (resource, state) in TAA_HISTORY_RESOURCES
+                .into_iter()
+                .zip(initial.taa_histories())
+            {
+                builder = builder.resource(GraphResourceDecl::new(
+                    resource,
+                    state,
+                    ResourceState::ShaderRead,
+                ));
+            }
+            for (resource, state) in TAA_DEPTH_HISTORY_RESOURCES
+                .into_iter()
+                .zip(initial.taa_depth_histories())
+            {
+                builder = builder.resource(GraphResourceDecl::new(
+                    resource,
+                    state,
+                    ResourceState::ShaderRead,
+                ));
+            }
+            for (resource, state) in TAA_NORMAL_HISTORY_RESOURCES
+                .into_iter()
+                .zip(initial.taa_normal_histories())
+            {
+                builder = builder.resource(GraphResourceDecl::new(
+                    resource,
+                    state,
+                    ResourceState::ShaderRead,
+                ));
+            }
+            builder = builder.resource(GraphResourceDecl::new(
+                TAA_MOTION_RESOURCE,
+                initial.motion_vectors(),
+                ResourceState::ShaderRead,
+            ));
+        }
         if shadow_casters && refresh_shadows {
             for (pass_name, resource) in shadow_pass_names()
                 .into_iter()
-                .zip(SHADOW_MOMENT_RAW_RESOURCES)
-            {
-                builder = builder.pass(
-                    GraphPass::new(pass_name)
-                        .write(PassOutput::color_clear(resource, [1.0, 1.0, 1.0, 1.0])),
-                );
-            }
-            for ((pass_name, input), output) in shadow_blur_h_pass_names()
-                .into_iter()
-                .zip(SHADOW_MOMENT_RAW_RESOURCES)
-                .zip(SHADOW_MOMENT_BLUR_RESOURCES)
-            {
-                builder = builder.pass(
-                    GraphPass::new(pass_name)
-                        .read(PassInput::read(input, ResourceState::ShaderRead))
-                        .write(PassOutput::color_load(output)),
-                );
-            }
-            for ((pass_name, input), output) in shadow_blur_v_pass_names()
-                .into_iter()
-                .zip(SHADOW_MOMENT_BLUR_RESOURCES)
                 .zip(SHADOW_CASCADE_RESOURCES)
             {
-                builder = builder.pass(
-                    GraphPass::new(pass_name)
-                        .read(PassInput::read(input, ResourceState::ShaderRead))
-                        .write(PassOutput::color_load(output)),
-                );
+                builder = builder
+                    .pass(GraphPass::new(pass_name).write(PassOutput::depth_clear_store(resource)));
             }
         }
-        if shadow_casters && translucent_shadows && refresh_shadows {
-            for (pass_name, color_resource) in translucent_shadow_pass_names()
-                .into_iter()
-                .zip(TRANSLUCENT_SHADOW_RESOURCES)
+        if shadow_casters && refresh_shadows {
+            for (cascade_index, ((pass_name, color_resource), enabled)) in
+                translucent_shadow_pass_names()
+                    .into_iter()
+                    .zip(TRANSLUCENT_SHADOW_RESOURCES)
+                    .zip(translucent_shadow_cascades)
+                    .enumerate()
             {
-                let mut pass = GraphPass::new(pass_name);
-                for sampled_moment_resource in SHADOW_MOMENT_RAW_RESOURCES {
-                    pass = pass.read(PassInput::read(
-                        sampled_moment_resource,
-                        ResourceState::ShaderRead,
-                    ));
+                if !enabled {
+                    continue;
                 }
+                let mut pass = GraphPass::new(pass_name);
+                // The translucent shader reads only the depth layer selected by its cascade push
+                // constant. Declaring that matching dependency avoids making every translucent pass
+                // wait on (and transition against) all four opaque layers.
+                pass = pass.read(PassInput::read(
+                    SHADOW_CASCADE_RESOURCES[cascade_index],
+                    ResourceState::ShaderRead,
+                ));
                 builder = builder.pass(pass.write(PassOutput::color_clear(
                     color_resource,
                     [1.0, 1.0, 1.0, 1.0],
@@ -1154,14 +1167,14 @@ impl FrameGraphPlan {
 
         let mut scene_pass = GraphPass::new(SCENE_PASS);
         if shadow_casters {
-            for resource in SHADOW_MOMENT_RAW_RESOURCES {
-                scene_pass = scene_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
-            }
             for resource in SHADOW_CASCADE_RESOURCES {
                 scene_pass = scene_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
             }
-            if translucent_shadows {
-                for resource in TRANSLUCENT_SHADOW_RESOURCES {
+            for (resource, enabled) in TRANSLUCENT_SHADOW_RESOURCES
+                .into_iter()
+                .zip(translucent_shadow_cascades)
+            {
+                if enabled {
                     scene_pass =
                         scene_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
                 }
@@ -1185,10 +1198,59 @@ impl FrameGraphPlan {
         scene_pass = scene_pass.write(PassOutput::depth_clear_store(GraphResource::SceneDepth));
 
         builder = builder.pass(scene_pass);
+        let taa_history_write_index = taa_history_write_index % TAA_HISTORY_COUNT;
+        let taa_history_read_index = 1 - taa_history_write_index;
+        let taa_current_color = GraphResource::SceneColor;
+        let resolved_scene_color = if taa {
+            builder = builder.pass(
+                GraphPass::new(TAA_RESOLVE_PASS)
+                    .read(PassInput::read(
+                        taa_current_color,
+                        ResourceState::ShaderRead,
+                    ))
+                    .read(PassInput::read(
+                        GraphResource::SceneDepth,
+                        ResourceState::ShaderRead,
+                    ))
+                    .read(PassInput::read(
+                        GraphResource::SceneNormalRoughness,
+                        ResourceState::ShaderRead,
+                    ))
+                    .read(PassInput::read(
+                        GraphResource::SceneTransparentNormalRoughness,
+                        ResourceState::ShaderRead,
+                    ))
+                    .read(PassInput::read(
+                        TAA_HISTORY_RESOURCES[taa_history_read_index],
+                        ResourceState::ShaderRead,
+                    ))
+                    .read(PassInput::read(
+                        TAA_DEPTH_HISTORY_RESOURCES[taa_history_read_index],
+                        ResourceState::ShaderRead,
+                    ))
+                    .read(PassInput::read(
+                        TAA_NORMAL_HISTORY_RESOURCES[taa_history_read_index],
+                        ResourceState::ShaderRead,
+                    ))
+                    .write(PassOutput::color_overwrite(
+                        TAA_HISTORY_RESOURCES[taa_history_write_index],
+                    ))
+                    .write(PassOutput::color_overwrite(TAA_MOTION_RESOURCE))
+                    .write(PassOutput::color_overwrite(
+                        TAA_DEPTH_HISTORY_RESOURCES[taa_history_write_index],
+                    ))
+                    .write(PassOutput::color_overwrite(
+                        TAA_NORMAL_HISTORY_RESOURCES[taa_history_write_index],
+                    )),
+            );
+            TAA_HISTORY_RESOURCES[taa_history_write_index]
+        } else {
+            GraphResource::SceneColor
+        };
         if bloom {
             for (index, pass_name) in BLOOM_DOWNSAMPLE_PASSES.into_iter().enumerate() {
                 let input = if index == 0 {
-                    GraphResource::SceneColor
+                    resolved_scene_color
                 } else {
                     BLOOM_MIP_RESOURCES[index - 1]
                 };
@@ -1212,23 +1274,30 @@ impl FrameGraphPlan {
         let god_ray_history_write_index = god_ray_history_write_index % GOD_RAY_HISTORY_COUNT;
         let god_ray_history_read_index = 1 - god_ray_history_write_index;
         if god_rays {
+            let mut mask_pass = GraphPass::new(GOD_RAY_MASK_PASS)
+                .read(PassInput::read(
+                    GraphResource::SceneColor,
+                    ResourceState::ShaderRead,
+                ))
+                .read(PassInput::read(
+                    GraphResource::SceneDepth,
+                    ResourceState::ShaderRead,
+                ))
+                .read(PassInput::read(
+                    GraphResource::SceneTransparentNormalRoughness,
+                    ResourceState::ShaderRead,
+                ));
+            if shadow_casters && volumetric_god_rays {
+                // The quality volumetric branch samples all CSM layers while the legacy branch
+                // simply ignores these inputs. Keeping the dependency conditional preserves the
+                // fallback path for scenes that have no shadow casters.
+                for resource in SHADOW_CASCADE_RESOURCES {
+                    mask_pass =
+                        mask_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
+                }
+            }
             builder = builder
-                .pass(
-                    GraphPass::new(GOD_RAY_MASK_PASS)
-                        .read(PassInput::read(
-                            GraphResource::SceneColor,
-                            ResourceState::ShaderRead,
-                        ))
-                        .read(PassInput::read(
-                            GraphResource::SceneDepth,
-                            ResourceState::ShaderRead,
-                        ))
-                        .read(PassInput::read(
-                            GraphResource::SceneTransparentNormalRoughness,
-                            ResourceState::ShaderRead,
-                        ))
-                        .write(PassOutput::color_load(GraphResource::GodRayMask)),
-                )
+                .pass(mask_pass.write(PassOutput::color_load(GraphResource::GodRayMask)))
                 .pass(
                     GraphPass::new(GOD_RAY_PREFILTER_PASS)
                         .read(PassInput::read(
@@ -1263,7 +1332,7 @@ impl FrameGraphPlan {
 
         let mut post_pass = GraphPass::new(POST_PASS)
             .read(PassInput::read(
-                GraphResource::SceneColor,
+                resolved_scene_color,
                 ResourceState::ShaderRead,
             ))
             .read(PassInput::read(
@@ -1812,8 +1881,6 @@ mod tests {
                 ResourceState::Undefined,
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 ResourceState::Undefined,
                 ResourceState::Undefined,
                 ResourceState::Undefined,
@@ -1831,13 +1898,11 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected = Vec::new();
         expected.extend(shadow_pass_names());
-        expected.extend(shadow_blur_h_pass_names());
         expected.extend(translucent_shadow_pass_names());
-        expected.extend(shadow_blur_v_pass_names());
         expected.extend([SCENE_PASS, POST_PASS, PRESENT_PASS]);
 
         assert_eq!(names, expected);
-        assert_eq!(graph.resource_count(), 24);
+        assert_eq!(graph.resource_count(), 16);
         assert!(graph.transition_count() >= 10);
         assert!(graph.barrier_count() >= 6);
     }
@@ -1848,8 +1913,6 @@ mod tests {
             [0.0, 0.1, 0.2, 1.0],
             FrameGraphInitialStates::new(
                 ResourceState::Undefined,
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 ResourceState::Undefined,
@@ -1893,6 +1956,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn taa_without_scene_metadata_falls_back_to_scene_color() {
+        let initial = FrameGraphInitialStates::new(
+            ResourceState::Undefined,
+            [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+            [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+            ResourceState::Undefined,
+            ResourceState::Undefined,
+            ResourceState::Undefined,
+            ResourceState::Undefined,
+        )
+        .with_taa(
+            [ResourceState::Undefined; TAA_HISTORY_COUNT],
+            [ResourceState::Undefined; TAA_HISTORY_COUNT],
+            [ResourceState::Undefined; TAA_HISTORY_COUNT],
+            ResourceState::Undefined,
+        );
+        let graph =
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa(
+                [0.0, 0.1, 0.2, 1.0],
+                initial,
+                false,
+                false,
+                [false; SHADOW_CASCADE_COUNT],
+                false,
+                false,
+                false,
+                false,
+                0,
+                true,
+                0,
+            )
+            .expect("TAA should compile with Stable CSM writing directly into scene color");
+        let taa = graph
+            .passes()
+            .iter()
+            .find(|pass| pass.name() == TAA_RESOLVE_PASS)
+            .expect("TAA pass should be retained");
+
+        assert!(taa.reads().iter().any(|input| {
+            input.resource() == GraphResource::SceneColor
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(taa.writes().iter().all(|output| {
+            output.load() == LoadOp::DontCare && output.store() == StoreOp::Store
+        }));
+    }
+
     // Verifies that persistent resource states affect the next frame's barrier plan.
     #[test]
     fn standard_frame_graph_uses_actual_initial_states() {
@@ -1900,8 +2011,6 @@ mod tests {
             [0.0, 0.1, 0.2, 1.0],
             FrameGraphInitialStates::new(
                 ResourceState::Present,
-                [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
-                [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
                 [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
                 [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
                 ResourceState::ShaderRead,
@@ -1945,15 +2054,13 @@ mod tests {
         );
     }
 
-    // Verifies that cached raw/filtered shadow maps stay readable while writes are omitted.
+    // Verifies that cached directional shadow maps stay readable while writes are omitted.
     #[test]
     fn standard_frame_graph_reuses_cached_shadow_maps() {
         let graph = FrameGraphPlan::standard_frame_with_shadow_refresh(
             [0.0, 0.1, 0.2, 1.0],
             FrameGraphInitialStates::new(
                 ResourceState::Present,
-                [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
-                [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
                 [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
                 [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
                 ResourceState::ShaderRead,
@@ -1979,28 +2086,18 @@ mod tests {
             Some(ResourceState::ShaderRead)
         );
         assert_eq!(
-            graph.final_state_for(GraphResource::ShadowMomentRaw0),
-            Some(ResourceState::ShaderRead)
-        );
-        assert_eq!(
-            graph.final_state_for(GraphResource::ShadowMomentBlur0),
-            None
-        );
-        assert_eq!(
             graph.final_state_for(GraphResource::TranslucentShadow0),
             Some(ResourceState::ShaderRead)
         );
     }
 
-    // Verifies that translucent shadow passes sample opaque cascade moments explicitly.
+    // Verifies that translucent shadow passes depend on the matching opaque depth render.
     #[test]
     fn standard_frame_graph_declares_translucent_shadow_shader_reads() {
         let graph = FrameGraphPlan::standard_frame_with_readback(
             [0.0, 0.1, 0.2, 1.0],
             FrameGraphInitialStates::new(
                 ResourceState::Undefined,
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 ResourceState::Undefined,
@@ -2021,18 +2118,12 @@ mod tests {
             .expect("translucent shadow pass should be retained");
 
         assert!(translucent_pass.reads().iter().any(|input| {
-            input.resource() == GraphResource::ShadowMomentRaw0
+            input.resource() == GraphResource::ShadowCascade0
                 && input.state() == ResourceState::ShaderRead
         }));
-        assert!(
-            !translucent_pass
-                .reads()
-                .iter()
-                .any(|input| input.resource() == GraphResource::ShadowCascade0)
-        );
         assert!(graph.barriers().iter().any(|barrier| {
-            barrier.resource() == GraphResource::ShadowMomentRaw0
-                && barrier.from() == ResourceState::ColorAttachment
+            barrier.resource() == GraphResource::ShadowCascade0
+                && barrier.from() == ResourceState::DepthAttachment
                 && barrier.to() == ResourceState::ShaderRead
         }));
     }
@@ -2044,8 +2135,6 @@ mod tests {
             [0.0, 0.1, 0.2, 1.0],
             FrameGraphInitialStates::new(
                 ResourceState::Undefined,
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 ResourceState::Undefined,
@@ -2065,12 +2154,10 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected = Vec::new();
         expected.extend(shadow_pass_names());
-        expected.extend(shadow_blur_h_pass_names());
-        expected.extend(shadow_blur_v_pass_names());
         expected.extend([SCENE_PASS, POST_PASS, PRESENT_PASS]);
 
         assert_eq!(names, expected);
-        assert_eq!(graph.resource_count(), 20);
+        assert_eq!(graph.resource_count(), 12);
         assert_eq!(
             graph.final_state_for(GraphResource::TranslucentShadow0),
             None
@@ -2083,6 +2170,59 @@ mod tests {
         );
     }
 
+    // Verifies that only occupied translucent cascades allocate graph resources and passes.
+    #[test]
+    fn standard_frame_graph_omits_empty_translucent_cascades() {
+        let graph =
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa(
+                [0.0, 0.1, 0.2, 1.0],
+                FrameGraphInitialStates::new(
+                    ResourceState::Undefined,
+                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                ),
+                false,
+                true,
+                [true, false, false, true],
+                true,
+                true,
+                false,
+                false,
+                0,
+                false,
+                0,
+            )
+            .expect("partial translucent-shadow graph should compile");
+        let names = graph
+            .passes()
+            .iter()
+            .map(GraphPass::name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(graph.resource_count(), 14);
+        assert_eq!(graph.pass_count(), 9);
+        assert!(names.contains(&translucent_shadow_pass_name(0)));
+        assert!(names.contains(&translucent_shadow_pass_name(3)));
+        assert!(!names.contains(&translucent_shadow_pass_name(1)));
+        assert!(!names.contains(&translucent_shadow_pass_name(2)));
+        for resource in [
+            GraphResource::TranslucentShadow1,
+            GraphResource::TranslucentShadow2,
+        ] {
+            assert_eq!(graph.final_state_for(resource), None);
+            assert!(
+                !graph
+                    .barriers()
+                    .iter()
+                    .any(|barrier| barrier.resource() == resource)
+            );
+        }
+    }
+
     // Verifies that frames without any shadow casters skip all shadow graph work.
     #[test]
     fn standard_frame_graph_omits_all_shadow_work_without_shadow_casters() {
@@ -2090,8 +2230,6 @@ mod tests {
             [0.0, 0.1, 0.2, 1.0],
             FrameGraphInitialStates::new(
                 ResourceState::Undefined,
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 ResourceState::Undefined,
@@ -2125,8 +2263,6 @@ mod tests {
             [0.0, 0.1, 0.2, 1.0],
             FrameGraphInitialStates::new(
                 ResourceState::Undefined,
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 ResourceState::Undefined,
@@ -2181,12 +2317,10 @@ mod tests {
     #[test]
     fn standard_frame_graph_inserts_god_ray_chain_before_post() {
         let graph =
-            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_and_god_rays(
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa(
                 [0.0, 0.1, 0.2, 1.0],
                 FrameGraphInitialStates::new(
                     ResourceState::Undefined,
-                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                     [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                     [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                     ResourceState::Undefined,
@@ -2196,12 +2330,14 @@ mod tests {
                 ),
                 false,
                 false,
-                false,
+                [false; SHADOW_CASCADE_COUNT],
                 false,
                 true,
                 false,
                 true,
                 1,
+                false,
+                0,
             )
             .expect("god-ray graph should compile");
         let names = graph
@@ -2259,8 +2395,6 @@ mod tests {
                 ResourceState::Present,
                 [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
                 [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
-                [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
-                [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
                 ResourceState::ShaderRead,
                 ResourceState::ShaderRead,
                 ResourceState::ShaderRead,
@@ -2290,8 +2424,6 @@ mod tests {
                 ResourceState::Undefined,
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
                 ResourceState::Undefined,
                 ResourceState::Undefined,
                 ResourceState::Undefined,
@@ -2309,9 +2441,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected = Vec::new();
         expected.extend(shadow_pass_names());
-        expected.extend(shadow_blur_h_pass_names());
         expected.extend(translucent_shadow_pass_names());
-        expected.extend(shadow_blur_v_pass_names());
         expected.extend([
             SCENE_PASS,
             POST_PASS,

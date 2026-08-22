@@ -128,48 +128,33 @@ pub(super) fn create_scene_fast_render_pass(
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
-/// Creates the render pass that writes moment shadow data while depth-testing casters.
+/// Creates the depth-only pass used for one Stable CSM directional cascade layer.
 pub(super) fn create_shadow_render_pass(
     device: &Device,
-    moment_format: vk::Format,
     depth_format: vk::Format,
 ) -> Result<vk::RenderPass, super::VulkanError> {
-    let moment_attachment = vk::AttachmentDescription::default()
-        .format(moment_format)
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(depth_format)
         .samples(vk::SampleCountFlags::TYPE_1)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let depth_attachment = vk::AttachmentDescription::default()
-        .format(depth_format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
         .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    let moment_attachment_ref = vk::AttachmentReference::default()
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
     let depth_attachment_ref = vk::AttachmentReference::default()
-        .attachment(1)
+        .attachment(0)
         .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    let color_attachment_refs = [moment_attachment_ref];
     let subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachment_refs)
         .depth_stencil_attachment(&depth_attachment_ref);
-    let attachments = [moment_attachment, depth_attachment];
+    let attachments = [depth_attachment];
     let subpasses = [subpass];
     let create_info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
         .subpasses(&subpasses);
 
-    // Safety: all create-info slices live for this call and graph barriers control moment layout.
+    // Safety: all create-info slices live for this call; per-layer barriers own layout transitions.
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
@@ -202,10 +187,11 @@ pub(super) fn create_local_shadow_render_pass(
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
-/// Creates the color-only pass that accumulates transparent shadow transmittance per cascade.
+/// Creates the pass that keeps only the nearest translucent caster in front of opaque depth.
 pub(super) fn create_translucent_shadow_render_pass(
     device: &Device,
     color_format: vk::Format,
+    depth_format: vk::Format,
 ) -> Result<vk::RenderPass, super::VulkanError> {
     let color_attachment = vk::AttachmentDescription::default()
         .format(color_format)
@@ -219,17 +205,47 @@ pub(super) fn create_translucent_shadow_render_pass(
     let color_attachment_ref = vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(depth_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        // This is a dedicated transient depth target. The fragment shader samples layer zero of the
+        // immutable opaque D16 array, while fixed-function depth retains the nearest translucent layer.
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let depth_attachment_ref = vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     let color_attachment_refs = [color_attachment_ref];
     let subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachment_refs);
-    let attachments = [color_attachment];
+        .color_attachments(&color_attachment_refs)
+        .depth_stencil_attachment(&depth_attachment_ref);
+    let attachments = [color_attachment, depth_attachment];
     let subpasses = [subpass];
+    let dependencies = [vk::SubpassDependency::default()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        )
+        .dst_stage_mask(
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        )
+        .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+        .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+        .dependency_flags(vk::DependencyFlags::BY_REGION)];
     let create_info = vk::RenderPassCreateInfo::default()
         .attachments(&attachments)
-        .subpasses(&subpasses);
+        .subpasses(&subpasses)
+        .dependencies(&dependencies);
 
-    // Safety: graph barriers place the transmittance target in color attachment layout.
+    // Safety: color layout transitions are graph-owned; the dedicated depth target is cleared per pass.
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
@@ -296,14 +312,6 @@ fn create_color_only_render_pass(
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
-/// Creates the color-only pass used by separable moment shadow blur targets.
-pub(super) fn create_shadow_blur_render_pass(
-    device: &Device,
-    moment_format: vk::Format,
-) -> Result<vk::RenderPass, super::VulkanError> {
-    create_post_render_pass(device, moment_format)
-}
-
 /// Destroys one swapchain render pass after its framebuffers are gone.
 pub(super) fn destroy_render_pass(device: &Device, render_pass: vk::RenderPass) {
     if render_pass == vk::RenderPass::null() {
@@ -316,7 +324,7 @@ pub(super) fn destroy_render_pass(device: &Device, render_pass: vk::RenderPass) 
     }
 }
 
-/// Creates the scene framebuffer that binds scene color and scene depth views.
+/// Creates the scene framebuffer that binds HDR color, metadata, and depth views.
 pub(super) fn create_scene_framebuffer(
     device: &Device,
     render_pass: vk::RenderPass,
@@ -363,15 +371,14 @@ pub(super) fn create_scene_fast_framebuffer(
     unsafe { device.create_framebuffer(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
-/// Creates the shadow framebuffer that binds moment color and private depth views.
+/// Creates a depth-only framebuffer for one stable CSM cascade layer.
 pub(super) fn create_shadow_framebuffer(
     device: &Device,
     render_pass: vk::RenderPass,
-    moment_view: vk::ImageView,
     depth_view: vk::ImageView,
     extent: NonZeroExtent,
 ) -> Result<vk::Framebuffer, super::VulkanError> {
-    let attachments = [moment_view, depth_view];
+    let attachments = [depth_view];
     let create_info = vk::FramebufferCreateInfo::default()
         .render_pass(render_pass)
         .attachments(&attachments)
@@ -379,7 +386,7 @@ pub(super) fn create_shadow_framebuffer(
         .height(extent.height())
         .layers(1);
 
-    // Safety: both image views match the shadow render pass attachments.
+    // Safety: the 2D layer view matches the depth-only render pass attachment.
     unsafe { device.create_framebuffer(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
@@ -401,14 +408,15 @@ pub(super) fn create_local_shadow_framebuffer(
     unsafe { device.create_framebuffer(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
-/// Creates a framebuffer for one translucent shadow cascade transmittance target.
+/// Creates a framebuffer for one translucent shadow cascade and its opaque depth buffer.
 pub(super) fn create_translucent_shadow_framebuffer(
     device: &Device,
     render_pass: vk::RenderPass,
     color_view: vk::ImageView,
+    depth_view: vk::ImageView,
     extent: NonZeroExtent,
 ) -> Result<vk::Framebuffer, super::VulkanError> {
-    let attachments = [color_view];
+    let attachments = [color_view, depth_view];
     let create_info = vk::FramebufferCreateInfo::default()
         .render_pass(render_pass)
         .attachments(&attachments)
@@ -416,7 +424,7 @@ pub(super) fn create_translucent_shadow_framebuffer(
         .height(extent.height())
         .layers(1);
 
-    // Safety: the image view belongs to the cascade and matches the render pass attachment.
+    // Safety: both image views belong to the cascade and match the render pass attachments.
     unsafe { device.create_framebuffer(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 

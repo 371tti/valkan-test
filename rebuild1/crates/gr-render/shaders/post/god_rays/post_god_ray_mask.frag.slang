@@ -8,6 +8,7 @@ layout(location = 0) out float4 out_color;
 [[vk::binding(2, 0)]] Sampler2D scene_transparent_normal_roughness;
 
 #include "post_god_ray_common.slang"
+#include "post_god_ray_volume.slang"
 
 float depth_open_visibility(float depth) {
     if (depth >= 0.999995) {
@@ -42,6 +43,34 @@ float transparent_coverage(float2 uv) {
     float has_transparent = step(1.0, transparent.w);
 
     return lerp(1.0, 0.62, has_transparent);
+}
+
+float closest_volume_surface_depth(float2 uv, float center_depth) {
+    // The volume target is quarter-resolution while scene depth is full-resolution. A foliage
+    // pixel can contain a leaf on only one of the full-resolution taps, so a majority vote loses
+    // the leaf and marches through it to the sky. Use the nearest opaque depth in the same small
+    // footprint that the full-resolution bilateral upscale uses. The upscale repeats this exact
+    // conservative classification, so a short leaf sample cannot be mistaken for a background
+    // sample and spread a thin fog ring into the gap beside it.
+    float2 footprint = params.target.xy * 0.45;
+    float nearest = center_depth;
+    float sample_depth = raw_depth_at(scene_depth, uv + float2( footprint.x, 0.0));
+    if (sample_depth < GOD_RAY_BACKGROUND_DEPTH) {
+        nearest = min(nearest, sample_depth);
+    }
+    sample_depth = raw_depth_at(scene_depth, uv + float2(-footprint.x, 0.0));
+    if (sample_depth < GOD_RAY_BACKGROUND_DEPTH) {
+        nearest = min(nearest, sample_depth);
+    }
+    sample_depth = raw_depth_at(scene_depth, uv + float2(0.0,  footprint.y));
+    if (sample_depth < GOD_RAY_BACKGROUND_DEPTH) {
+        nearest = min(nearest, sample_depth);
+    }
+    sample_depth = raw_depth_at(scene_depth, uv + float2(0.0, -footprint.y));
+    if (sample_depth < GOD_RAY_BACKGROUND_DEPTH) {
+        nearest = min(nearest, sample_depth);
+    }
+    return nearest;
 }
 
 float local_source_visibility(float2 uv) {
@@ -114,7 +143,25 @@ float3 source_mask(
 
 [shader("fragment")]
 void main() {
-    float depth = raw_depth_at(scene_depth, frag_uv);
+    float2 depth_uv = frag_uv;
+    if (params.features.z > 0.5) {
+        // Scene MRT coordinates include the current projection jitter; the volume ray itself is
+        // evaluated on the stable output grid. Match post_common::post_metadata_uv here.
+        depth_uv = clamp(
+            frag_uv + params.color1.xy * 0.5,
+            float2(0.0),
+            float2(1.0)
+        );
+    }
+    float depth = raw_depth_at(scene_depth, depth_uv);
+
+    if (params.features.z > 0.5) {
+        depth = closest_volume_surface_depth(depth_uv, depth);
+        GodRayVolumeResult volume = god_ray_volumetric_integral(frag_uv, depth);
+        out_color = float4(volume.scattering, volume.transmittance);
+        return;
+    }
+
     float3 mask = float3(0.0);
     bool has_source = source_active(params.source0) || source_active(params.source1);
 

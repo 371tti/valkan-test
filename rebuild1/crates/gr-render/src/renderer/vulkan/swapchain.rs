@@ -1,8 +1,6 @@
-use std::sync::OnceLock;
+use ash::{Device, Instance, khr, vk};
 
-use ash::{Device, khr, vk};
-
-use crate::protocol::NonZeroExtent;
+use crate::protocol::{CameraSnapshot, FrameSnapshot, NonZeroExtent, RenderQualitySettings};
 
 use super::{
     VulkanDevice, VulkanError,
@@ -10,32 +8,33 @@ use super::{
     god_rays::GodRaysPipeline,
     mesh::{MAX_LOCAL_LIGHTS, MeshPassResources, MeshPipelineSet, VulkanMeshStore},
     post::PostPipeline,
-    shadow_blur::ShadowMomentBlurPipeline,
+    stable_csm_depth::{STABLE_CSM_DEPTH_FORMAT, StableCsmDepthArray},
     swapchain_pass::{
         create_bloom_downsample_render_pass, create_bloom_upsample_render_pass,
         create_god_ray_render_pass, create_local_shadow_framebuffer,
         create_local_shadow_render_pass, create_post_framebuffer, create_post_render_pass,
         create_scene_fast_framebuffer, create_scene_fast_render_pass, create_scene_framebuffer,
-        create_scene_render_pass, create_shadow_blur_render_pass, create_shadow_framebuffer,
-        create_shadow_render_pass, create_translucent_shadow_framebuffer,
-        create_translucent_shadow_render_pass, destroy_framebuffer, destroy_render_pass,
+        create_scene_render_pass, create_shadow_framebuffer, create_shadow_render_pass,
+        create_translucent_shadow_framebuffer, create_translucent_shadow_render_pass,
+        destroy_framebuffer, destroy_render_pass,
     },
     swapchain_target::{
         ColorTarget, DepthCubeTarget, DepthTarget, create_color_target, create_depth_cube_target,
         create_depth_target, destroy_color_target, destroy_depth_cube_target, destroy_depth_target,
         destroy_image_view, initialize_depth_cube_shader_read_image,
-        initialize_shadow_sampler_fallback_images,
+        initialize_mipped_color_shader_read_image,
     },
+    taa::{TaaFrameInfo, TemporalAntiAliasing},
 };
 use crate::renderer::graph::{
     BLOOM_MIP_COUNT, FrameGraphInitialStates, GOD_RAY_HISTORY_COUNT, GOD_RAY_HISTORY_RESOURCES,
     GOD_RAY_TEMPORAL_PASS, GraphResource, ResourceState, SHADOW_CASCADE_COUNT,
-    SHADOW_CASCADE_RESOURCES, SHADOW_MOMENT_BLUR_RESOURCES, SHADOW_MOMENT_RAW_RESOURCES,
-    TRANSLUCENT_SHADOW_RESOURCES,
+    SHADOW_CASCADE_RESOURCES, TRANSLUCENT_SHADOW_RESOURCES,
 };
-use crate::renderer::shadow_cascade_size;
 
-const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+pub(super) const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+/// Stable CSM stores one depth layer per cascade. There is no temporal direction/sample axis.
+pub(super) const STABLE_CSM_LAYER_COUNT: usize = SHADOW_CASCADE_COUNT;
 
 // Scene color is sampled by the post shader before tonemapping.
 // Do not use the swapchain format here: B8G8R8A8_SRGB/RGBA8_UNORM clamps HDR PBR
@@ -49,28 +48,58 @@ const SCENE_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 // UNORM8 would clamp that to 1.0, so post.frag's `transparent.w > 1.0` test can never work.
 const SCENE_TRANSPARENT_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-const DEFAULT_SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R32G32_SFLOAT;
-const FAST_SHADOW_MOMENT_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
-const TRANSLUCENT_SHADOW_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+// RGB stores the nearest translucent layer's transmittance while alpha stores its shadow depth.
+// FP16 avoids the 256 depth levels of UNORM8, which visibly terrace thin or sloped receivers.
+// This sampled color-attachment format is already required by SCENE_COLOR_FORMAT.
+const TRANSLUCENT_SHADOW_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const FALLBACK_SHADOW_TRANSMITTANCE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-static SHADOW_MOMENT_FORMAT: OnceLock<vk::Format> = OnceLock::new();
 
-fn shadow_moment_format() -> vk::Format {
-    *SHADOW_MOMENT_FORMAT.get_or_init(|| {
-        let fast_requested = std::env::var("REBUILD1_SHADOW_MOMENT_BITS")
-            .ok()
-            .map(|value| {
-                let value = value.trim().to_ascii_lowercase();
-                matches!(value.as_str(), "16" | "fp16" | "f16" | "fast")
-            })
-            .unwrap_or(false);
+/// Verifies the optimal-tiling features required by the directional shadow pipeline.
+///
+/// D16 must support linear-filtered sampling because the single comparison lookup intentionally
+/// relies on the hardware 2x2 PCF footprint.
+pub(super) fn validate_shadow_format_support(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Result<(), VulkanError> {
+    let requirements = [
+        (
+            STABLE_CSM_DEPTH_FORMAT,
+            vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            "D16 stable CSM directional shadow array",
+        ),
+        (
+            DEPTH_FORMAT,
+            vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            "D32 local-light shadow depth",
+        ),
+        (
+            TRANSLUCENT_SHADOW_FORMAT,
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            "FP16 translucent shadow",
+        ),
+    ];
 
-        if fast_requested {
-            FAST_SHADOW_MOMENT_FORMAT
-        } else {
-            DEFAULT_SHADOW_MOMENT_FORMAT
+    for (format, required, label) in requirements {
+        let properties =
+            unsafe { instance.get_physical_device_format_properties(physical_device, format) };
+        let available = properties.optimal_tiling_features;
+        if !available.contains(required) {
+            tracing::error!(
+                ?format,
+                ?required,
+                ?available,
+                label = %label,
+                "required Vulkan shadow format features are unavailable"
+            );
+            return Err(VulkanError::Vk(vk::Result::ERROR_FORMAT_NOT_SUPPORTED));
         }
-    })
+    }
+
+    Ok(())
 }
 
 pub(super) struct VulkanSwapchain {
@@ -97,6 +126,7 @@ pub(super) struct VulkanSwapchain {
     bloom_pipeline: BloomPipeline,
     god_rays_pipeline: GodRaysPipeline,
     post_pipeline: PostPipeline,
+    taa: TemporalAntiAliasing,
     scene_framebuffer: vk::Framebuffer,
     scene_fast_framebuffer: vk::Framebuffer,
     bloom: BloomTargets,
@@ -108,42 +138,33 @@ pub(super) struct VulkanSwapchain {
 }
 
 pub(super) struct ShadowResources {
+    directional_depth: StableCsmDepthArray,
+    shadow_framebuffers: [vk::Framebuffer; STABLE_CSM_LAYER_COUNT],
+    directional_state: ResourceState,
+    shadow_extent: NonZeroExtent,
+    translucent_depth: DepthTarget,
     cascades: [ShadowCascade; SHADOW_CASCADE_COUNT],
     local: Vec<LocalShadowCube>,
     shadow_render_pass: vk::RenderPass,
     local_shadow_render_pass: vk::RenderPass,
-    blur_render_pass: vk::RenderPass,
     translucent_render_pass: vk::RenderPass,
     mesh_pass_resources: MeshPassResources,
-    translucent_pass_resources: MeshPassResources,
     shadow_pipeline: MeshPipelineSet,
     local_shadow_pipeline: MeshPipelineSet,
-    blur_pipeline: ShadowMomentBlurPipeline,
     translucent_pipeline: MeshPipelineSet,
 }
 
 pub(super) struct ShadowSamplerFallback {
-    moments: ColorTarget,
     transmittance: ColorTarget,
+    directional_depth: StableCsmDepthArray,
     local_depth: DepthCubeTarget,
     mesh_pass_resources: MeshPassResources,
 }
 
 struct ShadowCascade {
-    moments: ColorTarget,
-    blurred_moments: ColorTarget,
-    filtered_moments: ColorTarget,
-    depth: DepthTarget,
     transmittance: ColorTarget,
-    raw_moment_state: ResourceState,
-    blur_moment_state: ResourceState,
-    moment_state: ResourceState,
     transmittance_state: ResourceState,
-    shadow_framebuffer: vk::Framebuffer,
-    blur_h_framebuffer: vk::Framebuffer,
-    blur_v_framebuffer: vk::Framebuffer,
     translucent_framebuffer: vk::Framebuffer,
-    extent: NonZeroExtent,
 }
 
 struct LocalShadowCube {
@@ -223,7 +244,7 @@ impl SceneTargets {
         }
     }
 
-    /// Returns the tracked graph states for the scene MRT and depth attachments.
+    /// Returns the tracked graph states for the scene metadata attachments and depth.
     fn graph_states(&self) -> (ResourceState, ResourceState, ResourceState, ResourceState) {
         (
             self.color_state,
@@ -405,6 +426,12 @@ impl GodRayTargets {
         self.history_valid
     }
 
+    /// Drops temporal rays when the source model changes (legacy radial versus volumetric).
+    fn invalidate_history(&mut self) {
+        self.history_valid = false;
+        self.history_write_index = 0;
+    }
+
     fn destroy(self, device: &Device) {
         for history in self.histories.into_iter().rev() {
             destroy_color_target(device, history.color);
@@ -448,6 +475,13 @@ pub(super) struct SwapchainConfig {
     transfer_src_supported: bool,
 }
 
+impl SwapchainConfig {
+    /// Returns the surface-capability-resolved drawable extent.
+    pub(super) fn extent(&self) -> NonZeroExtent {
+        self.extent
+    }
+}
+
 struct SwapchainBuild<'a> {
     device: &'a VulkanDevice,
     handle: vk::SwapchainKHR,
@@ -480,6 +514,7 @@ struct SwapchainBuild<'a> {
     bloom_pipeline: Option<BloomPipeline>,
     god_rays_pipeline: Option<GodRaysPipeline>,
     post_pipeline: Option<PostPipeline>,
+    taa: Option<TemporalAntiAliasing>,
     scene_framebuffer: Option<vk::Framebuffer>,
     scene_fast_framebuffer: Option<vk::Framebuffer>,
     bloom_downsample_framebuffers: Vec<vk::Framebuffer>,
@@ -530,6 +565,7 @@ impl<'a> SwapchainBuild<'a> {
             bloom_pipeline: None,
             god_rays_pipeline: None,
             post_pipeline: None,
+            taa: None,
             scene_framebuffer: None,
             scene_fast_framebuffer: None,
             bloom_downsample_framebuffers: Vec::new(),
@@ -590,6 +626,7 @@ impl<'a> SwapchainBuild<'a> {
             bloom_pipeline: take_created(&mut self.bloom_pipeline, "bloom pipeline"),
             god_rays_pipeline: take_created(&mut self.god_rays_pipeline, "god-ray pipeline"),
             post_pipeline: take_created(&mut self.post_pipeline, "post pipeline"),
+            taa: take_created(&mut self.taa, "temporal anti-aliasing"),
             scene_framebuffer: take_created(&mut self.scene_framebuffer, "scene framebuffer"),
             scene_fast_framebuffer: take_created(
                 &mut self.scene_fast_framebuffer,
@@ -640,6 +677,9 @@ impl Drop for SwapchainBuild<'_> {
         }
         if let Some(pipeline) = self.bloom_pipeline.take() {
             pipeline.destroy(&self.device.device);
+        }
+        if let Some(taa) = self.taa.take() {
+            taa.destroy(&self.device.device);
         }
         if let Some(pipeline) = self.mesh_pipeline.take() {
             self.device
@@ -712,17 +752,17 @@ impl Drop for SwapchainBuild<'_> {
 
 struct ShadowBuild<'a> {
     device: &'a VulkanDevice,
+    directional_depth: Option<StableCsmDepthArray>,
+    shadow_framebuffers: Vec<vk::Framebuffer>,
+    translucent_depth: Option<DepthTarget>,
     cascades: Vec<ShadowCascade>,
     local: Vec<LocalShadowCube>,
     shadow_render_pass: Option<vk::RenderPass>,
     local_shadow_render_pass: Option<vk::RenderPass>,
-    blur_render_pass: Option<vk::RenderPass>,
     translucent_render_pass: Option<vk::RenderPass>,
     mesh_pass_resources: Option<MeshPassResources>,
-    translucent_pass_resources: Option<MeshPassResources>,
     shadow_pipeline: Option<MeshPipelineSet>,
     local_shadow_pipeline: Option<MeshPipelineSet>,
-    blur_pipeline: Option<ShadowMomentBlurPipeline>,
     translucent_pipeline: Option<MeshPipelineSet>,
     finished: bool,
 }
@@ -732,17 +772,17 @@ impl<'a> ShadowBuild<'a> {
     fn new(device: &'a VulkanDevice) -> Self {
         Self {
             device,
+            directional_depth: None,
+            shadow_framebuffers: Vec::with_capacity(STABLE_CSM_LAYER_COUNT),
+            translucent_depth: None,
             cascades: Vec::with_capacity(SHADOW_CASCADE_COUNT),
             local: Vec::with_capacity(MAX_LOCAL_LIGHTS),
             shadow_render_pass: None,
             local_shadow_render_pass: None,
-            blur_render_pass: None,
             translucent_render_pass: None,
             mesh_pass_resources: None,
-            translucent_pass_resources: None,
             shadow_pipeline: None,
             local_shadow_pipeline: None,
-            blur_pipeline: None,
             translucent_pipeline: None,
             finished: false,
         }
@@ -753,10 +793,26 @@ impl<'a> ShadowBuild<'a> {
         let cascades = std::mem::take(&mut self.cascades)
             .try_into()
             .unwrap_or_else(|_| panic!("all shadow cascades must be created before finish"));
+        let shadow_framebuffers = std::mem::take(&mut self.shadow_framebuffers)
+            .try_into()
+            .unwrap_or_else(|_| {
+                panic!("all Stable CSM cascade layers must be created before finish")
+            });
         if self.local.len() != MAX_LOCAL_LIGHTS {
             panic!("all local shadow cubemaps must be created before finish");
         }
         let resources = ShadowResources {
+            directional_depth: take_created(
+                &mut self.directional_depth,
+                "Stable CSM directional depth array",
+            ),
+            shadow_framebuffers,
+            directional_state: ResourceState::ShaderRead,
+            shadow_extent: stable_csm_shadow_extent(self.device.shadow_map_resolution()),
+            translucent_depth: take_created(
+                &mut self.translucent_depth,
+                "shared translucent shadow depth",
+            ),
             cascades,
             local: std::mem::take(&mut self.local),
             shadow_render_pass: take_created(&mut self.shadow_render_pass, "shadow render pass"),
@@ -764,7 +820,6 @@ impl<'a> ShadowBuild<'a> {
                 &mut self.local_shadow_render_pass,
                 "local shadow render pass",
             ),
-            blur_render_pass: take_created(&mut self.blur_render_pass, "shadow blur render pass"),
             translucent_render_pass: take_created(
                 &mut self.translucent_render_pass,
                 "translucent shadow render pass",
@@ -773,16 +828,11 @@ impl<'a> ShadowBuild<'a> {
                 &mut self.mesh_pass_resources,
                 "shadow pass resources",
             ),
-            translucent_pass_resources: take_created(
-                &mut self.translucent_pass_resources,
-                "translucent shadow pass resources",
-            ),
             shadow_pipeline: take_created(&mut self.shadow_pipeline, "shadow pipeline"),
             local_shadow_pipeline: take_created(
                 &mut self.local_shadow_pipeline,
                 "local shadow pipeline",
             ),
-            blur_pipeline: take_created(&mut self.blur_pipeline, "shadow blur pipeline"),
             translucent_pipeline: take_created(
                 &mut self.translucent_pipeline,
                 "translucent shadow pipeline",
@@ -803,16 +853,10 @@ impl Drop for ShadowBuild<'_> {
         if let Some(resources) = self.mesh_pass_resources.take() {
             resources.destroy(&self.device.device);
         }
-        if let Some(resources) = self.translucent_pass_resources.take() {
-            resources.destroy(&self.device.device);
-        }
         if let Some(pipeline) = self.translucent_pipeline.take() {
             self.device
                 .meshes
                 .destroy_pipeline_set(&self.device.device, pipeline);
-        }
-        if let Some(pipeline) = self.blur_pipeline.take() {
-            pipeline.destroy(&self.device.device);
         }
         if let Some(pipeline) = self.shadow_pipeline.take() {
             self.device
@@ -827,12 +871,20 @@ impl Drop for ShadowBuild<'_> {
         for cascade in self.cascades.drain(..) {
             destroy_shadow_cascade(&self.device.device, cascade);
         }
+        if let Some(depth) = self.translucent_depth.take() {
+            destroy_depth_target(&self.device.device, depth);
+        }
         for local in self.local.drain(..) {
             destroy_local_shadow_cube(&self.device.device, local);
         }
+        for framebuffer in self.shadow_framebuffers.drain(..) {
+            destroy_framebuffer(&self.device.device, framebuffer);
+        }
+        if let Some(depth) = self.directional_depth.take() {
+            depth.destroy(&self.device.device);
+        }
         for render_pass in [
             self.translucent_render_pass.take(),
-            self.blur_render_pass.take(),
             self.local_shadow_render_pass.take(),
             self.shadow_render_pass.take(),
         ]
@@ -859,53 +911,54 @@ impl ShadowSamplerFallback {
         queue: vk::Queue,
         meshes: &VulkanMeshStore,
     ) -> Result<Self, VulkanError> {
-        let moment_format = shadow_moment_format();
         let extent = NonZeroExtent::new(1, 1).expect("fallback shadow extent must be non-zero");
-        let moments = create_color_target(
-            device,
-            memory_properties,
-            extent,
-            moment_format,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-        )?;
-        let transmittance = match create_color_target(
+        let transmittance = create_color_target(
             device,
             memory_properties,
             extent,
             FALLBACK_SHADOW_TRANSMITTANCE_FORMAT,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-        ) {
-            Ok(target) => target,
-            Err(error) => {
-                destroy_color_target(device, moments);
-                return Err(error);
-            }
-        };
+        )?;
         let local_depth = match create_depth_cube_target(
             device,
             memory_properties,
             extent,
             DEPTH_FORMAT,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
         ) {
             Ok(target) => target,
             Err(error) => {
                 destroy_color_target(device, transmittance);
-                destroy_color_target(device, moments);
+                return Err(error);
+            }
+        };
+        let directional_depth = match StableCsmDepthArray::create(
+            device,
+            memory_properties,
+            extent,
+            STABLE_CSM_LAYER_COUNT as u32,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                destroy_depth_cube_target(device, local_depth);
+                destroy_color_target(device, transmittance);
                 return Err(error);
             }
         };
 
-        if let Err(error) = initialize_shadow_sampler_fallback_images(
+        if let Err(error) = initialize_mipped_color_shader_read_image(
             device,
             queue_family_index,
             queue,
-            moments.image,
             transmittance.image,
+            1,
+            [1.0; 4],
         ) {
+            directional_depth.destroy(device);
             destroy_depth_cube_target(device, local_depth);
             destroy_color_target(device, transmittance);
-            destroy_color_target(device, moments);
             return Err(error);
         }
         if let Err(error) = initialize_depth_cube_shader_read_image(
@@ -914,34 +967,43 @@ impl ShadowSamplerFallback {
             queue,
             local_depth.image,
         ) {
+            directional_depth.destroy(device);
             destroy_depth_cube_target(device, local_depth);
             destroy_color_target(device, transmittance);
-            destroy_color_target(device, moments);
+            return Err(error);
+        }
+        if let Err(error) =
+            directional_depth.initialize_shader_read(device, queue_family_index, queue)
+        {
+            directional_depth.destroy(device);
+            destroy_depth_cube_target(device, local_depth);
+            destroy_color_target(device, transmittance);
             return Err(error);
         }
 
-        let shadow_views = [moments.view; SHADOW_CASCADE_COUNT];
         let translucent_views = [transmittance.view; SHADOW_CASCADE_COUNT];
         let mesh_pass_resources = match meshes.create_pass_resources(
             device,
-            shadow_views,
-            shadow_views,
+            directional_depth.sampled_view,
             translucent_views,
             [local_depth.view; MAX_LOCAL_LIGHTS],
         ) {
             Ok(resources) => resources,
             Err(error) => {
+                directional_depth.destroy(device);
                 destroy_depth_cube_target(device, local_depth);
                 destroy_color_target(device, transmittance);
-                destroy_color_target(device, moments);
                 return Err(error);
             }
         };
 
-        tracing::trace!("created tiny Vulkan shadow sampler fallback");
+        tracing::trace!(
+            layers = STABLE_CSM_LAYER_COUNT,
+            "created tiny Vulkan Stable CSM sampler fallback"
+        );
         Ok(ShadowSamplerFallback {
-            moments,
             transmittance,
+            directional_depth,
             local_depth,
             mesh_pass_resources,
         })
@@ -951,19 +1013,17 @@ impl ShadowSamplerFallback {
 impl VulkanDevice {
     /// Creates fixed shadow resources once per logical device instead of per swapchain resize.
     pub(super) fn create_shadow_resources(&self) -> Result<ShadowResources, VulkanError> {
-        let moment_format = shadow_moment_format();
         let mut build = ShadowBuild::new(self);
         build.shadow_render_pass = Some(create_shadow_render_pass(
             &self.device,
-            moment_format,
-            DEPTH_FORMAT,
+            STABLE_CSM_DEPTH_FORMAT,
         )?);
         build.local_shadow_render_pass =
             Some(create_local_shadow_render_pass(&self.device, DEPTH_FORMAT)?);
-        build.blur_render_pass = Some(create_shadow_blur_render_pass(&self.device, moment_format)?);
         build.translucent_render_pass = Some(create_translucent_shadow_render_pass(
             &self.device,
             TRANSLUCENT_SHADOW_FORMAT,
+            DEPTH_FORMAT,
         )?);
 
         let shadow_render_pass = build
@@ -972,30 +1032,75 @@ impl VulkanDevice {
         let local_shadow_render_pass = build
             .local_shadow_render_pass
             .expect("local shadow render pass was just created");
-        let blur_render_pass = build
-            .blur_render_pass
-            .expect("shadow blur render pass was just created");
         let translucent_render_pass = build
             .translucent_render_pass
             .expect("translucent shadow render pass was just created");
 
-        for cascade_index in 0..SHADOW_CASCADE_COUNT {
+        let shadow_resolution = self.shadow_map_resolution();
+        let shadow_extent = stable_csm_shadow_extent(shadow_resolution);
+        build.directional_depth = Some(StableCsmDepthArray::create(
+            &self.device,
+            &self.memory_properties,
+            shadow_extent,
+            STABLE_CSM_LAYER_COUNT as u32,
+        )?);
+        build
+            .directional_depth
+            .as_ref()
+            .expect("Stable CSM directional depth array was just created")
+            .initialize_shader_read(&self.device, self.queue_family_index, self.graphics_queue)?;
+        for layer in 0..STABLE_CSM_LAYER_COUNT {
+            let layer_view = build
+                .directional_depth
+                .as_ref()
+                .expect("Stable CSM directional depth array exists while creating framebuffers")
+                .layer_views[layer];
+            build.shadow_framebuffers.push(create_shadow_framebuffer(
+                &self.device,
+                shadow_render_pass,
+                layer_view,
+                shadow_extent,
+            )?);
+        }
+
+        build.translucent_depth = Some(create_depth_target(
+            &self.device,
+            &self.memory_properties,
+            shadow_extent,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        )?);
+        let translucent_depth_view = build
+            .translucent_depth
+            .as_ref()
+            .expect("shared translucent shadow depth was just created")
+            .view;
+        for _ in 0..SHADOW_CASCADE_COUNT {
             build.cascades.push(create_shadow_cascade_target(
                 &self.device,
                 &self.memory_properties,
-                shadow_cascade_extent(cascade_index),
-                moment_format,
-                shadow_render_pass,
-                blur_render_pass,
+                shadow_extent,
                 translucent_render_pass,
+                translucent_depth_view,
             )?);
+        }
+        for cascade in &mut build.cascades {
+            initialize_mipped_color_shader_read_image(
+                &self.device,
+                self.queue_family_index,
+                self.graphics_queue,
+                cascade.transmittance.image,
+                1,
+                [1.0; 4],
+            )?;
+            cascade.transmittance_state = ResourceState::ShaderRead;
         }
 
         for _ in 0..MAX_LOCAL_LIGHTS {
             build.local.push(create_local_shadow_cube_target(
                 &self.device,
                 &self.memory_properties,
-                local_shadow_extent(),
+                local_shadow_extent(shadow_resolution),
                 local_shadow_render_pass,
             )?);
         }
@@ -1008,35 +1113,20 @@ impl VulkanDevice {
             )?;
         }
 
-        let filtered_views =
-            cascade_views(&build.cascades, |cascade| cascade.filtered_moments.view);
-        let raw_views = cascade_views(&build.cascades, |cascade| cascade.moments.view);
-        let blur_tmp_views = cascade_views(&build.cascades, |cascade| cascade.blurred_moments.view);
         let translucent_views =
             cascade_views(&build.cascades, |cascade| cascade.transmittance.view);
+        let depth_array_view = build
+            .directional_depth
+            .as_ref()
+            .expect("Stable CSM directional depth array exists while creating descriptors")
+            .sampled_view;
         let local_shadow_views = local_shadow_views(&build.local);
 
         build.mesh_pass_resources = Some(self.meshes.create_pass_resources(
             &self.device,
-            filtered_views,
-            raw_views,
+            depth_array_view,
             translucent_views,
             local_shadow_views,
-        )?);
-        build.translucent_pass_resources = Some(self.meshes.create_pass_resources(
-            &self.device,
-            raw_views,
-            raw_views,
-            translucent_views,
-            local_shadow_views,
-        )?);
-        let blur_h_views = Vec::from(raw_views);
-        let blur_v_views = Vec::from(blur_tmp_views);
-        build.blur_pipeline = Some(ShadowMomentBlurPipeline::create(
-            &self.device,
-            blur_render_pass,
-            &blur_h_views,
-            &blur_v_views,
         )?);
         build.shadow_pipeline = Some(
             self.meshes
@@ -1053,15 +1143,13 @@ impl VulkanDevice {
 
         tracing::info!(
             cascade_count = SHADOW_CASCADE_COUNT,
-            cascade_0_size = build.cascades[0].extent.width(),
-            cascade_1_size = build.cascades[1].extent.width(),
-            cascade_2_size = build.cascades[2].extent.width(),
-            cascade_3_size = build.cascades[3].extent.width(),
+            layer_count = STABLE_CSM_LAYER_COUNT,
+            shadow_size = shadow_extent.width(),
             local_count = build.local.len(),
             local_size = build.local.first().map(|local| local.extent.width()).unwrap_or(0),
-            moment_format = ?moment_format,
+            depth_format = ?STABLE_CSM_DEPTH_FORMAT,
             translucent_format = ?TRANSLUCENT_SHADOW_FORMAT,
-            "created fixed Vulkan shadow resources"
+            "created fixed Stable CSM shadows with shared translucent depth"
         );
         Ok(build.finish())
     }
@@ -1249,6 +1337,21 @@ impl VulkanDevice {
             self.meshes
                 .create_scene_transparent_fast_pipeline_set(&self.device, scene_fast_render_pass)?,
         );
+        build.taa = Some(TemporalAntiAliasing::create(
+            &self.device,
+            &self.memory_properties,
+            config.extent,
+            self.frames.slot_count(),
+            scene_color.view,
+            scene_depth.view,
+            scene_normal_roughness.view,
+            scene_transparent_normal_roughness.view,
+        )?);
+        let taa_history_views = build
+            .taa
+            .as_ref()
+            .expect("temporal anti-aliasing was just created")
+            .history_views();
         let bloom_views = build
             .bloom_levels
             .iter()
@@ -1258,7 +1361,7 @@ impl VulkanDevice {
             &self.device,
             bloom_downsample_render_pass,
             bloom_upsample_render_pass,
-            scene_color.view,
+            taa_history_views,
             &bloom_views,
         )?);
         let god_ray_history_views = [
@@ -1268,9 +1371,11 @@ impl VulkanDevice {
         build.god_rays_pipeline = Some(GodRaysPipeline::create(
             &self.device,
             god_ray_render_pass,
+            self.meshes.frame_set_layout(),
             scene_color.view,
             scene_depth.view,
             scene_transparent_normal_roughness.view,
+            self.shadow_fallback.directional_depth.sampled_view,
             build
                 .god_ray_mask
                 .as_ref()
@@ -1294,7 +1399,7 @@ impl VulkanDevice {
         build.post_pipeline = Some(PostPipeline::create(
             &self.device,
             post_render_pass,
-            scene_color.view,
+            taa_history_views,
             scene_depth.view,
             scene_normal_roughness.view,
             scene_transparent_normal_roughness.view,
@@ -1377,6 +1482,7 @@ impl VulkanDevice {
         swapchain.post_pipeline.destroy(&self.device);
         swapchain.god_rays_pipeline.destroy(&self.device);
         swapchain.bloom_pipeline.destroy(&self.device);
+        swapchain.taa.destroy(&self.device);
         self.meshes
             .destroy_pipeline_set(&self.device, swapchain.mesh_pipeline);
         self.meshes
@@ -1535,6 +1641,42 @@ impl VulkanSwapchain {
         &self.post_pipeline
     }
 
+    pub(super) fn prepare_taa_frame(
+        &mut self,
+        device: &Device,
+        slot_index: usize,
+        snapshot: &FrameSnapshot,
+        camera: CameraSnapshot,
+        quality: RenderQualitySettings,
+        use_corrected_scene_color: bool,
+    ) -> Result<TaaFrameInfo, VulkanError> {
+        self.taa.prepare_frame(
+            device,
+            slot_index,
+            snapshot,
+            camera,
+            quality,
+            self.extent_2d(),
+            use_corrected_scene_color,
+        )
+    }
+
+    pub(super) fn record_taa(
+        &self,
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+    ) -> Result<(), VulkanError> {
+        self.taa.record(device, command_buffer, self.extent_2d())
+    }
+
+    pub(super) fn taa_history_write_index(&self) -> usize {
+        self.taa.history_write_index()
+    }
+
+    pub(super) fn taa_jitter_pixels(&self) -> [f32; 2] {
+        self.taa.pending_jitter_pixels()
+    }
+
     /// Returns the bloom pipeline compatible with this swapchain's bloom passes.
     pub(super) fn bloom_pipeline(&self) -> &BloomPipeline {
         &self.bloom_pipeline
@@ -1543,6 +1685,21 @@ impl VulkanSwapchain {
     /// Returns the god-ray pipeline compatible with this swapchain's low-resolution targets.
     pub(super) fn god_rays_pipeline(&self) -> &GodRaysPipeline {
         &self.god_rays_pipeline
+    }
+
+    /// Updates the CSM view used by the quality volumetric mask pass.
+    pub(super) fn update_god_ray_shadow_view(
+        &mut self,
+        device: &Device,
+        image_view: vk::ImageView,
+    ) {
+        self.god_rays_pipeline
+            .update_directional_shadow_view(device, image_view);
+    }
+
+    /// Returns the CSM view currently bound by the volumetric mask pass.
+    pub(super) fn god_ray_shadow_view(&self) -> vk::ImageView {
+        self.god_rays_pipeline.directional_shadow_view()
     }
 
     /// Returns the number of images owned by this swapchain.
@@ -1611,6 +1768,11 @@ impl VulkanSwapchain {
         self.god_rays.history_write_index()
     }
 
+    /// Invalidates the low-resolution God Ray history after a quality-model switch.
+    pub(super) fn invalidate_god_ray_history(&mut self) {
+        self.god_rays.invalidate_history();
+    }
+
     /// Returns the framebuffer used by a downsample pass writing one bloom mip.
     pub(super) fn bloom_downsample_framebuffer(
         &self,
@@ -1671,17 +1833,9 @@ impl VulkanSwapchain {
         image_index: u32,
         shadows: Option<&ShadowResources>,
     ) -> Result<FrameGraphInitialStates, VulkanError> {
-        let shadow_moment_states = shadows.map_or(
+        let shadow_states = shadows.map_or(
             [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-            ShadowResources::moment_states,
-        );
-        let shadow_raw_moment_states = shadows.map_or(
-            [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-            ShadowResources::raw_moment_states,
-        );
-        let shadow_blur_moment_states = shadows.map_or(
-            [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
-            ShadowResources::blur_moment_states,
+            ShadowResources::shadow_states,
         );
         let translucent_shadow_states = shadows.map_or(
             [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
@@ -1693,11 +1847,11 @@ impl VulkanSwapchain {
             scene_transparent_normal_roughness_state,
             scene_depth_state,
         ) = self.scene.graph_states();
+        let (taa_histories, taa_depth_histories, taa_normal_histories, motion_vectors) =
+            self.taa.graph_states();
         Ok(FrameGraphInitialStates::new(
             self.image_state(image_index)?,
-            shadow_raw_moment_states,
-            shadow_blur_moment_states,
-            shadow_moment_states,
+            shadow_states,
             translucent_shadow_states,
             scene_color_state,
             scene_normal_roughness_state,
@@ -1710,6 +1864,12 @@ impl VulkanSwapchain {
             self.god_rays.prefilter.state,
             self.god_rays.blur.state,
             self.god_rays.history_states(),
+        )
+        .with_taa(
+            taa_histories,
+            taa_depth_histories,
+            taa_normal_histories,
+            motion_vectors,
         ))
     }
 
@@ -1725,6 +1885,7 @@ impl VulkanSwapchain {
         self.scene.apply_graph_final_states(plan);
         self.bloom.apply_graph_final_states(plan);
         self.god_rays.apply_graph_final_states(plan);
+        self.taa.apply_graph_final_states(plan);
         Ok(())
     }
 
@@ -1749,7 +1910,9 @@ impl VulkanSwapchain {
         if let Some(image) = self.god_rays.graph_image(resource) {
             return Ok(image);
         }
-
+        if let Some(image) = self.taa.graph_image(resource) {
+            return Ok(image);
+        }
         match resource {
             GraphResource::SwapchainImage => Ok((
                 self.image_for_index(image_index)?,
@@ -1768,18 +1931,17 @@ impl VulkanSwapchain {
             | GraphResource::GodRayPrefilter
             | GraphResource::GodRayBlur
             | GraphResource::GodRayHistory0
-            | GraphResource::GodRayHistory1 => {
-                unreachable!("scene, bloom, and god-ray resources return early above")
+            | GraphResource::GodRayHistory1
+            | GraphResource::TaaHistory0
+            | GraphResource::TaaHistory1
+            | GraphResource::TaaDepthHistory0
+            | GraphResource::TaaDepthHistory1
+            | GraphResource::TaaNormalHistory0
+            | GraphResource::TaaNormalHistory1
+            | GraphResource::MotionVectors => {
+                unreachable!("scene, bloom, god-ray, and TAA resources return early above")
             }
-            GraphResource::ShadowMomentRaw0
-            | GraphResource::ShadowMomentRaw1
-            | GraphResource::ShadowMomentRaw2
-            | GraphResource::ShadowMomentRaw3
-            | GraphResource::ShadowMomentBlur0
-            | GraphResource::ShadowMomentBlur1
-            | GraphResource::ShadowMomentBlur2
-            | GraphResource::ShadowMomentBlur3
-            | GraphResource::ShadowCascade0
+            GraphResource::ShadowCascade0
             | GraphResource::ShadowCascade1
             | GraphResource::ShadowCascade2
             | GraphResource::ShadowCascade3
@@ -1833,11 +1995,6 @@ impl ShadowResources {
         self.local_shadow_render_pass
     }
 
-    /// Returns the render pass that writes one separable moment blur target.
-    pub(super) fn blur_render_pass(&self) -> vk::RenderPass {
-        self.blur_render_pass
-    }
-
     /// Returns the render pass that writes one translucent cascade transmittance target.
     pub(super) fn translucent_render_pass(&self) -> vk::RenderPass {
         self.translucent_render_pass
@@ -1853,11 +2010,6 @@ impl ShadowResources {
         self.local_shadow_pipeline
     }
 
-    /// Returns the fullscreen separable blur pipeline for shadow moments.
-    pub(super) fn blur_pipeline(&self) -> &ShadowMomentBlurPipeline {
-        &self.blur_pipeline
-    }
-
     /// Returns the translucent shadow mesh pipelines shared by all cascades.
     pub(super) fn translucent_pipeline(&self) -> MeshPipelineSet {
         self.translucent_pipeline
@@ -1868,18 +2020,25 @@ impl ShadowResources {
         &self.mesh_pass_resources
     }
 
-    /// Returns descriptors used by translucent shadow shaders to test unfiltered opaque depth.
+    /// Returns the shared raw-depth descriptors used while rendering translucent shadow casters.
     pub(super) fn translucent_pass_resources(&self) -> &MeshPassResources {
-        &self.translucent_pass_resources
+        &self.mesh_pass_resources
     }
 
-    /// Returns the fixed render extent for one cascade index.
+    /// Returns the common render extent of every Stable CSM cascade layer.
     pub(super) fn extent_2d(&self, cascade_index: usize) -> Result<vk::Extent2D, VulkanError> {
-        let extent = self.cascade(cascade_index)?.extent;
+        self.cascade(cascade_index)?;
         Ok(vk::Extent2D {
-            width: extent.width(),
-            height: extent.height(),
+            width: self.shadow_extent.width(),
+            height: self.shadow_extent.height(),
         })
+    }
+
+    pub(super) fn shadow_extent_2d(&self) -> vk::Extent2D {
+        vk::Extent2D {
+            width: self.shadow_extent.width(),
+            height: self.shadow_extent.height(),
+        }
     }
 
     /// Returns the fixed render extent shared by local-light shadow maps.
@@ -1894,12 +2053,17 @@ impl ShadowResources {
         }
     }
 
-    /// Returns the framebuffer used to render one opaque shadow cascade.
+    /// Returns the framebuffer for the stable CSM layer belonging to one cascade.
+    ///
+    /// The legacy backing image may still expose additional layers while a swapchain is being
+    /// rebuilt, but the Stable CSM path always addresses sample zero. Keeping that mapping here
+    /// makes the render path independent from any removed temporal-direction cursor.
     pub(super) fn shadow_framebuffer(
         &self,
         cascade_index: usize,
     ) -> Result<vk::Framebuffer, VulkanError> {
-        Ok(self.cascade(cascade_index)?.shadow_framebuffer)
+        let layer = self.shadow_layer(cascade_index, 0)?;
+        Ok(self.shadow_framebuffers[layer])
     }
 
     /// Returns the framebuffer used to render one local-light cubemap face.
@@ -1917,22 +2081,6 @@ impl ShadowResources {
         )
     }
 
-    /// Returns the framebuffer that receives horizontal moment blur for one cascade.
-    pub(super) fn blur_h_framebuffer(
-        &self,
-        cascade_index: usize,
-    ) -> Result<vk::Framebuffer, VulkanError> {
-        Ok(self.cascade(cascade_index)?.blur_h_framebuffer)
-    }
-
-    /// Returns the framebuffer that receives the filtered moment map for one cascade.
-    pub(super) fn blur_v_framebuffer(
-        &self,
-        cascade_index: usize,
-    ) -> Result<vk::Framebuffer, VulkanError> {
-        Ok(self.cascade(cascade_index)?.blur_v_framebuffer)
-    }
-
     /// Returns the framebuffer used to render one translucent shadow cascade.
     pub(super) fn translucent_framebuffer(
         &self,
@@ -1941,19 +2089,9 @@ impl ShadowResources {
         Ok(self.cascade(cascade_index)?.translucent_framebuffer)
     }
 
-    /// Returns tracked raw moment-map layouts for graph compilation.
-    fn raw_moment_states(&self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
-        std::array::from_fn(|index| self.cascades[index].raw_moment_state)
-    }
-
-    /// Returns tracked horizontal blur scratch layouts for graph compilation.
-    fn blur_moment_states(&self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
-        std::array::from_fn(|index| self.cascades[index].blur_moment_state)
-    }
-
-    /// Returns tracked moment-map layouts for graph compilation.
-    fn moment_states(&self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
-        std::array::from_fn(|index| self.cascades[index].moment_state)
+    /// Returns tracked directional shadow-map layouts for graph compilation.
+    fn shadow_states(&self) -> [ResourceState; SHADOW_CASCADE_COUNT] {
+        [self.directional_state; SHADOW_CASCADE_COUNT]
     }
 
     /// Returns tracked translucent transmittance layouts for graph compilation.
@@ -1966,20 +2104,11 @@ impl ShadowResources {
         &mut self,
         plan: &crate::renderer::graph::FrameGraphPlan,
     ) {
-        for (cascade, resource) in self.cascades.iter_mut().zip(SHADOW_MOMENT_RAW_RESOURCES) {
-            if let Some(state) = plan.final_state_for(resource) {
-                cascade.raw_moment_state = state;
-            }
-        }
-        for (cascade, resource) in self.cascades.iter_mut().zip(SHADOW_MOMENT_BLUR_RESOURCES) {
-            if let Some(state) = plan.final_state_for(resource) {
-                cascade.blur_moment_state = state;
-            }
-        }
-        for (cascade, resource) in self.cascades.iter_mut().zip(SHADOW_CASCADE_RESOURCES) {
-            if let Some(state) = plan.final_state_for(resource) {
-                cascade.moment_state = state;
-            }
+        if let Some(state) = SHADOW_CASCADE_RESOURCES
+            .into_iter()
+            .find_map(|resource| plan.final_state_for(resource))
+        {
+            self.directional_state = state;
         }
         for (cascade, resource) in self.cascades.iter_mut().zip(TRANSLUCENT_SHADOW_RESOURCES) {
             if let Some(state) = plan.final_state_for(resource) {
@@ -1993,37 +2122,10 @@ impl ShadowResources {
         &self,
         resource: GraphResource,
     ) -> Option<(vk::Image, vk::ImageAspectFlags)> {
-        SHADOW_MOMENT_RAW_RESOURCES
+        SHADOW_CASCADE_RESOURCES
             .iter()
-            .position(|candidate| *candidate == resource)
-            .map(|index| {
-                (
-                    self.cascades[index].moments.image,
-                    vk::ImageAspectFlags::COLOR,
-                )
-            })
-            .or_else(|| {
-                SHADOW_MOMENT_BLUR_RESOURCES
-                    .iter()
-                    .position(|candidate| *candidate == resource)
-                    .map(|index| {
-                        (
-                            self.cascades[index].blurred_moments.image,
-                            vk::ImageAspectFlags::COLOR,
-                        )
-                    })
-            })
-            .or_else(|| {
-                SHADOW_CASCADE_RESOURCES
-                    .iter()
-                    .position(|candidate| *candidate == resource)
-                    .map(|index| {
-                        (
-                            self.cascades[index].filtered_moments.image,
-                            vk::ImageAspectFlags::COLOR,
-                        )
-                    })
-            })
+            .any(|candidate| *candidate == resource)
+            .then_some((self.directional_depth.image, vk::ImageAspectFlags::DEPTH))
             .or_else(|| {
                 TRANSLUCENT_SHADOW_RESOURCES
                     .iter()
@@ -2037,6 +2139,35 @@ impl ShadowResources {
             })
     }
 
+    /// Moves one independently addressed array layer from sampling to depth attachment use.
+    pub(super) fn transition_shadow_layer_to_attachment(
+        &self,
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+        cascade_index: usize,
+    ) -> Result<(), VulkanError> {
+        let layer = self.shadow_layer(cascade_index, 0)?;
+        self.directional_depth
+            .transition_layer_to_attachment(device, command_buffer, layer as u32);
+        Ok(())
+    }
+
+    /// Makes one freshly rendered array layer available to comparison sampling.
+    pub(super) fn transition_shadow_layer_to_shader_read(
+        &self,
+        device: &Device,
+        command_buffer: vk::CommandBuffer,
+        cascade_index: usize,
+    ) -> Result<(), VulkanError> {
+        let layer = self.shadow_layer(cascade_index, 0)?;
+        self.directional_depth.transition_layer_to_shader_read(
+            device,
+            command_buffer,
+            layer as u32,
+        );
+        Ok(())
+    }
+
     /// Returns one local-shadow depth image.
     pub(super) fn local_depth_image(&self, light_index: usize) -> Result<vk::Image, VulkanError> {
         Ok(self.local_shadow_cube(light_index)?.depth.image)
@@ -2044,20 +2175,22 @@ impl ShadowResources {
 
     /// Releases fixed shadow framebuffers, descriptors, pipelines, render passes, and targets.
     fn destroy(self, device: &Device, meshes: &VulkanMeshStore) {
-        self.translucent_pass_resources.destroy(device);
         self.mesh_pass_resources.destroy(device);
         meshes.destroy_pipeline_set(device, self.translucent_pipeline);
-        self.blur_pipeline.destroy(device);
         meshes.destroy_pipeline_set(device, self.local_shadow_pipeline);
         meshes.destroy_pipeline_set(device, self.shadow_pipeline);
         for cascade in self.cascades {
             destroy_shadow_cascade(device, cascade);
         }
+        destroy_depth_target(device, self.translucent_depth);
         for local in self.local {
             destroy_local_shadow_cube(device, local);
         }
+        for framebuffer in self.shadow_framebuffers {
+            destroy_framebuffer(device, framebuffer);
+        }
+        self.directional_depth.destroy(device);
         destroy_render_pass(device, self.translucent_render_pass);
-        destroy_render_pass(device, self.blur_render_pass);
         destroy_render_pass(device, self.local_shadow_render_pass);
         destroy_render_pass(device, self.shadow_render_pass);
     }
@@ -2070,6 +2203,15 @@ impl ShadowResources {
                 index: cascade_index,
                 count: self.cascades.len(),
             })
+    }
+
+    fn shadow_layer(
+        &self,
+        cascade_index: usize,
+        _sample_index: usize,
+    ) -> Result<usize, VulkanError> {
+        self.cascade(cascade_index)?;
+        Ok(cascade_index)
     }
 
     fn local_shadow_cube(&self, light_index: usize) -> Result<&LocalShadowCube, VulkanError> {
@@ -2091,9 +2233,9 @@ impl ShadowSamplerFallback {
     /// Releases the dummy descriptor set and its tiny sampled images.
     pub(super) fn destroy(self, device: &Device) {
         self.mesh_pass_resources.destroy(device);
+        self.directional_depth.destroy(device);
         destroy_depth_cube_target(device, self.local_depth);
         destroy_color_target(device, self.transmittance);
-        destroy_color_target(device, self.moments);
     }
 }
 
@@ -2199,7 +2341,7 @@ fn choose_present_mode(
     Ok(present_modes
         .iter()
         .copied()
-        .find(|mode| *mode == vk::PresentModeKHR::FIFO) // V-Sync
+        .find(|mode| *mode == vk::PresentModeKHR::MAILBOX)
         .unwrap_or(vk::PresentModeKHR::FIFO))
 }
 
@@ -2325,13 +2467,12 @@ fn create_swapchain_image_view(
     unsafe { device.create_image_view(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
-fn shadow_cascade_extent(cascade_index: usize) -> NonZeroExtent {
-    let size = shadow_cascade_size(cascade_index);
-    NonZeroExtent::new(size, size).expect("shadow map extent must be non-zero")
+fn stable_csm_shadow_extent(size: u32) -> NonZeroExtent {
+    NonZeroExtent::new(size, size).expect("stable CSM shadow array extent must be non-zero")
 }
 
-fn local_shadow_extent() -> NonZeroExtent {
-    let size = shadow_cascade_size(0).min(2048).max(1024);
+fn local_shadow_extent(shadow_resolution: u32) -> NonZeroExtent {
+    let size = (shadow_resolution / 2).clamp(512, 2048);
     NonZeroExtent::new(size, size).expect("local shadow map extent must be non-zero")
 }
 
@@ -2567,160 +2708,40 @@ fn create_local_shadow_cube_target(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn create_shadow_cascade_target(
     device: &Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     extent: NonZeroExtent,
-    moment_format: vk::Format,
-    shadow_render_pass: vk::RenderPass,
-    blur_render_pass: vk::RenderPass,
     translucent_render_pass: vk::RenderPass,
+    translucent_depth_view: vk::ImageView,
 ) -> Result<ShadowCascade, VulkanError> {
-    let moments = create_color_target(
-        device,
-        memory_properties,
-        extent,
-        moment_format,
-        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-    )?;
-    let blurred_moments = match create_color_target(
-        device,
-        memory_properties,
-        extent,
-        moment_format,
-        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-    ) {
-        Ok(target) => target,
-        Err(error) => {
-            destroy_color_target(device, moments);
-            return Err(error);
-        }
-    };
-    let filtered_moments = match create_color_target(
-        device,
-        memory_properties,
-        extent,
-        moment_format,
-        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-    ) {
-        Ok(target) => target,
-        Err(error) => {
-            destroy_color_target(device, blurred_moments);
-            destroy_color_target(device, moments);
-            return Err(error);
-        }
-    };
-    let depth = match create_depth_target(
-        device,
-        memory_properties,
-        extent,
-        DEPTH_FORMAT,
-        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-    ) {
-        Ok(target) => target,
-        Err(error) => {
-            destroy_color_target(device, filtered_moments);
-            destroy_color_target(device, blurred_moments);
-            destroy_color_target(device, moments);
-            return Err(error);
-        }
-    };
-    let transmittance = match create_color_target(
+    let transmittance = create_color_target(
         device,
         memory_properties,
         extent,
         TRANSLUCENT_SHADOW_FORMAT,
-        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-    ) {
-        Ok(target) => target,
-        Err(error) => {
-            destroy_depth_target(device, depth);
-            destroy_color_target(device, filtered_moments);
-            destroy_color_target(device, blurred_moments);
-            destroy_color_target(device, moments);
-            return Err(error);
-        }
-    };
-    let shadow_framebuffer = match create_shadow_framebuffer(
-        device,
-        shadow_render_pass,
-        moments.view,
-        depth.view,
-        extent,
-    ) {
-        Ok(framebuffer) => framebuffer,
-        Err(error) => {
-            destroy_color_target(device, transmittance);
-            destroy_depth_target(device, depth);
-            destroy_color_target(device, filtered_moments);
-            destroy_color_target(device, blurred_moments);
-            destroy_color_target(device, moments);
-            return Err(error);
-        }
-    };
-    let blur_h_framebuffer =
-        match create_post_framebuffer(device, blur_render_pass, blurred_moments.view, extent) {
-            Ok(framebuffer) => framebuffer,
-            Err(error) => {
-                destroy_framebuffer(device, shadow_framebuffer);
-                destroy_color_target(device, transmittance);
-                destroy_depth_target(device, depth);
-                destroy_color_target(device, filtered_moments);
-                destroy_color_target(device, blurred_moments);
-                destroy_color_target(device, moments);
-                return Err(error);
-            }
-        };
-    let blur_v_framebuffer =
-        match create_post_framebuffer(device, blur_render_pass, filtered_moments.view, extent) {
-            Ok(framebuffer) => framebuffer,
-            Err(error) => {
-                destroy_framebuffer(device, blur_h_framebuffer);
-                destroy_framebuffer(device, shadow_framebuffer);
-                destroy_color_target(device, transmittance);
-                destroy_depth_target(device, depth);
-                destroy_color_target(device, filtered_moments);
-                destroy_color_target(device, blurred_moments);
-                destroy_color_target(device, moments);
-                return Err(error);
-            }
-        };
+        vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_DST,
+    )?;
     let translucent_framebuffer = match create_translucent_shadow_framebuffer(
         device,
         translucent_render_pass,
         transmittance.view,
+        translucent_depth_view,
         extent,
     ) {
         Ok(framebuffer) => framebuffer,
         Err(error) => {
-            destroy_framebuffer(device, blur_v_framebuffer);
-            destroy_framebuffer(device, blur_h_framebuffer);
-            destroy_framebuffer(device, shadow_framebuffer);
             destroy_color_target(device, transmittance);
-            destroy_depth_target(device, depth);
-            destroy_color_target(device, filtered_moments);
-            destroy_color_target(device, blurred_moments);
-            destroy_color_target(device, moments);
             return Err(error);
         }
     };
 
     Ok(ShadowCascade {
-        moments,
-        blurred_moments,
-        filtered_moments,
-        depth,
         transmittance,
-        raw_moment_state: ResourceState::Undefined,
-        blur_moment_state: ResourceState::Undefined,
-        moment_state: ResourceState::Undefined,
         transmittance_state: ResourceState::Undefined,
-        shadow_framebuffer,
-        blur_h_framebuffer,
-        blur_v_framebuffer,
         translucent_framebuffer,
-        extent,
     })
 }
 
@@ -2749,14 +2770,7 @@ fn local_shadow_views(local: &[LocalShadowCube]) -> [vk::ImageView; MAX_LOCAL_LI
 /// Destroys one fixed shadow cascade after frame work has completed.
 fn destroy_shadow_cascade(device: &Device, cascade: ShadowCascade) {
     destroy_framebuffer(device, cascade.translucent_framebuffer);
-    destroy_framebuffer(device, cascade.blur_v_framebuffer);
-    destroy_framebuffer(device, cascade.blur_h_framebuffer);
-    destroy_framebuffer(device, cascade.shadow_framebuffer);
     destroy_color_target(device, cascade.transmittance);
-    destroy_depth_target(device, cascade.depth);
-    destroy_color_target(device, cascade.filtered_moments);
-    destroy_color_target(device, cascade.blurred_moments);
-    destroy_color_target(device, cascade.moments);
 }
 
 fn destroy_local_shadow_cube(device: &Device, local: LocalShadowCube) {
@@ -2764,4 +2778,32 @@ fn destroy_local_shadow_cube(device: &Device, local: LocalShadowCube) {
         destroy_framebuffer(device, framebuffer);
     }
     destroy_depth_cube_target(device, local.depth);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn present_mode_prefers_mailbox_over_fifo() {
+        let modes = [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX];
+
+        assert_eq!(
+            choose_present_mode(&modes).expect("present modes are available"),
+            vk::PresentModeKHR::MAILBOX
+        );
+    }
+
+    #[test]
+    fn present_mode_falls_back_to_guaranteed_fifo() {
+        assert_eq!(
+            choose_present_mode(&[vk::PresentModeKHR::FIFO])
+                .expect("FIFO is always supported by Vulkan surfaces"),
+            vk::PresentModeKHR::FIFO
+        );
+        assert!(matches!(
+            choose_present_mode(&[]),
+            Err(VulkanError::PresentModesUnavailable)
+        ));
+    }
 }

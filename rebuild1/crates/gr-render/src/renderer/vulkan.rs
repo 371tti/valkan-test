@@ -3,6 +3,7 @@ mod buffer;
 mod debug;
 mod frame;
 mod god_rays;
+mod gpu_timing;
 mod immediate;
 mod lod;
 mod material;
@@ -12,10 +13,11 @@ mod post;
 mod readback;
 mod shader;
 mod shadow;
-mod shadow_blur;
+mod stable_csm_depth;
 mod swapchain;
 mod swapchain_pass;
 mod swapchain_target;
+mod taa;
 
 use std::{collections::BTreeMap, ffi::CStr};
 
@@ -23,13 +25,14 @@ use ash::{Device, Entry, Instance, khr, vk};
 use thiserror::Error;
 
 use crate::{
-    import::{ImportedScene, import_asset_on_worker},
+    import::ImportedScene,
     protocol::{
         AssetHandle, DropReason, FrameId, FramebufferReadback, FramebufferReadbackOptions,
         LoadedAsset, MessageEnvelope, NativeSurfaceHandle, NativeSurfacePlatform, NonZeroExtent,
         RenderItemPacket, RenderQualitySettings, RendererCommand, RendererEvent, RendererInbox,
         SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, WindowId,
     },
+    renderer::shadow_map_size_for_quality,
 };
 
 use self::{
@@ -38,13 +41,20 @@ use self::{
     material::VulkanMaterialStore,
     mesh::VulkanMeshStore,
     readback::{FramebufferReadbackConfig, FramebufferReadbackState},
-    shadow::{ShadowFrameData, ShadowFrameSignature},
+    shadow::{LocalShadowFrameData, LocalShadowFrameSignature},
     swapchain::{ShadowResources, ShadowSamplerFallback, VulkanSwapchain},
 };
-use super::{RendererBackend, RendererResult, assets::GpuAssetStore};
+use super::{
+    RendererBackend, RendererResult,
+    asset_import::{AssetImportScheduler, RendererLoopEvent},
+    assets::GpuAssetStore,
+};
 
 const APP_NAME: &CStr = c"rebuild1";
 const ENGINE_NAME: &CStr = c"rebuild1";
+/// Full scene rendering writes HDR color and the two material metadata targets in one subpass.
+/// Directional visibility is already resolved into HDR color by Stable CSM + PCSS.
+const REQUIRED_SCENE_COLOR_ATTACHMENTS: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum VulkanError {
@@ -92,13 +102,39 @@ impl RendererBackend for VulkanRendererBackend {
     async fn run(self, mut inbox: RendererInbox) -> RendererResult {
         tracing::info!("vulkan renderer backend starting");
         let mut context = VulkanContext::new()?;
+        let mut asset_imports = AssetImportScheduler::default();
 
         inbox
             .send_event(MessageEnvelope::new(RendererEvent::RendererReady))
             .await?;
         tracing::info!("vulkan renderer backend ready");
 
-        while let Some(command) = inbox.recv_command().await {
+        loop {
+            let command = match asset_imports.next_event(&mut inbox).await {
+                RendererLoopEvent::Command(command) => command,
+                RendererLoopEvent::AssetImported(completion) => {
+                    let event = match completion.result {
+                        Ok(imported) => {
+                            let asset = context.register_imported_asset(&imported)?;
+                            RendererEvent::AssetLoaded {
+                                request_id: completion.request_id,
+                                asset,
+                            }
+                        }
+                        Err(reason) => RendererEvent::AssetLoadFailed {
+                            request_id: completion.request_id,
+                            reason,
+                        },
+                    };
+                    inbox.send_event(MessageEnvelope::new(event)).await?;
+                    continue;
+                }
+                RendererLoopEvent::CommandChannelClosed => {
+                    asset_imports.shutdown();
+                    break;
+                }
+            };
+            let request_id = command.request_id;
             match command.payload {
                 RendererCommand::ConfigureSurface { surface } => {
                     let configured = context.configure_surface(surface)?;
@@ -167,21 +203,7 @@ impl RendererBackend for VulkanRendererBackend {
                     }
                 }
                 RendererCommand::LoadAsset { path } => {
-                    tracing::trace!(path = %path.display(), "Vulkan renderer loading asset");
-                    let event = match import_asset_on_worker(path).await {
-                        Ok(imported) => {
-                            let asset = context.register_imported_asset(&imported)?;
-                            RendererEvent::AssetLoaded {
-                                request_id: command.request_id,
-                                asset,
-                            }
-                        }
-                        Err(error) => RendererEvent::AssetLoadFailed {
-                            request_id: command.request_id,
-                            reason: error.to_string(),
-                        },
-                    };
-                    inbox.send_event(MessageEnvelope::new(event)).await?;
+                    asset_imports.enqueue(request_id, path);
                 }
                 RendererCommand::UnloadAsset { asset } => {
                     tracing::trace!(asset = ?asset, "Vulkan renderer unloading asset");
@@ -196,10 +218,11 @@ impl RendererBackend for VulkanRendererBackend {
                     context.set_framebuffer_readback(options)?;
                 }
                 RendererCommand::SetQualitySettings { settings } => {
-                    context.set_quality_settings(settings);
+                    context.set_quality_settings(settings)?;
                 }
                 RendererCommand::Shutdown => {
                     tracing::info!("vulkan renderer backend stopping");
+                    asset_imports.shutdown();
                     inbox
                         .send_event(MessageEnvelope::new(RendererEvent::RendererStopped))
                         .await?;
@@ -341,6 +364,30 @@ impl VulkanContext {
             return Ok(Some(configured));
         }
 
+        if existing.swapchain.is_some() {
+            let resolved_extent = self.resolve_swapchain_extent(existing.handle, extent)?;
+            if existing.extent == resolved_extent {
+                tracing::trace!(
+                    surface_id = surface_id.raw(),
+                    generation = generation.raw(),
+                    requested_width = extent.width(),
+                    requested_height = extent.height(),
+                    resolved_width = resolved_extent.width(),
+                    resolved_height = resolved_extent.height(),
+                    "Vulkan surface resize skipped because the resolved extent is unchanged"
+                );
+                let mut configured = existing.info();
+                if existing.generation != generation {
+                    let Some(surface) = self.surfaces.get_mut(&surface_id) else {
+                        return Ok(None);
+                    };
+                    surface.generation = generation;
+                    configured.generation = generation;
+                }
+                return Ok(Some(configured));
+            }
+        }
+
         self.wait_device_idle()?;
         let Some(mut surface) = self.surfaces.remove(&surface_id) else {
             tracing::trace!(
@@ -386,7 +433,7 @@ impl VulkanContext {
     /// Renders and presents a submitted frame snapshot against its target surface.
     fn present_frame(
         &mut self,
-        snapshot: crate::protocol::FrameSnapshot,
+        mut snapshot: crate::protocol::FrameSnapshot,
     ) -> Result<FramePresentResult, VulkanError> {
         tracing::trace!(
             frame_id = snapshot.frame_id.raw(),
@@ -426,6 +473,19 @@ impl VulkanContext {
             ));
         }
 
+        let submitted_render_items = snapshot.render_items.len();
+        snapshot
+            .render_items
+            .retain(|item| self.assets.can_draw(item.mesh, item.material));
+        let retired_render_items =
+            submitted_render_items.saturating_sub(snapshot.render_items.len());
+        if retired_render_items > 0 {
+            tracing::trace!(
+                submitted_render_items,
+                retired_render_items,
+                "removed retired assets from Vulkan frame snapshot"
+            );
+        }
         self.trace_render_item_asset_summary(&snapshot.render_items);
         let surface_id = snapshot.surface_id;
         let Some(mut surface) = self.surfaces.remove(&surface_id) else {
@@ -472,10 +532,7 @@ impl VulkanContext {
             FramePresentResult::Dropped(DropReason::NoSurface { surface_id })
         };
 
-        let retired = self.assets.collect_deferred_destroys();
-        if let Some(device) = self.device.as_mut() {
-            device.destroy_retired_assets(&retired);
-        }
+        self.collect_retired_assets();
         self.surfaces.insert(surface_id, surface);
         Ok(result)
     }
@@ -507,7 +564,18 @@ impl VulkanContext {
         let texture_records = self.assets.texture_descriptors(&asset.textures);
         let material_records = self.assets.material_descriptors(&asset.materials);
         if let Some(device) = self.device.as_mut() {
-            device.upload_imported_meshes(&self.instance, &asset.meshes, imported.meshes())?;
+            let scene = asset.scene.ok_or_else(|| {
+                VulkanError::ShaderInterface(
+                    "an imported scene must own a scene handle before Vulkan upload".into(),
+                )
+            })?;
+            device.upload_imported_meshes(
+                &self.instance,
+                scene,
+                &asset.meshes,
+                imported.meshes(),
+                imported.materials(),
+            )?;
             device.upload_imported_textures(&texture_records)?;
             device.upload_imported_materials(&material_records)?;
         }
@@ -516,13 +584,35 @@ impl VulkanContext {
 
     /// Invalidates one renderer asset handle and queues its GPU resources for deferred destroy.
     fn unload_asset(&mut self, asset: AssetHandle) -> bool {
-        let unloaded = self.assets.unload(asset);
+        let retire_after_submission = self
+            .device
+            .as_ref()
+            .map_or(0, |device| device.frames.last_submitted_serial());
+        let unloaded = self.assets.unload(asset, retire_after_submission);
         tracing::trace!(
             asset = ?asset,
+            retire_after_submission,
             pending_destroy_count = self.assets.pending_destroy_count(),
             "queued Vulkan asset unload"
         );
+        if unloaded {
+            if let Some(device) = self.device.as_mut() {
+                device.invalidate_shadow_state();
+            }
+            self.collect_retired_assets();
+        }
         unloaded
+    }
+
+    /// Destroys only resources whose last referencing frame fence has completed.
+    fn collect_retired_assets(&mut self) {
+        let completed_submission = self.device.as_ref().map_or(u64::MAX, |device| {
+            device.frames.completed_submission_serial()
+        });
+        let retired = self.assets.collect_deferred_destroys(completed_submission);
+        if let Some(device) = self.device.as_mut() {
+            device.destroy_retired_assets(&retired);
+        }
     }
 
     /// Stores app-visible framebuffer readback policy and applies it to the active device.
@@ -548,17 +638,29 @@ impl VulkanContext {
     }
 
     /// Stores renderer quality policy and applies it to all later submitted frames.
-    fn set_quality_settings(&mut self, settings: RenderQualitySettings) {
+    fn set_quality_settings(&mut self, settings: RenderQualitySettings) -> Result<(), VulkanError> {
         tracing::info!(
             ssao_intensity = settings.ssao().intensity(),
             aa_threshold = settings.anti_aliasing().edge_threshold(),
             post_contrast = settings.post().contrast(),
             "updated Vulkan renderer quality settings"
         );
-        self.quality = settings;
+        let volumetric_god_rays_changed = self.quality.bloom().volumetric_god_rays()
+            != settings.bloom().volumetric_god_rays()
+            || self.quality.fog().enabled() != settings.fog().enabled();
         if let Some(device) = self.device.as_mut() {
-            device.set_quality_settings(settings);
+            device.set_quality_settings(settings)?;
         }
+        self.quality = settings;
+        if volumetric_god_rays_changed {
+            for surface in self.surfaces.values_mut() {
+                if let Some(swapchain) = surface.swapchain.as_mut() {
+                    swapchain.invalidate_god_ray_history();
+                }
+            }
+            tracing::debug!("invalidated volumetric God Ray history after changing quality");
+        }
+        Ok(())
     }
 
     /// Creates the logical device once and verifies that later surfaces are present-capable.
@@ -569,7 +671,7 @@ impl VulkanContext {
 
         let mut device = create_device_for_surface(&self.instance, &self.surface_loader, surface)?;
         device.set_framebuffer_readback_options(self.framebuffer_readback);
-        device.set_quality_settings(self.quality);
+        device.set_quality_settings(self.quality)?;
         tracing::info!(
             queue_family_index = device.queue_family_index,
             device_name = %device.name,
@@ -602,6 +704,22 @@ impl VulkanContext {
         device.configure_framebuffer_readback(&swapchain)?;
 
         Ok(swapchain)
+    }
+
+    /// Resolves an app-requested extent through the current surface capability contract.
+    fn resolve_swapchain_extent(
+        &self,
+        surface: vk::SurfaceKHR,
+        requested_extent: NonZeroExtent,
+    ) -> Result<NonZeroExtent, VulkanError> {
+        let physical_device = self
+            .device
+            .as_ref()
+            .ok_or(VulkanError::LogicalDeviceMissing)?
+            .physical_device;
+        let support =
+            swapchain::query_surface_support(&self.surface_loader, physical_device, surface)?;
+        Ok(swapchain::choose_swapchain_config(&support, requested_extent)?.extent())
     }
 
     /// Creates a platform Vulkan surface from one renderer protocol descriptor.
@@ -759,8 +877,8 @@ struct VulkanDevice {
 #[derive(Clone, Copy, Debug)]
 struct ShadowCacheState {
     dirty: bool,
-    signature: Option<ShadowFrameSignature>,
-    frame_data: Option<ShadowFrameData>,
+    local_signature: Option<LocalShadowFrameSignature>,
+    local_frame_data: Option<LocalShadowFrameData>,
 }
 
 impl ShadowCacheState {
@@ -768,39 +886,39 @@ impl ShadowCacheState {
     fn dirty() -> Self {
         Self {
             dirty: true,
-            signature: None,
-            frame_data: None,
+            local_signature: None,
+            local_frame_data: None,
         }
     }
 
     /// Marks cached shadow maps unusable after assets or shadow resources change.
     fn invalidate(&mut self) {
         self.dirty = true;
-        self.signature = None;
-        self.frame_data = None;
+        self.local_signature = None;
+        self.local_frame_data = None;
     }
 
-    /// Returns whether the submitted frame needs to render shadow maps again.
-    fn needs_refresh(self, signature: Option<ShadowFrameSignature>) -> bool {
+    /// Returns whether persistent local cubemaps no longer match the caster/light set.
+    fn local_needs_refresh(self, signature: Option<LocalShadowFrameSignature>) -> bool {
         signature.is_some_and(|signature| {
-            self.dirty || self.signature != Some(signature) || self.frame_data.is_none()
+            self.dirty || self.local_signature != Some(signature) || self.local_frame_data.is_none()
         })
     }
 
-    /// Returns the shadow matrices that match the currently cached shadow-map contents.
-    fn frame_data(self) -> Option<ShadowFrameData> {
-        self.frame_data
+    /// Returns local-light matrices matching the currently cached cubemap contents.
+    fn local_frame_data(self) -> Option<LocalShadowFrameData> {
+        self.local_frame_data
     }
 
-    /// Stores the signature that was rendered into the persistent shadow resources.
-    fn mark_refreshed(
+    /// Stores the light/caster signature rendered into the persistent local cubemaps.
+    fn mark_local_refreshed(
         &mut self,
-        signature: Option<ShadowFrameSignature>,
-        frame_data: Option<ShadowFrameData>,
+        signature: Option<LocalShadowFrameSignature>,
+        frame_data: Option<LocalShadowFrameData>,
     ) {
         if let Some(signature) = signature {
-            self.signature = Some(signature);
-            self.frame_data = frame_data;
+            self.local_signature = Some(signature);
+            self.local_frame_data = frame_data;
             self.dirty = false;
         }
     }
@@ -811,8 +929,10 @@ impl VulkanDevice {
     fn upload_imported_meshes(
         &mut self,
         instance: &Instance,
+        scene: crate::protocol::SceneHandle,
         handles: &[crate::protocol::MeshHandle],
         meshes: &[crate::import::ImportedMesh],
+        materials: &[crate::import::ImportedMaterial],
     ) -> Result<(), VulkanError> {
         self.meshes.upload_imported_meshes(
             instance,
@@ -820,10 +940,12 @@ impl VulkanDevice {
             self.physical_device,
             self.queue_family_index,
             self.graphics_queue,
+            scene,
             handles,
             meshes,
+            materials,
         )?;
-        self.shadow_cache.invalidate();
+        self.invalidate_shadow_state();
         Ok(())
     }
 
@@ -842,7 +964,7 @@ impl VulkanDevice {
             self.graphics_queue,
             textures,
         )?;
-        self.shadow_cache.invalidate();
+        self.invalidate_shadow_state();
         Ok(())
     }
 
@@ -861,17 +983,14 @@ impl VulkanDevice {
             self.graphics_queue,
             materials,
         )?;
-        self.shadow_cache.invalidate();
+        self.invalidate_shadow_state();
         Ok(())
     }
 
-    /// Destroys backend-local resources whose protocol handles have passed deferred retirement.
+    /// Destroys backend resources already proven safe by frame-fence retirement.
     fn destroy_retired_assets(&mut self, retired: &[AssetHandle]) {
         self.meshes.destroy_retired(&self.device, retired);
         self.materials.destroy_retired(&self.device, retired);
-        if !retired.is_empty() {
-            self.shadow_cache.invalidate();
-        }
     }
 
     /// Updates the framebuffer readback cadence requested by the app protocol.
@@ -879,9 +998,33 @@ impl VulkanDevice {
         self.readback.set_options(options);
     }
 
-    /// Updates shader quality constants applied while recording later frames.
-    fn set_quality_settings(&mut self, settings: RenderQualitySettings) {
+    /// Returns the one edge length used by every Stable CSM layer for the current profile.
+    pub(super) fn shadow_map_resolution(&self) -> u32 {
+        shadow_map_size_for_quality(self.quality.stable_csm_pcss().shadow_map_resolution())
+    }
+
+    /// Updates quality constants and rebuilds fixed shadow targets when their shared resolution
+    /// changes.  The CSM layer count and split layout remain untouched.
+    fn set_quality_settings(&mut self, settings: RenderQualitySettings) -> Result<(), VulkanError> {
+        let previous_resolution = self.shadow_map_resolution();
+        let requested_resolution =
+            shadow_map_size_for_quality(settings.stable_csm_pcss().shadow_map_resolution());
         self.quality = settings;
+        if previous_resolution == requested_resolution || self.shadows.is_none() {
+            return Ok(());
+        }
+
+        self.wait_idle()?;
+        if let Some(shadows) = self.shadows.take() {
+            self.destroy_shadow_resources(shadows);
+        }
+        self.invalidate_shadow_state();
+        tracing::info!(
+            old_resolution = previous_resolution,
+            new_resolution = requested_resolution,
+            "rebuilding Stable CSM resources for shared quality resolution"
+        );
+        Ok(())
     }
 
     /// Rebuilds readback buffers for the currently configured swapchain.
@@ -1067,7 +1210,17 @@ fn create_device_for_surface(
     let graphics_queue = unsafe { device.get_device_queue(candidate.queue_family_index, 0) };
     let swapchain_loader = khr::swapchain::Device::new(instance, &device);
     let memory_properties = buffer::memory_properties(instance, candidate.physical_device);
-    let frames = match VulkanFrames::create(&device, candidate.queue_family_index) {
+    let physical_device_properties =
+        get_physical_device_properties(instance, candidate.physical_device);
+    let timestamp_valid_bits = get_queue_family_properties(instance, candidate.physical_device)
+        .get(candidate.queue_family_index as usize)
+        .map_or(0, |queue_family| queue_family.timestamp_valid_bits);
+    let frames = match VulkanFrames::create(
+        &device,
+        candidate.queue_family_index,
+        physical_device_properties.limits.timestamp_period,
+        timestamp_valid_bits,
+    ) {
         Ok(frames) => frames,
         Err(error) => {
             // Safety: no device resources escaped because frame creation failed before returning
@@ -1168,9 +1321,15 @@ fn select_device_candidate(
         let supports_vulkan_1_1 = properties.api_version >= vk::API_VERSION_1_1;
         let features = get_physical_device_features(instance, physical_device);
         let vulkan11_features = get_physical_device_vulkan11_features(instance, physical_device);
-        let has_swapchain = device_supports_swapchain(instance, physical_device)?;
+        let device_extensions = enumerate_device_extensions(instance, physical_device)?;
+        let has_swapchain = extension_properties_include_all(
+            &device_extensions,
+            std::slice::from_ref(&khr::swapchain::NAME),
+        );
         let has_independent_blend = features.independent_blend == vk::TRUE;
         let has_shader_draw_parameters = vulkan11_features.shader_draw_parameters == vk::TRUE;
+        let has_scene_color_attachments =
+            properties.limits.max_color_attachments >= REQUIRED_SCENE_COLOR_ATTACHMENTS;
         let queue_family_index =
             find_graphics_present_queue(instance, surface_loader, physical_device, surface)?;
 
@@ -1180,6 +1339,8 @@ fn select_device_candidate(
             has_swapchain,
             has_independent_blend,
             has_shader_draw_parameters,
+            max_color_attachments = properties.limits.max_color_attachments,
+            has_scene_color_attachments,
             supports_vulkan_1_1,
             queue_family_index,
             "evaluated Vulkan physical device"
@@ -1193,6 +1354,7 @@ fn select_device_candidate(
             || !has_swapchain
             || !has_independent_blend
             || !has_shader_draw_parameters
+            || !has_scene_color_attachments
         {
             continue;
         }
@@ -1246,15 +1408,16 @@ fn find_graphics_present_queue(
     Ok(None)
 }
 
-/// Returns whether a physical device exposes the swapchain extension required for presentation.
-fn device_supports_swapchain(
-    instance: &Instance,
-    physical_device: vk::PhysicalDevice,
-) -> Result<bool, VulkanError> {
-    let extensions = enumerate_device_extensions(instance, physical_device)?;
-    Ok(extensions
-        .iter()
-        .any(|extension| extension_name_matches(extension, khr::swapchain::NAME)))
+/// Returns whether every required extension name is exposed by one physical device.
+fn extension_properties_include_all(
+    available: &[vk::ExtensionProperties],
+    required: &[&CStr],
+) -> bool {
+    required.iter().all(|expected| {
+        available
+            .iter()
+            .any(|extension| extension_name_matches(extension, expected))
+    })
 }
 
 /// Gives simple preference to discrete GPUs while keeping selection deterministic and readable.

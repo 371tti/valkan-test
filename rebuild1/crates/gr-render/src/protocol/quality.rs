@@ -4,8 +4,10 @@ pub struct RenderQualitySettings {
     ssr: SsrQualitySettings,
     anti_aliasing: AntiAliasingQualitySettings,
     shadow_softening: ShadowSofteningQualitySettings,
-    contact_shadow: ContactShadowQualitySettings,
+    stable_csm_pcss: StableCsmPcssQualitySettings,
+    contact_hard_shadows: bool,
     bloom: BloomQualitySettings,
+    fog: VolumetricFogQualitySettings,
     post: PostQualitySettings,
 }
 
@@ -16,8 +18,10 @@ impl RenderQualitySettings {
         ssr: SsrQualitySettings,
         anti_aliasing: AntiAliasingQualitySettings,
         shadow_softening: ShadowSofteningQualitySettings,
-        contact_shadow: ContactShadowQualitySettings,
+        stable_csm_pcss: StableCsmPcssQualitySettings,
+        contact_hard_shadows: bool,
         bloom: BloomQualitySettings,
+        fog: VolumetricFogQualitySettings,
         post: PostQualitySettings,
     ) -> Self {
         Self {
@@ -25,8 +29,10 @@ impl RenderQualitySettings {
             ssr,
             anti_aliasing,
             shadow_softening,
-            contact_shadow,
+            stable_csm_pcss,
+            contact_hard_shadows,
             bloom,
+            fog,
             post,
         }
     }
@@ -69,27 +75,10 @@ impl RenderQualitySettings {
             ssr,
             anti_aliasing,
             shadow_softening,
-            ContactShadowQualitySettings::balanced(),
+            StableCsmPcssQualitySettings::balanced(),
+            false,
             BloomQualitySettings::balanced(),
-            post,
-        )
-    }
-
-    /// Creates a complete renderer quality profile including contact shadows.
-    pub fn new_with_contact_shadow(
-        ssao: SsaoQualitySettings,
-        ssr: SsrQualitySettings,
-        anti_aliasing: AntiAliasingQualitySettings,
-        contact_shadow: ContactShadowQualitySettings,
-        post: PostQualitySettings,
-    ) -> Self {
-        Self::from_parts(
-            ssao,
-            ssr,
-            anti_aliasing,
-            ShadowSofteningQualitySettings::balanced(),
-            contact_shadow,
-            BloomQualitySettings::balanced(),
+            VolumetricFogQualitySettings::disabled(),
             post,
         )
     }
@@ -101,8 +90,10 @@ impl RenderQualitySettings {
             SsrQualitySettings::disabled(),
             AntiAliasingQualitySettings::disabled(),
             ShadowSofteningQualitySettings::disabled(),
-            ContactShadowQualitySettings::disabled(),
+            StableCsmPcssQualitySettings::performance(),
+            false,
             BloomQualitySettings::disabled(),
+            VolumetricFogQualitySettings::disabled(),
             PostQualitySettings::natural(),
         )
     }
@@ -114,8 +105,10 @@ impl RenderQualitySettings {
             SsrQualitySettings::interactive(),
             AntiAliasingQualitySettings::interactive(),
             ShadowSofteningQualitySettings::interactive(),
-            ContactShadowQualitySettings::interactive(),
+            StableCsmPcssQualitySettings::interactive(),
+            false,
             BloomQualitySettings::interactive(),
+            VolumetricFogQualitySettings::disabled(),
             PostQualitySettings::natural(),
         )
     }
@@ -127,8 +120,10 @@ impl RenderQualitySettings {
             SsrQualitySettings::balanced(),
             AntiAliasingQualitySettings::balanced(),
             ShadowSofteningQualitySettings::balanced(),
-            ContactShadowQualitySettings::balanced(),
+            StableCsmPcssQualitySettings::balanced(),
+            false,
             BloomQualitySettings::balanced(),
+            VolumetricFogQualitySettings::disabled(),
             PostQualitySettings::natural(),
         )
     }
@@ -140,8 +135,10 @@ impl RenderQualitySettings {
             SsrQualitySettings::high_quality(),
             AntiAliasingQualitySettings::high_quality(),
             ShadowSofteningQualitySettings::high_quality(),
-            ContactShadowQualitySettings::high_quality(),
+            StableCsmPcssQualitySettings::high_quality(),
+            true,
             BloomQualitySettings::high_quality(),
+            VolumetricFogQualitySettings::high_quality(),
             PostQualitySettings::natural(),
         )
     }
@@ -161,15 +158,22 @@ impl RenderQualitySettings {
         self
     }
 
-    /// Returns a copy with a different screen-space contact shadow profile.
-    pub fn with_contact_shadow(mut self, contact_shadow: ContactShadowQualitySettings) -> Self {
-        self.contact_shadow = contact_shadow;
+    /// Enables a wider PCSS blocker search for near-contact detail without changing CSM layout.
+    pub fn with_contact_hard_shadows(mut self, enabled: bool) -> Self {
+        self.contact_hard_shadows = enabled;
+        self.stable_csm_pcss = self.stable_csm_pcss.with_contact_shadows(enabled);
         self
     }
 
     /// Returns a copy with a different bloom profile.
     pub fn with_bloom(mut self, bloom: BloomQualitySettings) -> Self {
         self.bloom = bloom;
+        self
+    }
+
+    /// Returns a copy with a different world-space volumetric fog profile.
+    pub fn with_fog(mut self, fog: VolumetricFogQualitySettings) -> Self {
+        self.fog = fog;
         self
     }
 
@@ -193,14 +197,30 @@ impl RenderQualitySettings {
         self.shadow_softening
     }
 
-    /// Returns the screen-space contact shadow quality applied by the post pass.
-    pub fn contact_shadow(self) -> ContactShadowQualitySettings {
-        self.contact_shadow
+    /// Returns the spatial Stable CSM + PCSS directional-shadow policy.
+    pub fn stable_csm_pcss(self) -> StableCsmPcssQualitySettings {
+        self.stable_csm_pcss
+    }
+
+    /// Returns a copy with a different Stable CSM + PCSS shadow policy.
+    pub fn with_stable_csm_pcss(mut self, stable_csm_pcss: StableCsmPcssQualitySettings) -> Self {
+        self.stable_csm_pcss = stable_csm_pcss;
+        self
+    }
+
+    /// Returns whether the wider contact-detail blocker search is enabled.
+    pub fn contact_hard_shadows(self) -> bool {
+        self.contact_hard_shadows
     }
 
     /// Returns the bloom quality applied by the post pass.
     pub fn bloom(self) -> BloomQualitySettings {
         self.bloom
+    }
+
+    /// Returns the volumetric medium used by the quality God Ray path.
+    pub fn fog(self) -> VolumetricFogQualitySettings {
+        self.fog
     }
 
     /// Returns the final look multipliers applied after app-side camera effects.
@@ -213,6 +233,171 @@ impl Default for RenderQualitySettings {
     /// Uses the renderer's balanced quality profile for the default visual path.
     fn default() -> Self {
         Self::balanced()
+    }
+}
+
+/// Spatial quality controls for the Stable CSM + PCSS directional shadow path.
+///
+/// These values describe the fixed four-layer map resolution and spatial work performed by the
+/// current frame. Increasing blocker/filter counts improves penumbra stability without a
+/// shadow-history horizon.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StableCsmPcssQualitySettings {
+    blocker_search_samples: u32,
+    filter_samples: u32,
+    light_angular_radius_radians: f32,
+    shadow_map_resolution: u32,
+    receiver_bias_scale: f32,
+    slope_bias_scale: f32,
+    normal_offset_scale: f32,
+    receiver_plane_bias_scale: f32,
+    contact_shadows: bool,
+}
+
+impl StableCsmPcssQualitySettings {
+    pub const MAX_BLOCKER_SEARCH_SAMPLES: u32 = 16;
+    pub const MAX_FILTER_SAMPLES: u32 = 32;
+    pub const MAX_LIGHT_ANGULAR_RADIUS_DEGREES: f32 = 5.0;
+    pub const MIN_SHADOW_MAP_RESOLUTION: u32 = 512;
+    pub const MAX_SHADOW_MAP_RESOLUTION: u32 = 8192;
+
+    pub fn new(
+        blocker_search_samples: u32,
+        filter_samples: u32,
+        light_angular_radius_degrees: f32,
+    ) -> Self {
+        Self {
+            blocker_search_samples: blocker_search_samples
+                .clamp(4, Self::MAX_BLOCKER_SEARCH_SAMPLES),
+            filter_samples: filter_samples.clamp(4, Self::MAX_FILTER_SAMPLES),
+            light_angular_radius_radians: finite_clamp(
+                light_angular_radius_degrees,
+                0.0,
+                Self::MAX_LIGHT_ANGULAR_RADIUS_DEGREES,
+                0.4,
+            )
+            .to_radians(),
+            shadow_map_resolution: 4096,
+            receiver_bias_scale: 1.0,
+            slope_bias_scale: 1.0,
+            normal_offset_scale: 1.0,
+            receiver_plane_bias_scale: 1.0,
+            contact_shadows: false,
+        }
+    }
+
+    /// Selects one shared edge length for all four Stable CSM layers.
+    pub fn with_shadow_map_resolution(mut self, resolution: u32) -> Self {
+        self.shadow_map_resolution = resolution.clamp(
+            Self::MIN_SHADOW_MAP_RESOLUTION,
+            Self::MAX_SHADOW_MAP_RESOLUTION,
+        );
+        self
+    }
+
+    pub fn with_receiver_bias_scale(mut self, scale: f32) -> Self {
+        self.receiver_bias_scale = finite_clamp(scale, 0.25, 8.0, 1.0);
+        self
+    }
+
+    /// Scales the angle-dependent depth bias used for grazing receivers.
+    pub fn with_slope_bias_scale(mut self, scale: f32) -> Self {
+        self.slope_bias_scale = finite_clamp(scale, 0.0, 8.0, 1.0);
+        self
+    }
+
+    /// Scales the world-space receiver displacement along the interpolated normal.
+    pub fn with_normal_offset_scale(mut self, scale: f32) -> Self {
+        self.normal_offset_scale = finite_clamp(scale, 0.0, 8.0, 1.0);
+        self
+    }
+
+    /// Scales the receiver-plane depth gradient used for PCSS tap comparisons.
+    pub fn with_receiver_plane_bias_scale(mut self, scale: f32) -> Self {
+        self.receiver_plane_bias_scale = finite_clamp(scale, 0.0, 8.0, 1.0);
+        self
+    }
+
+    pub fn with_contact_shadows(mut self, enabled: bool) -> Self {
+        self.contact_shadows = enabled;
+        self
+    }
+
+    pub fn performance() -> Self {
+        // Temporarily elevated while validating acne versus peter-panning in the visual smoke.
+        Self::new(4, 8, 0.27)
+            .with_shadow_map_resolution(2048)
+            .with_receiver_bias_scale(3.0)
+    }
+
+    pub fn interactive() -> Self {
+        Self::new(6, 12, 0.32)
+            .with_shadow_map_resolution(3072)
+            .with_receiver_bias_scale(3.0)
+    }
+
+    pub fn balanced() -> Self {
+        Self::new(10, 16, 0.40)
+            .with_shadow_map_resolution(4096)
+            // The 4096² profile needs a larger receiver margin than the editing presets. Keep all
+            // geometric terms elevated together so grazing planes do not reintroduce acne when
+            // PCSS averages a wide, regular tap pattern.
+            .with_receiver_bias_scale(4.0)
+            .with_slope_bias_scale(1.5)
+            .with_normal_offset_scale(1.5)
+            .with_receiver_plane_bias_scale(1.5)
+    }
+
+    pub fn high_quality() -> Self {
+        Self::new(16, 32, 0.60)
+            // Quality-first mode uses the maximum shared map size.  Every cascade receives the
+            // same 8192² target; there is still no near-only layer or extra CSM stage.
+            .with_shadow_map_resolution(8192)
+            .with_receiver_bias_scale(6.0)
+            .with_slope_bias_scale(2.5)
+            .with_normal_offset_scale(2.5)
+            .with_receiver_plane_bias_scale(2.5)
+            .with_contact_shadows(true)
+    }
+
+    pub fn blocker_search_samples(self) -> u32 {
+        self.blocker_search_samples
+    }
+
+    pub fn filter_samples(self) -> u32 {
+        self.filter_samples
+    }
+
+    pub fn light_angular_radius_radians(self) -> f32 {
+        self.light_angular_radius_radians
+    }
+
+    pub fn light_angular_radius_degrees(self) -> f32 {
+        self.light_angular_radius_radians.to_degrees()
+    }
+
+    pub fn shadow_map_resolution(self) -> u32 {
+        self.shadow_map_resolution
+    }
+
+    pub fn receiver_bias_scale(self) -> f32 {
+        self.receiver_bias_scale
+    }
+
+    pub fn slope_bias_scale(self) -> f32 {
+        self.slope_bias_scale
+    }
+
+    pub fn normal_offset_scale(self) -> f32 {
+        self.normal_offset_scale
+    }
+
+    pub fn receiver_plane_bias_scale(self) -> f32 {
+        self.receiver_plane_bias_scale
+    }
+
+    pub fn contact_shadows(self) -> bool {
+        self.contact_shadows
     }
 }
 
@@ -283,69 +468,6 @@ impl ShadowSofteningQualitySettings {
     /// Returns the maximum local luma shift applied by the cleanup pass.
     pub fn max_luma_delta(self) -> f32 {
         self.max_luma_delta
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ContactShadowQualitySettings {
-    intensity: f32,
-    max_distance: f32,
-    thickness: f32,
-    sample_count: u32,
-}
-
-impl ContactShadowQualitySettings {
-    /// Creates bounded controls for the shadow-map contact shadow evaluator.
-    ///
-    /// `max_distance` and `thickness` are measured in light-space world units.
-    /// `sample_count` is retained as a bounded quality tier for profile compatibility.
-    pub fn new(intensity: f32, max_distance: f32, thickness: f32, sample_count: u32) -> Self {
-        Self {
-            intensity: finite_clamp(intensity, 0.0, 1.0, 0.0),
-            max_distance: finite_clamp(max_distance, 0.05, 3.0, 0.85),
-            thickness: finite_clamp(thickness, 0.008, 0.35, 0.070),
-            sample_count: sample_count.clamp(1, 24),
-        }
-    }
-
-    /// Disables contact shadows.
-    pub fn disabled() -> Self {
-        Self::new(0.0, 0.30, 0.070, 1)
-    }
-
-    /// Returns a short, low-cost contact shadow profile for camera movement.
-    pub fn interactive() -> Self {
-        Self::new(0.58, 0.45, 0.070, 6)
-    }
-
-    /// Returns the default contact shadow profile for practical scene grounding.
-    pub fn balanced() -> Self {
-        Self::new(0.82, 0.85, 0.058, 14)
-    }
-
-    /// Returns the inspection profile with longer reach and stronger contact response.
-    pub fn high_quality() -> Self {
-        Self::new(0.95, 1.20, 0.052, 24)
-    }
-
-    /// Returns the final darkening strength.
-    pub fn intensity(self) -> f32 {
-        self.intensity
-    }
-
-    /// Returns the maximum contact range in light-space world units.
-    pub fn max_distance(self) -> f32 {
-        self.max_distance
-    }
-
-    /// Returns the accepted light-depth thickness for a contact hit.
-    pub fn thickness(self) -> f32 {
-        self.thickness
-    }
-
-    /// Returns the bounded quality tier used by the contact evaluator.
-    pub fn sample_count(self) -> u32 {
-        self.sample_count
     }
 }
 
@@ -452,7 +574,7 @@ impl SsaoQualitySettings {
         Self::new(0.20, 0.52, 0.032, 2)
     }
 
-    /// Returns an SSAO profile that adds contact depth without crushing shaded surfaces.
+    /// Returns an SSAO profile that adds near-field depth without crushing shaded surfaces.
     pub fn balanced() -> Self {
         Self::new(0.42, 0.70, 0.030, 4)
     }
@@ -490,7 +612,8 @@ pub struct AntiAliasingQualitySettings {
 }
 
 impl AntiAliasingQualitySettings {
-    /// Creates bounded post AA controls for the high-quality FXAA resolve.
+    /// Creates bounded temporal-AA controls. `blend` controls maximum history feedback; the edge
+    /// threshold remains available to the non-production spatial fallback/debug path.
     pub fn new(edge_threshold: f32, blend: f32) -> Self {
         Self {
             edge_threshold: finite_clamp(edge_threshold, 0.004, 0.08, 0.028),
@@ -498,22 +621,22 @@ impl AntiAliasingQualitySettings {
         }
     }
 
-    /// Disables post AA for the lowest-latency editing profile.
+    /// Disables projection jitter and color-history blending for the lowest-latency profile.
     pub fn disabled() -> Self {
         Self::new(0.08, 0.0)
     }
 
-    /// Returns a post AA profile for normal interactive camera movement.
+    /// Returns a responsive temporal-AA profile for interactive camera movement.
     pub fn interactive() -> Self {
         Self::new(0.034, 0.45)
     }
 
-    /// Returns a balanced post AA profile with lower edge-search cost than inspection mode.
+    /// Returns the default temporal-AA history feedback.
     pub fn balanced() -> Self {
         Self::new(0.018, 0.78)
     }
 
-    /// Returns the high-quality edge resolve profile.
+    /// Returns the strongest temporal accumulation profile.
     pub fn high_quality() -> Self {
         Self::new(0.010, 0.98)
     }
@@ -523,7 +646,7 @@ impl AntiAliasingQualitySettings {
         self.edge_threshold
     }
 
-    /// Returns the maximum amount of resolved color blended into edge pixels.
+    /// Returns the temporal accumulation strength in the range zero through one.
     pub fn blend(self) -> f32 {
         self.blend
     }
@@ -535,6 +658,7 @@ pub struct BloomQualitySettings {
     threshold: f32,
     radius_pixels: f32,
     god_rays_intensity: f32,
+    volumetric_god_rays: bool,
 }
 
 impl BloomQualitySettings {
@@ -542,7 +666,7 @@ impl BloomQualitySettings {
     ///
     /// `intensity` controls the broad glow, `threshold` selects HDR highlights,
     /// `radius_pixels` controls how far bloom taps spread, and
-    /// `god_rays_intensity` controls screen-space volumetric rays from visible light sources.
+    /// `god_rays_intensity` controls volumetric rays from visible light sources.
     pub fn new(
         intensity: f32,
         threshold: f32,
@@ -554,6 +678,7 @@ impl BloomQualitySettings {
             threshold: finite_clamp(threshold, 0.2, 8.0, 1.1),
             radius_pixels: finite_clamp(radius_pixels, 0.5, 32.0, 8.0),
             god_rays_intensity: finite_clamp(god_rays_intensity, 0.0, 1.0, 0.0),
+            volumetric_god_rays: false,
         }
     }
 
@@ -574,7 +699,7 @@ impl BloomQualitySettings {
 
     /// Returns a stronger profile intended for visual inspection.
     pub fn high_quality() -> Self {
-        Self::new(0.095, 1.24, 22.0, 0.44)
+        Self::new(0.095, 1.24, 22.0, 0.44).with_volumetric_god_rays(true)
     }
 
     /// Returns the broad glow contribution.
@@ -592,9 +717,95 @@ impl BloomQualitySettings {
         self.radius_pixels
     }
 
-    /// Returns the screen-space volumetric ray contribution.
+    /// Returns the volumetric ray contribution. Balanced profiles use the legacy screen-space
+    /// approximation; the high-quality profile switches the same intensity to the shadow-aware
+    /// integration path.
     pub fn god_rays_intensity(self) -> f32 {
         self.god_rays_intensity
+    }
+
+    /// Enables the shadow-aware camera-ray volume integration used by the quality profile.
+    pub fn with_volumetric_god_rays(mut self, enabled: bool) -> Self {
+        self.volumetric_god_rays = enabled;
+        self
+    }
+
+    /// Returns whether god rays should be integrated through the directional shadow map.
+    pub fn volumetric_god_rays(self) -> bool {
+        self.volumetric_god_rays
+    }
+}
+
+/// Controls the world-space medium used by the quality volumetric pass.
+///
+/// Fog is intentionally separate from the legacy screen-space God Ray intensity. The medium is
+/// integrated along every camera ray; the directional light only adds anisotropic in-scattering
+/// inside that medium, so fog remains visible when the sun is outside the camera frustum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VolumetricFogQualitySettings {
+    enabled: bool,
+    density: f32,
+    height_falloff: f32,
+    height: f32,
+    max_distance: f32,
+}
+
+impl VolumetricFogQualitySettings {
+    /// Creates a bounded exponential-height fog profile.
+    pub fn new(density: f32, height_falloff: f32, height: f32, max_distance: f32) -> Self {
+        Self {
+            enabled: density.is_finite() && density > 0.0,
+            density: finite_clamp(density, 0.0, 0.08, 0.0035),
+            height_falloff: finite_clamp(height_falloff, 0.0, 2.0, 0.018),
+            height: finite_clamp(height, -1000.0, 1000.0, 0.0),
+            max_distance: finite_clamp(max_distance, 1.0, 512.0, 160.0),
+        }
+    }
+
+    /// Disables volumetric fog and keeps the legacy God Ray path untouched.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            density: 0.0,
+            height_falloff: 0.018,
+            height: 0.0,
+            max_distance: 160.0,
+        }
+    }
+
+    /// Returns the quality fog profile used for still-image inspection.
+    pub fn high_quality() -> Self {
+        Self::new(0.0035, 0.018, 0.0, 160.0)
+    }
+
+    /// Enables or disables the medium without changing its tuned physical parameters.
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled && self.density > 0.0;
+        self
+    }
+
+    pub fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// Extinction coefficient in inverse world units.
+    pub fn density(self) -> f32 {
+        self.density
+    }
+
+    /// Exponential density falloff per world unit above `height`.
+    pub fn height_falloff(self) -> f32 {
+        self.height_falloff
+    }
+
+    /// Reference world-space height of the medium.
+    pub fn height(self) -> f32 {
+        self.height
+    }
+
+    /// Maximum distance marched through the medium for a background pixel.
+    pub fn max_distance(self) -> f32 {
+        self.max_distance
     }
 }
 
@@ -654,8 +865,14 @@ mod tests {
         assert!(settings.ssr().max_distance().is_finite());
         assert_eq!(settings.anti_aliasing().blend(), 1.0);
         assert!(settings.shadow_softening().radius_pixels().is_finite());
-        assert!(settings.contact_shadow().max_distance().is_finite());
+        assert!(
+            settings
+                .stable_csm_pcss()
+                .light_angular_radius_radians()
+                .is_finite()
+        );
         assert!(settings.bloom().threshold().is_finite());
+        assert!(settings.fog().max_distance().is_finite());
         assert!(settings.post().contrast().is_finite());
     }
 
@@ -667,9 +884,74 @@ mod tests {
         assert_eq!(settings.ssr().intensity(), 0.0);
         assert_eq!(settings.anti_aliasing().blend(), 0.0);
         assert_eq!(settings.shadow_softening().intensity(), 0.0);
-        assert_eq!(settings.contact_shadow().intensity(), 0.0);
         assert_eq!(settings.bloom().intensity(), 0.0);
         assert_eq!(settings.bloom().god_rays_intensity(), 0.0);
+        assert!(!settings.fog().enabled());
+        assert!(!settings.contact_hard_shadows());
+    }
+
+    #[test]
+    fn contact_hard_shadows_are_explicit_and_high_quality_only_by_default() {
+        assert!(!RenderQualitySettings::interactive().contact_hard_shadows());
+        assert!(!RenderQualitySettings::balanced().contact_hard_shadows());
+        assert!(RenderQualitySettings::high_quality().contact_hard_shadows());
+        assert!(
+            RenderQualitySettings::balanced()
+                .with_contact_hard_shadows(true)
+                .contact_hard_shadows()
+        );
+    }
+
+    #[test]
+    fn stable_csm_pcss_settings_bound_current_frame_work() {
+        let low = StableCsmPcssQualitySettings::new(0, 0, f32::NAN);
+        let high = StableCsmPcssQualitySettings::new(99, 1, 99.0)
+            .with_shadow_map_resolution(u32::MAX)
+            .with_receiver_bias_scale(f32::INFINITY)
+            .with_slope_bias_scale(f32::INFINITY)
+            .with_normal_offset_scale(f32::NAN)
+            .with_receiver_plane_bias_scale(f32::INFINITY)
+            .with_contact_shadows(true);
+
+        assert_eq!(low.blocker_search_samples(), 4);
+        assert_eq!(low.filter_samples(), 4);
+        assert!((low.light_angular_radius_degrees() - 0.4).abs() < 1.0e-5);
+        assert_eq!(high.blocker_search_samples(), 16);
+        assert_eq!(high.filter_samples(), 4);
+        assert!((high.light_angular_radius_degrees() - 5.0).abs() < 1.0e-5);
+        assert_eq!(high.shadow_map_resolution(), 8192);
+        assert_eq!(high.receiver_bias_scale(), 1.0);
+        assert_eq!(high.slope_bias_scale(), 1.0);
+        assert_eq!(high.normal_offset_scale(), 1.0);
+        assert_eq!(high.receiver_plane_bias_scale(), 1.0);
+        assert!(high.contact_shadows());
+    }
+
+    #[test]
+    fn stable_csm_pcss_profiles_scale_blocker_and_filter_work() {
+        let interactive = RenderQualitySettings::interactive().stable_csm_pcss();
+        let balanced = RenderQualitySettings::balanced().stable_csm_pcss();
+        let high = RenderQualitySettings::high_quality().stable_csm_pcss();
+
+        assert!(interactive.blocker_search_samples() < balanced.blocker_search_samples());
+        assert!(balanced.blocker_search_samples() < high.blocker_search_samples());
+        assert!(interactive.filter_samples() < balanced.filter_samples());
+        assert!(balanced.filter_samples() < high.filter_samples());
+        assert!(
+            interactive.light_angular_radius_radians() < balanced.light_angular_radius_radians()
+        );
+        assert!(balanced.light_angular_radius_radians() < high.light_angular_radius_radians());
+        assert!(interactive.shadow_map_resolution() < balanced.shadow_map_resolution());
+        assert!(balanced.shadow_map_resolution() < high.shadow_map_resolution());
+        assert_eq!(high.shadow_map_resolution(), 8192);
+        assert!(balanced.receiver_bias_scale() > interactive.receiver_bias_scale());
+        assert!(balanced.slope_bias_scale() > interactive.slope_bias_scale());
+        assert!(balanced.normal_offset_scale() > interactive.normal_offset_scale());
+        assert!(balanced.receiver_plane_bias_scale() > interactive.receiver_plane_bias_scale());
+        assert!(high.receiver_bias_scale() > balanced.receiver_bias_scale());
+        assert!(high.slope_bias_scale() > balanced.slope_bias_scale());
+        assert!(high.normal_offset_scale() > balanced.normal_offset_scale());
+        assert!(high.receiver_plane_bias_scale() > balanced.receiver_plane_bias_scale());
     }
 
     #[test]
@@ -693,16 +975,6 @@ mod tests {
     }
 
     #[test]
-    fn contact_shadow_settings_bound_shadow_work() {
-        let settings = ContactShadowQualitySettings::new(5.0, f32::INFINITY, -1.0, 128);
-
-        assert_eq!(settings.intensity(), 1.0);
-        assert!(settings.max_distance().is_finite());
-        assert_eq!(settings.thickness(), 0.008);
-        assert_eq!(settings.sample_count(), 24);
-    }
-
-    #[test]
     fn bloom_settings_bound_post_work() {
         let settings = BloomQualitySettings::new(5.0, f32::INFINITY, -1.0, 5.0);
 
@@ -713,25 +985,17 @@ mod tests {
     }
 
     #[test]
-    fn default_visual_profiles_enable_contact_shadows() {
-        assert!(
-            RenderQualitySettings::interactive()
-                .contact_shadow()
-                .intensity()
-                > 0.0
-        );
-        assert!(
-            RenderQualitySettings::balanced()
-                .contact_shadow()
-                .intensity()
-                > 0.0
-        );
-        assert!(
-            RenderQualitySettings::high_quality()
-                .contact_shadow()
-                .intensity()
-                > 0.0
-        );
+    fn volumetric_fog_settings_bound_medium_work() {
+        let settings =
+            VolumetricFogQualitySettings::new(f32::INFINITY, -1.0, f32::NAN, f32::INFINITY);
+
+        assert!(!settings.enabled());
+        assert!(settings.density().is_finite());
+        assert_eq!(settings.height_falloff(), 0.0);
+        assert!(settings.height().is_finite());
+        assert_eq!(settings.max_distance(), 160.0);
+        assert!(RenderQualitySettings::high_quality().fog().enabled());
+        assert!(!RenderQualitySettings::balanced().fog().enabled());
     }
 
     #[test]
@@ -739,6 +1003,16 @@ mod tests {
         assert!(RenderQualitySettings::interactive().bloom().intensity() > 0.0);
         assert!(RenderQualitySettings::balanced().bloom().intensity() > 0.0);
         assert!(RenderQualitySettings::high_quality().bloom().intensity() > 0.0);
+        assert!(
+            !RenderQualitySettings::balanced()
+                .bloom()
+                .volumetric_god_rays()
+        );
+        assert!(
+            RenderQualitySettings::high_quality()
+                .bloom()
+                .volumetric_god_rays()
+        );
         assert!(
             RenderQualitySettings::high_quality()
                 .bloom()
@@ -765,13 +1039,6 @@ mod tests {
 
         assert!(interactive.anti_aliasing().blend() < balanced.anti_aliasing().blend());
         assert!(balanced.anti_aliasing().blend() < high.anti_aliasing().blend());
-
-        assert!(interactive.contact_shadow().intensity() < balanced.contact_shadow().intensity());
-        assert!(balanced.contact_shadow().intensity() < high.contact_shadow().intensity());
-        assert!(
-            interactive.contact_shadow().sample_count() < balanced.contact_shadow().sample_count()
-        );
-        assert!(balanced.contact_shadow().sample_count() < high.contact_shadow().sample_count());
 
         assert!(interactive.bloom().intensity() < balanced.bloom().intensity());
         assert!(balanced.bloom().intensity() < high.bloom().intensity());

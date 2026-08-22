@@ -32,9 +32,21 @@ const SHADERS: &[Shader] = &[
         stage: "fragment",
     },
     Shader {
+        const_name: "MESH_SCENE_OPAQUE_FRAG",
+        source: "shaders/scene/mesh_scene_opaque.frag.slang",
+        output: "mesh_scene_opaque.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
         const_name: "MESH_SCENE_FAST_FRAG",
         source: "shaders/scene/mesh_scene_fast.frag.slang",
         output: "mesh_scene_fast.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
+        const_name: "MESH_SCENE_OPAQUE_FAST_FRAG",
+        source: "shaders/scene/mesh_scene_opaque_fast.frag.slang",
+        output: "mesh_scene_opaque_fast.frag.spv",
         stage: "fragment",
     },
     Shader {
@@ -44,33 +56,57 @@ const SHADERS: &[Shader] = &[
         stage: "fragment",
     },
     Shader {
+        const_name: "MESH_SCENE_OPAQUE_TEXTURED_FRAG",
+        source: "shaders/scene/mesh_scene_opaque_textured.frag.slang",
+        output: "mesh_scene_opaque_textured.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
         const_name: "MESH_SCENE_TEXTURED_FAST_FRAG",
         source: "shaders/scene/mesh_scene_textured_fast.frag.slang",
         output: "mesh_scene_textured_fast.frag.spv",
         stage: "fragment",
     },
     Shader {
-        const_name: "SHADOW_VERT",
-        source: "shaders/shadow/shadow.vert.slang",
-        output: "shadow.vert.spv",
+        const_name: "MESH_SCENE_OPAQUE_TEXTURED_FAST_FRAG",
+        source: "shaders/scene/mesh_scene_opaque_textured_fast.frag.slang",
+        output: "mesh_scene_opaque_textured_fast.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
+        const_name: "SHADOW_DIRECTIONAL_VERT",
+        source: "shaders/shadow/shadow_directional.vert.slang",
+        output: "shadow_directional.vert.spv",
         stage: "vertex",
     },
     Shader {
-        const_name: "SHADOW_FRAG",
-        source: "shaders/shadow/shadow.frag.slang",
-        output: "shadow.frag.spv",
-        stage: "fragment",
+        const_name: "SHADOW_LOCAL_VERT",
+        source: "shaders/shadow/shadow_local.vert.slang",
+        output: "shadow_local.vert.spv",
+        stage: "vertex",
     },
     Shader {
-        const_name: "SHADOW_TEXTURED_FRAG",
-        source: "shaders/shadow/shadow_textured.frag.slang",
-        output: "shadow_textured.frag.spv",
-        stage: "fragment",
+        const_name: "SHADOW_OPAQUE_DIRECTIONAL_VERT",
+        source: "shaders/shadow/shadow_opaque_directional.vert.slang",
+        output: "shadow_opaque_directional.vert.spv",
+        stage: "vertex",
+    },
+    Shader {
+        const_name: "SHADOW_OPAQUE_LOCAL_VERT",
+        source: "shaders/shadow/shadow_opaque_local.vert.slang",
+        output: "shadow_opaque_local.vert.spv",
+        stage: "vertex",
     },
     Shader {
         const_name: "SHADOW_DEPTH_FRAG",
         source: "shaders/shadow/shadow_depth.frag.slang",
         output: "shadow_depth.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
+        const_name: "SHADOW_DEPTH_OPAQUE_FRAG",
+        source: "shaders/shadow/shadow_depth_opaque.frag.slang",
+        output: "shadow_depth_opaque.frag.spv",
         stage: "fragment",
     },
     Shader {
@@ -92,16 +128,16 @@ const SHADERS: &[Shader] = &[
         stage: "fragment",
     },
     Shader {
-        const_name: "SHADOW_MOMENT_BLUR_FRAG",
-        source: "shaders/shadow/shadow_moment_blur.frag.slang",
-        output: "shadow_moment_blur.frag.spv",
-        stage: "fragment",
-    },
-    Shader {
         const_name: "POST_VERT",
         source: "shaders/post/post.vert.slang",
         output: "post.vert.spv",
         stage: "vertex",
+    },
+    Shader {
+        const_name: "POST_TAA_RESOLVE_FRAG",
+        source: "shaders/post/post_taa_resolve.frag.slang",
+        output: "post_taa_resolve.frag.spv",
+        stage: "fragment",
     },
     Shader {
         const_name: "POST_BLOOM_DOWNSAMPLE_FRAG",
@@ -143,6 +179,12 @@ const SHADERS: &[Shader] = &[
         const_name: "POST_FRAG",
         source: "shaders/post/post.frag.slang",
         output: "post.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
+        const_name: "POST_FAST_FRAG",
+        source: "shaders/post/post_fast.frag.slang",
+        output: "post_fast.frag.spv",
         stage: "fragment",
     },
 ];
@@ -229,7 +271,9 @@ fn compile_shader(slangc: &std::ffi::OsStr, shader: &Shader, out_dir: &Path) {
         .arg("-capability")
         .arg("spirv_1_3")
         .arg("-matrix-layout-column-major")
-        .arg("-O2")
+        .arg("-O3")
+        .arg("-fp-mode")
+        .arg("fast")
         .arg("-entry")
         .arg("main")
         .arg("-stage")

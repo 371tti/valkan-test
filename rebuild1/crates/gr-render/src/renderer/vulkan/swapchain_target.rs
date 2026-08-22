@@ -2,16 +2,14 @@ use ash::{Device, vk};
 
 use crate::protocol::NonZeroExtent;
 
-use super::{
-    VulkanError,
-    buffer::find_memory_type,
-    immediate::{submit_immediate_commands, transition_image},
-};
+use super::{VulkanError, buffer::find_memory_type, immediate::submit_immediate_commands};
 
 pub(super) struct ColorTarget {
     pub(super) image: vk::Image,
     pub(super) memory: vk::DeviceMemory,
     pub(super) view: vk::ImageView,
+    pub(super) sampled_view: vk::ImageView,
+    pub(super) mip_views: Vec<vk::ImageView>,
     pub(super) format: vk::Format,
 }
 
@@ -27,67 +25,6 @@ pub(super) struct DepthCubeTarget {
     pub(super) memory: vk::DeviceMemory,
     pub(super) view: vk::ImageView,
     pub(super) face_views: [vk::ImageView; 6],
-}
-
-/// Clears 1x1 fallback shadow images to full light and makes them shader-readable.
-pub(super) fn initialize_shadow_sampler_fallback_images(
-    device: &Device,
-    queue_family_index: u32,
-    queue: vk::Queue,
-    moment_image: vk::Image,
-    transmittance_image: vk::Image,
-) -> Result<(), VulkanError> {
-    submit_immediate_commands(device, queue_family_index, queue, |command_buffer| {
-        transition_image(
-            device,
-            command_buffer,
-            moment_image,
-            vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_WRITE,
-        );
-        transition_image(
-            device,
-            command_buffer,
-            transmittance_image,
-            vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::AccessFlags::empty(),
-            vk::AccessFlags::TRANSFER_WRITE,
-        );
-        clear_shadow_fallback_images(device, command_buffer, moment_image, transmittance_image);
-        transition_image(
-            device,
-            command_buffer,
-            moment_image,
-            vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-        );
-        transition_image(
-            device,
-            command_buffer,
-            transmittance_image,
-            vk::ImageAspectFlags::COLOR,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-        );
-    })
 }
 
 /// Clears a depth cubemap to full light and makes all faces shader-readable.
@@ -121,6 +58,72 @@ pub(super) fn initialize_depth_cube_shader_read_image(
             vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::SHADER_READ,
         );
+    })
+}
+
+/// Clears the requested color mip levels and leaves them shader-readable.
+pub(super) fn initialize_mipped_color_shader_read_image(
+    device: &Device,
+    queue_family_index: u32,
+    queue: vk::Queue,
+    image: vk::Image,
+    mip_count: u32,
+    clear: [f32; 4],
+) -> Result<(), VulkanError> {
+    let mip_count = mip_count.max(1);
+    submit_immediate_commands(device, queue_family_index, queue, |command_buffer| {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(mip_count)
+            .base_array_layer(0)
+            .layer_count(1);
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_transfer],
+            );
+            device.cmd_clear_color_image(
+                command_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: clear },
+                &[range],
+            );
+        }
+        let to_shader_read = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_shader_read],
+            );
+        }
     })
 }
 
@@ -181,6 +184,8 @@ pub(super) fn create_color_target(
         image,
         memory,
         view,
+        sampled_view: view,
+        mip_views: Vec::new(),
         format,
     })
 }
@@ -319,6 +324,12 @@ pub(super) fn create_depth_cube_target(
 
 /// Destroys a graph-owned color target after the device is idle.
 pub(super) fn destroy_color_target(device: &Device, color: ColorTarget) {
+    for view in color.mip_views {
+        destroy_image_view(device, view);
+    }
+    if color.sampled_view != color.view {
+        destroy_image_view(device, color.sampled_view);
+    }
     destroy_image_view(device, color.view);
     free_memory(device, color.memory);
     destroy_image(device, color.image);
@@ -349,36 +360,6 @@ pub(super) fn destroy_image_view(device: &Device, image_view: vk::ImageView) {
 
     unsafe {
         device.destroy_image_view(image_view, None);
-    }
-}
-
-/// Writes full-light values into dummy shadow maps in transfer-destination layout.
-fn clear_shadow_fallback_images(
-    device: &Device,
-    command_buffer: vk::CommandBuffer,
-    moment_image: vk::Image,
-    transmittance_image: vk::Image,
-) {
-    let color = vk::ClearColorValue {
-        float32: [1.0, 1.0, 1.0, 1.0],
-    };
-    let color_range = [image_subresource_range(vk::ImageAspectFlags::COLOR)];
-
-    unsafe {
-        device.cmd_clear_color_image(
-            command_buffer,
-            moment_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &color,
-            &color_range,
-        );
-        device.cmd_clear_color_image(
-            command_buffer,
-            transmittance_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &color,
-            &color_range,
-        );
     }
 }
 
@@ -435,15 +416,6 @@ fn transition_cube_depth_image(
     }
 }
 
-fn image_subresource_range(aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::default()
-        .aspect_mask(aspect)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1)
-}
-
 fn cube_depth_subresource_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -458,10 +430,20 @@ fn create_color_image_view(
     image: vk::Image,
     format: vk::Format,
 ) -> Result<vk::ImageView, VulkanError> {
+    create_color_image_view_range(device, image, format, 0, 1)
+}
+
+fn create_color_image_view_range(
+    device: &Device,
+    image: vk::Image,
+    format: vk::Format,
+    base_mip_level: u32,
+    level_count: u32,
+) -> Result<vk::ImageView, VulkanError> {
     let subresource_range = vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
+        .base_mip_level(base_mip_level)
+        .level_count(level_count)
         .base_array_layer(0)
         .layer_count(1);
     let create_info = vk::ImageViewCreateInfo::default()

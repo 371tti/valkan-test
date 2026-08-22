@@ -65,7 +65,7 @@ pub use scene::{
 /// CPUがGPU完了を待たずに先行して準備できるフレーム数(1..4程度が一般的)
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const REFLECTION_PROBE_SIZE: u32 = 128;
-const SHADOW_MAP_SIZE: u32 = 4096;
+const SHADOW_MAP_SIZE: u32 = 8192;
 const PLANAR_REFLECTION_MIN_SIZE: u32 = 128;
 const PLANAR_REFLECTION_MAX_SIZE: u32 = 2048;
 const SHADOW_UPDATE_INTERVAL: u32 = 16;

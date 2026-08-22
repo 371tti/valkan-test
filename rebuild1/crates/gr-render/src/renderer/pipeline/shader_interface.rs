@@ -12,29 +12,24 @@ pub(crate) const MATERIAL_NORMAL_BINDING: u32 = 2;
 pub(crate) const MATERIAL_METALLIC_ROUGHNESS_BINDING: u32 = 3;
 pub(crate) const MATERIAL_OCCLUSION_BINDING: u32 = 4;
 pub(crate) const MATERIAL_EMISSIVE_BINDING: u32 = 5;
-pub(crate) const PASS_SHADOW_CASCADE_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [0, 1, 2, 3];
 pub(crate) const PASS_TRANSLUCENT_SHADOW_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [4, 5, 6, 7];
-pub(crate) const PASS_RAW_SHADOW_CASCADE_BINDINGS: [u32; SHADOW_CASCADE_COUNT] = [8, 9, 10, 11];
-pub(crate) const PASS_LOCAL_SHADOW_BINDING: u32 = 12;
-const PASS_SHADOW_CASCADE_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
-    "shadow_cascade_0",
-    "shadow_cascade_1",
-    "shadow_cascade_2",
-    "shadow_cascade_3",
-];
+pub(crate) const PASS_LOCAL_SHADOW_BINDING: u32 = 8;
+pub(crate) const PASS_SHADOW_DEPTH_BINDING: u32 = 9;
+/// Raw directional depth view used only by the PCSS blocker search.
+///
+/// Binding 9 remains the comparison sampler so the final filter is resolved by Vulkan's
+/// hardware-accelerated 2x2 PCF footprint. The raw view is deliberately separate because a
+/// blocker search needs the unfiltered depth value.
+pub(crate) const PASS_SHADOW_DEPTH_RAW_BINDING: u32 = 10;
 const PASS_TRANSLUCENT_SHADOW_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
     "translucent_shadow_0",
     "translucent_shadow_1",
     "translucent_shadow_2",
     "translucent_shadow_3",
 ];
-const PASS_RAW_SHADOW_CASCADE_NAMES: [&str; SHADOW_CASCADE_COUNT] = [
-    "raw_shadow_cascade_0",
-    "raw_shadow_cascade_1",
-    "raw_shadow_cascade_2",
-    "raw_shadow_cascade_3",
-];
 const PASS_LOCAL_SHADOW_NAME: &str = "local_shadow_depth";
+const PASS_SHADOW_DEPTH_NAME: &str = "shadow_depth";
+const PASS_SHADOW_DEPTH_RAW_NAME: &str = "shadow_depth_raw";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ShaderBinding {
@@ -82,21 +77,23 @@ fn mesh_shader_bindings() -> Vec<ShaderBinding> {
         },
     ];
     bindings.extend(pass_shader_bindings(
-        PASS_SHADOW_CASCADE_BINDINGS,
-        PASS_SHADOW_CASCADE_NAMES,
-    ));
-    bindings.extend(pass_shader_bindings(
         PASS_TRANSLUCENT_SHADOW_BINDINGS,
         PASS_TRANSLUCENT_SHADOW_NAMES,
-    ));
-    bindings.extend(pass_shader_bindings(
-        PASS_RAW_SHADOW_CASCADE_BINDINGS,
-        PASS_RAW_SHADOW_CASCADE_NAMES,
     ));
     bindings.push(ShaderBinding {
         set: PASS_SET,
         binding: PASS_LOCAL_SHADOW_BINDING,
         name: PASS_LOCAL_SHADOW_NAME,
+    });
+    bindings.push(ShaderBinding {
+        set: PASS_SET,
+        binding: PASS_SHADOW_DEPTH_BINDING,
+        name: PASS_SHADOW_DEPTH_NAME,
+    });
+    bindings.push(ShaderBinding {
+        set: PASS_SET,
+        binding: PASS_SHADOW_DEPTH_RAW_BINDING,
+        name: PASS_SHADOW_DEPTH_RAW_NAME,
     });
     bindings
 }
@@ -131,11 +128,11 @@ pub(crate) fn validate_mesh_interface() -> Result<(), &'static str> {
     if bindings.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("material texture bindings must be unique");
     }
-    let mut pass_bindings = Vec::with_capacity(SHADOW_CASCADE_COUNT * 3 + 1);
-    pass_bindings.extend(PASS_SHADOW_CASCADE_BINDINGS);
+    let mut pass_bindings = Vec::with_capacity(SHADOW_CASCADE_COUNT + 3);
     pass_bindings.extend(PASS_TRANSLUCENT_SHADOW_BINDINGS);
-    pass_bindings.extend(PASS_RAW_SHADOW_CASCADE_BINDINGS);
     pass_bindings.push(PASS_LOCAL_SHADOW_BINDING);
+    pass_bindings.push(PASS_SHADOW_DEPTH_BINDING);
+    pass_bindings.push(PASS_SHADOW_DEPTH_RAW_BINDING);
     pass_bindings.sort_unstable();
     if pass_bindings.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("pass shadow bindings must be unique");

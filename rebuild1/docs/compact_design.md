@@ -25,12 +25,12 @@
 - dedicated renderer thread
 - Vulkan instance / validation callback / device / surface / swapchain
 - swapchain image view / scene-post render passes / framebuffers
-- fixed cascade shadow depth/transmittance targets
+- one fixed four-layer D16 array for Stable CSM cascades, plus transmittance targets
 - frames-in-flight / acquire / submit / present
 - per-swapchain-image present semaphore
 - render graph compiler: pass/resource declaration, dependency sort, lifetime, barrier plan
 - explicit barrier plan generated from resource usage
-- executable graph path: shadow cascades -> translucent shadow transmittance -> scene target -> post -> optional readback -> present
+- executable graph path: Stable CSM + PCSS -> scene -> TAA -> post -> optional readback -> present
 - build-time Slang -> SPIR-V with generated Vulkan shader asset registry
 - temporary debug triangle pipeline was removed; startup without assets presents a clear scene frame
 - window capture で triangle 表示確認
@@ -60,8 +60,9 @@
 - scene framebuffer has a depth target and mesh pipeline uses depth test/write
 - pass cadence is visible through `pass_schedule.rs`
 - post pipeline samples scene color and writes the acquired swapchain image
-- shadow passes own fixed-size cascade depth targets and depth-only mesh pipeline
-- translucent shadow passes own fixed-size transmittance targets and multiplicative blend mesh pipeline
+- directional shadow passes address one four-layer D16 array as `cascade`
+- translucent shadow uses only the reference direction and keeps the nearest visible transmittance layer
+- Stable CSM keeps each cascade center snapped to its light-space texel grid; PCSS uses raw blocker taps followed by a hardware-comparison PCF filter
 - Vulkan material module uploads imported texture payloads into sampled images
 - Vulkan material module uploads material parameter buffers and descriptor sets
 - `--window-smoke` verifies Vulkan startup, `assets/model.glb` load, mesh draw, post, present, and shutdown
@@ -164,14 +165,15 @@ This keeps asset lifetime, resize ordering, and frame submission from tangling t
 
 The current graph treats shadows as real resources, not a fake pre-pass:
 
-1. `shadow_cascade_0..2` write fixed-size opaque depth targets.
-2. `translucent_shadow_0..2` sample cascade depth and write color-only transmittance maps.
-3. `scene` samples all opaque/translucent cascade resources and writes scene color/depth.
-4. `post` samples scene color and writes the acquired swapchain image.
-5. `framebuffer_readback` runs only for requested final-frame summaries.
-6. `present` is the external side-effect pass.
+1. `shadow_direction_0..3/cascade_0..3` write hard comparison depth into the four stable CSM layers.
+2. `translucent_shadow_0..3` uses the CSM layer and keeps the nearest colored transmittance layer.
+3. `scene` evaluates PCSS using raw blocker taps plus a LINEAR comparison sampler, blends adjacent cascades, and writes HDR plus scene metadata.
+4. `TAA` samples the scene HDR directly, removes current/previous jitter phase from history UVs, selects a matching 2x2 depth/normal candidate, and uses reactive history only when transparent coverage matches.
+5. `post` samples TAA output, maps stable output UVs to the current jittered metadata grid for SSAO/SSR, and writes the acquired swapchain image.
+6. `framebuffer_readback` runs only for requested final-frame summaries.
+7. `present` is the external side-effect pass.
 
-Shadow resources are device-owned and do not follow swapchain extent. The near cascade uses the highest resolution, mid/far cascades are smaller, and projection comes from the camera frustum instead of whole scene bounds.
+Directional depth is device-owned and does not follow swapchain extent. The four cascade layers and split layout are fixed; each quality profile selects one shared resolution for all layers (with `REBUILD1_SHADOW_MAP_SIZE` as a process override). A fixed frustum-bounding sphere, symmetric receiver overlap at each split, square projection, and one-texel light-space snap keep the four cascade projections stable. PCSS uses receiver-plane depth gradients for per-tap comparisons. TAA history follows swapchain extent and is recreated on resize.
 
 ## Module Shape
 

@@ -1,3 +1,4 @@
+#define SCENE_FAST_PATH
 #include "slang_compat.slang"
 
 layout(location = 1) in float3 frag_normal;
@@ -12,14 +13,16 @@ struct FrameCamera {
     float4x4 view_proj;
     float4x4 view;
     float4x4 shadow_view_proj[4];
+    float4 stable_csm_pcss_params;
+    float4 stable_csm_receiver_params;
     float4 shadow_cascade_splits;
     float4 shadow_cascade_texel_world;
     float4 shadow_cascade_depth_span;
+    float4 shadow_cascade_resolution;
     float4 camera_pos;
     float4 light_dir;
     float4 light_color;
     float4 ambient_color;
-    float4 contact_shadow;
     float4x4 local_shadow_view_proj[24];
     float4 local_shadow_params[4];
     float4 emissive_light_position_radius[4];
@@ -27,6 +30,7 @@ struct FrameCamera {
     float4 emissive_light_direction_radius[4];
     float4 emissive_light_size_kind[4];
     float4 emissive_light_count;
+    float4 debug_view;
 };
 [[vk::binding(0, 0)]] ConstantBuffer<FrameCamera> frame_camera;
 
@@ -43,32 +47,31 @@ struct MaterialParams {
 [[vk::binding(3, 1)]] Sampler2D metallic_roughness_texture;
 [[vk::binding(4, 1)]] Sampler2D occlusion_texture;
 [[vk::binding(5, 1)]] Sampler2D emissive_texture;
-[[vk::binding(0, 2)]] Sampler2D shadow_cascade_0;
-[[vk::binding(1, 2)]] Sampler2D shadow_cascade_1;
-[[vk::binding(2, 2)]] Sampler2D shadow_cascade_2;
-[[vk::binding(3, 2)]] Sampler2D shadow_cascade_3;
 [[vk::binding(4, 2)]] Sampler2D translucent_shadow_0;
 [[vk::binding(5, 2)]] Sampler2D translucent_shadow_1;
 [[vk::binding(6, 2)]] Sampler2D translucent_shadow_2;
 [[vk::binding(7, 2)]] Sampler2D translucent_shadow_3;
-[[vk::binding(8, 2)]] Sampler2D raw_shadow_cascade_0;
-[[vk::binding(9, 2)]] Sampler2D raw_shadow_cascade_1;
-[[vk::binding(10, 2)]] Sampler2D raw_shadow_cascade_2;
-[[vk::binding(11, 2)]] Sampler2D raw_shadow_cascade_3;
-[[vk::binding(12, 2)]] SamplerCube local_shadow_depth[4];
+[[vk::binding(8, 2)]] SamplerCube local_shadow_depth[4];
+[[vk::binding(9, 2)]] Sampler2DArrayShadow shadow_depth;
+[[vk::binding(10, 2)]] Sampler2DArray shadow_depth_raw;
 
 static const uint TEX_BASE_COLOR = 1u << 0;
 static const uint TEX_NORMAL = 1u << 1;
 static const uint TEX_METALLIC_ROUGHNESS = 1u << 2;
 static const uint TEX_OCCLUSION = 1u << 3;
 static const uint TEX_EMISSIVE = 1u << 4;
-#include "shadow_sampling.slang"
+#include "stable_csm_sampling.slang"
 #include "pbr_lighting.slang"
 
 bool has_texture(uint bit) {
     return (material.flags.y & bit) != 0u;
 }
 
+#ifdef SCENE_OPAQUE
+float4 apply_alpha(float4 base_color) {
+    return float4(base_color.rgb, 1.0);
+}
+#else
 float4 apply_alpha(float4 base_color) {
     if (material.flags.x == 1 && base_color.a <= material.pbr_alpha.z) {
         discard;
@@ -78,6 +81,7 @@ float4 apply_alpha(float4 base_color) {
     }
     return base_color;
 }
+#endif
 
 float3 normal_from_derivatives(float3 vertex_normal, float3 tangent_space_normal) {
     float3 dp1 = ddx(frag_world_pos);
@@ -139,11 +143,16 @@ float3 normal_from_map(float3 vertex_normal, float4 vertex_tangent) {
     );
 }
 
-float3 surface_normal(bool front_facing) {
+float3 surface_geometric_normal(bool front_facing) {
     float3 normal = normalize_fast(frag_normal);
     if (material.flags.z != 0u && !front_facing) {
         normal = -normal;
     }
+    return normal;
+}
+
+float3 surface_normal(float3 geometric_normal) {
+    float3 normal = geometric_normal;
     if (has_texture(TEX_NORMAL)) {
         normal = normal_from_map(normal, frag_tangent);
     }
@@ -196,26 +205,32 @@ float3 read_emissive() {
     return emissive;
 }
 
+#ifdef SCENE_OPAQUE
+[earlydepthstencil]
+#endif
 [shader("fragment")]
-void main(bool front_facing : SV_IsFrontFace) {
+void main(float4 sv_position : SV_Position, bool front_facing : SV_IsFrontFace) {
     float4 base_color = read_base_color();
-    if (scene_lighting_disabled()) {
+    float3 geometric_normal = surface_geometric_normal(front_facing);
+    if (scene_lighting_disabled() && frame_camera.debug_view.x < 2.5) {
         out_color = float4(read_emissive(), base_color.a);
         return;
     }
     float metallic;
     float roughness;
     read_pbr(metallic, roughness);
-    float3 normal = surface_normal(front_facing);
+    float3 normal = surface_normal(geometric_normal);
     out_color = float4(
         shade_pbr(
             base_color.rgb,
             normal,
+            geometric_normal,
             metallic,
             roughness,
             read_occlusion(),
             read_emissive(),
-            base_color.a
+            base_color.a,
+            sv_position.xy
         ),
         base_color.a
     );

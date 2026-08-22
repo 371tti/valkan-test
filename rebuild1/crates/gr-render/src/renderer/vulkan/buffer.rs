@@ -9,6 +9,166 @@ pub(super) struct GpuBuffer {
     memory: vk::DeviceMemory,
 }
 
+struct PendingDeviceLocalUpload {
+    staging: GpuBuffer,
+    destination: GpuBuffer,
+    size: vk::DeviceSize,
+    final_usage: vk::BufferUsageFlags,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredDeviceLocalCopy {
+    source: vk::Buffer,
+    destination: vk::Buffer,
+    size: vk::DeviceSize,
+    final_usage: vk::BufferUsageFlags,
+}
+
+/// Owns staging buffers whose copies will be recorded by a later command buffer.
+///
+/// Destination buffers are returned separately so descriptor sets can be built before submission.
+/// The staging allocations must remain alive until the command buffer's fence has completed.
+pub(super) struct DeferredDeviceLocalBufferUploads {
+    staging: Vec<GpuBuffer>,
+    copies: Vec<DeferredDeviceLocalCopy>,
+}
+
+impl DeferredDeviceLocalBufferUploads {
+    /// Records all deferred copies and their transfer-to-consumer visibility barriers.
+    pub(super) fn record(&self, device: &Device, command_buffer: vk::CommandBuffer) {
+        for copy in &self.copies {
+            copy_buffer(
+                device,
+                command_buffer,
+                copy.source,
+                copy.destination,
+                copy.size,
+            );
+            transition_uploaded_buffer(
+                device,
+                command_buffer,
+                copy.destination,
+                copy.size,
+                copy.final_usage,
+            );
+        }
+    }
+
+    /// Releases staging allocations after the submission containing `record` has completed.
+    pub(super) fn destroy(self, device: &Device) {
+        destroy_buffers(device, self.staging);
+    }
+}
+
+/// Collects device-local uploads for either one immediate setup submit or a deferred caller submit.
+pub(super) struct DeviceLocalBufferUploadBatch<'a> {
+    device: &'a Device,
+    memory_properties: &'a vk::PhysicalDeviceMemoryProperties,
+    uploads: Vec<PendingDeviceLocalUpload>,
+}
+
+impl<'a> DeviceLocalBufferUploadBatch<'a> {
+    pub(super) fn new(
+        device: &'a Device,
+        memory_properties: &'a vk::PhysicalDeviceMemoryProperties,
+    ) -> Self {
+        Self {
+            device,
+            memory_properties,
+            uploads: Vec::new(),
+        }
+    }
+
+    /// Copies typed data into a staging allocation and queues one device-local destination.
+    pub(super) fn push<T: Copy>(
+        &mut self,
+        usage: vk::BufferUsageFlags,
+        values: &[T],
+    ) -> Result<(), VulkanError> {
+        let size = size_of_val(values) as vk::DeviceSize;
+        let staging = create_buffer_with_data(
+            self.device,
+            self.memory_properties,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            values,
+        )?;
+        let destination = match create_buffer_with_properties(
+            self.device,
+            self.memory_properties,
+            usage | vk::BufferUsageFlags::TRANSFER_DST,
+            size,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                staging.destroy(self.device);
+                return Err(error);
+            }
+        };
+        self.uploads.push(PendingDeviceLocalUpload {
+            staging,
+            destination,
+            size,
+            final_usage: usage,
+        });
+        Ok(())
+    }
+
+    /// Returns destinations and keeps their staging copies deferred for a caller-owned submission.
+    pub(super) fn finish_deferred(mut self) -> (Vec<GpuBuffer>, DeferredDeviceLocalBufferUploads) {
+        let uploads = std::mem::take(&mut self.uploads);
+        let mut destinations = Vec::with_capacity(uploads.len());
+        let mut staging = Vec::with_capacity(uploads.len());
+        let mut copies = Vec::with_capacity(uploads.len());
+        for upload in uploads {
+            copies.push(DeferredDeviceLocalCopy {
+                source: upload.staging.handle(),
+                destination: upload.destination.handle(),
+                size: upload.size,
+                final_usage: upload.final_usage,
+            });
+            staging.push(upload.staging);
+            destinations.push(upload.destination);
+        }
+        (
+            destinations,
+            DeferredDeviceLocalBufferUploads { staging, copies },
+        )
+    }
+
+    /// Submits all queued copies once and returns destinations in insertion order.
+    pub(super) fn finish(
+        self,
+        queue_family_index: u32,
+        queue: vk::Queue,
+    ) -> Result<Vec<GpuBuffer>, VulkanError> {
+        let device = self.device;
+        let (destinations, deferred) = self.finish_deferred();
+        if destinations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let upload_result =
+            submit_immediate_commands(device, queue_family_index, queue, |command_buffer| {
+                deferred.record(device, command_buffer);
+            });
+        deferred.destroy(device);
+        if let Err(error) = upload_result {
+            destroy_buffers(device, destinations);
+            return Err(error);
+        }
+        Ok(destinations)
+    }
+}
+
+impl Drop for DeviceLocalBufferUploadBatch<'_> {
+    fn drop(&mut self) {
+        for upload in self.uploads.drain(..) {
+            upload.staging.destroy(self.device);
+            upload.destination.destroy(self.device);
+        }
+    }
+}
+
 impl GpuBuffer {
     /// Returns the raw Vulkan buffer handle for command buffer binding.
     pub(super) fn handle(&self) -> vk::Buffer {
@@ -17,11 +177,7 @@ impl GpuBuffer {
 
     /// Destroys the buffer and its bound memory allocation.
     pub(super) fn destroy(self, device: &Device) {
-        // Safety: buffers are destroyed after all submitted work using them is idle.
-        unsafe {
-            device.destroy_buffer(self.buffer, None);
-            device.free_memory(self.memory, None);
-        }
+        destroy_buffer_allocation(device, self.buffer, self.memory);
     }
 
     /// Maps host-visible memory for one bounded read and unmaps it before returning.
@@ -67,7 +223,10 @@ pub(super) fn create_buffer_with_data<T: Copy>(
         size,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    write_buffer_slice(device, &gpu_buffer, values)?;
+    if let Err(error) = write_buffer_slice(device, &gpu_buffer, values) {
+        gpu_buffer.destroy(device);
+        return Err(error);
+    }
     Ok(gpu_buffer)
 }
 
@@ -184,7 +343,10 @@ fn create_buffer_with_properties(
     };
 
     // Safety: the selected allocation type satisfies the buffer requirements.
-    unsafe { device.bind_buffer_memory(buffer, memory, 0) }.map_err(VulkanError::Vk)?;
+    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+        destroy_buffer_allocation(device, buffer, memory);
+        return Err(VulkanError::Vk(error));
+    }
     Ok(GpuBuffer { buffer, memory })
 }
 
@@ -309,7 +471,6 @@ fn buffer_read_stage_access(
         stages |= vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER;
         access |= vk::AccessFlags::UNIFORM_READ;
     }
-
     if stages.is_empty() || access.is_empty() {
         (
             vk::PipelineStageFlags::ALL_COMMANDS,
@@ -351,5 +512,14 @@ fn destroy_buffer(device: &Device, buffer: vk::Buffer) {
     // Safety: the buffer was created by this device and is not used after this point.
     unsafe {
         device.destroy_buffer(buffer, None);
+    }
+}
+
+/// Releases one buffer and the successful allocation associated with it.
+fn destroy_buffer_allocation(device: &Device, buffer: vk::Buffer, memory: vk::DeviceMemory) {
+    destroy_buffer(device, buffer);
+    // Safety: callers transfer ownership of one successful allocation and release it exactly once.
+    unsafe {
+        device.free_memory(memory, None);
     }
 }

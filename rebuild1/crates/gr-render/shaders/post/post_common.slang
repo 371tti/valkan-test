@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common_math.slang"
+#include "post_camera_effects.slang"
 
 static const float POST_BACKGROUND_DEPTH = 0.9999;
 
@@ -12,47 +13,31 @@ float3 sample_scene_color(float2 uv) {
     return sample_texture(scene_color, clamp_screen_uv(uv)).rgb;
 }
 
-float depth_at(float2 uv) {
-    return sample_texture(scene_depth, clamp_screen_uv(uv)).r;
+// TAA resolves color onto a stable output grid, while the scene MRTs retain the current
+// projection jitter. A raw MRT coordinate r represents stable coordinate r - jitter_ndc / 2,
+// therefore post effects must read metadata at stable_uv + jitter_ndc / 2.
+float2 post_jitter_ndc() {
+    return float2(params.white_balance.w, params.features.w);
+}
+
+float2 post_metadata_uv(float2 stable_uv) {
+    return clamp_screen_uv(stable_uv + post_jitter_ndc() * 0.5);
+}
+
+float depth_at(float2 stable_uv) {
+    return sample_texture(scene_depth, post_metadata_uv(stable_uv)).r;
+}
+
+float4 opaque_metadata_at(float2 stable_uv) {
+    return sample_texture(scene_normal_roughness, post_metadata_uv(stable_uv));
+}
+
+float4 transparent_metadata_at(float2 stable_uv) {
+    return sample_texture(scene_transparent_normal_roughness, post_metadata_uv(stable_uv));
 }
 
 bool is_background_depth(float depth) {
     return depth >= POST_BACKGROUND_DEPTH;
-}
-
-float3 filmic_tonemap(float3 color) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-
-    color = max(color, float3(0.0));
-
-    float3 numerator = color * (a * color + b);
-    float3 denominator = color * (c * color + d) + e;
-
-    return saturate(numerator / max(denominator, float3(0.0001)));
-}
-
-float3 apply_camera_effects(float3 color) {
-    if (params.enabled < 0.5) {
-        return max(color, float3(0.0));
-    }
-
-    color = max(color, float3(0.0));
-    color *= params.exposure;
-    color *= params.white_balance.rgb;
-
-    color = filmic_tonemap(color);
-
-    float luminance = dot(color, float3(0.2126, 0.7152, 0.0722));
-    color = lerp(float3(luminance), color, params.saturation);
-
-    const float3 contrast_pivot = float3(0.36);
-    color = contrast_pivot + (color - contrast_pivot) * params.contrast;
-
-    return saturate(color);
 }
 
 float linear_depth(float depth) {
@@ -62,9 +47,9 @@ float linear_depth(float depth) {
     );
 }
 
-float3 view_position(float2 uv, float depth) {
+float3 view_position(float2 stable_uv, float depth) {
     float z = linear_depth(depth);
-    float2 ndc = uv * 2.0 - 1.0;
+    float2 ndc = stable_uv * 2.0 - 1.0;
 
     return float3(
         ndc.x * z * params.camera.z,
@@ -106,12 +91,52 @@ bool post_bloom_enabled() {
 }
 
 bool post_god_rays_enabled() {
-    return params.bloom.w > 0.0 &&
-        (params.god_ray_source0.w > 0.0 || params.god_ray_source1.w > 0.0);
+    return params.god_ray_color1.a > 1.5 ||
+        (params.bloom.w > 0.0 &&
+            (params.god_ray_source0.w > 0.0 || params.god_ray_source1.w > 0.0));
+}
+
+bool post_volumetric_fog_enabled() {
+    return params.god_ray_color1.a > 1.5;
 }
 
 bool post_transparent_metadata_enabled() {
     return params.features.x > 0.5;
+}
+
+uint post_debug_view() {
+    return uint(params.features.z + 0.5);
+}
+
+bool post_debug_color(float2 uv, out float3 color) {
+    uint mode = post_debug_view();
+    if (mode == 0u) return false;
+
+    if (mode == 3u) {
+        // Scene shading already contains the per-cascade PCSS radius visualization. Bypass tone
+        // mapping and post effects so the requested normalized value remains directly readable.
+        color = sample_texture(scene_color, frag_uv).rgb;
+        return true;
+    }
+
+    float depth = depth_at(uv);
+    if (mode == 1u) {
+        if (is_background_depth(depth)) {
+            color = float3(0.015, 0.02, 0.03);
+        } else {
+            color = oct_decode(opaque_metadata_at(uv).xy) * 0.5 + 0.5;
+        }
+        return true;
+    }
+    if (mode == 2u) {
+        float normalized = is_background_depth(depth)
+            ? 1.0
+            : log2(1.0 + linear_depth(depth)) / log2(1.0 + params.depth.y);
+        color = float3(saturate(normalized));
+        return true;
+    }
+
+    return false;
 }
 
 bool post_requires_surface_material() {
@@ -229,13 +254,15 @@ SurfaceMaterial surface_material(float2 uv) {
         }
 
         return opaque_surface_material(
-            sample_texture(scene_normal_roughness, uv),
+            opaque_metadata_at(uv),
             opaque_depth
         );
     }
 
-    float4 transparent = sample_texture(scene_transparent_normal_roughness, uv);
-    bool has_transparent = transparent.w > 1.0;
+    float4 transparent = transparent_metadata_at(uv);
+    // The target is RGBA16F: a near device depth packed as 1 + depth can round to exactly 1.
+    // Zero is the clear value, so use the validity class instead of comparing against 1.
+    bool has_transparent = transparent.w > 0.5;
 
     if (is_background_depth(opaque_depth)) {
         if (has_transparent) {
@@ -245,7 +272,7 @@ SurfaceMaterial surface_material(float2 uv) {
         return empty_surface_material(opaque_depth);
     }
 
-    float4 opaque = sample_texture(scene_normal_roughness, uv);
+    float4 opaque = opaque_metadata_at(uv);
 
     if (has_transparent) {
         float transparent_depth = clamp(

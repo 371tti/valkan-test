@@ -41,7 +41,10 @@ float4 radial_from_source(float2 uv, float4 source, float4 source_color) {
     float directional = clamp(source_color.a, 0.0, 1.0);
     float local_shaft = smoothstep(0.015, 0.11, ray_distance) *
         exp2(-ray_distance * 0.82);
-    float directional_shaft = smoothstep(source.z * 2.0, source.z * 9.0, ray_distance) * 0.72;
+    // Keep a soft core at the directional source. Starting this term at zero carved an
+    // aspect-corrected elliptical hole around the sun/moon before the radial samples could blur it.
+    float directional_core = smoothstep(source.z * 0.35, source.z * 7.0, ray_distance);
+    float directional_shaft = lerp(0.42, 0.72, directional_core);
     float shaft = lerp(local_shaft, directional_shaft, directional) *
         god_ray_source_screen_fade(source.xy, directional);
 
@@ -79,6 +82,13 @@ float4 radial_from_source(float2 uv, float4 source, float4 source_color) {
 
 [shader("fragment")]
 void main() {
+    // The high-quality path already contains shadow-aware volumetric integration in the mask target.
+    // Do not apply the legacy source-centred radial blur on top of that signal.
+    if (params.features.z > 0.5) {
+        out_color = sample_inside(source_image, frag_uv);
+        return;
+    }
+
     float4 rays = radial_from_source(frag_uv, params.source0, params.color0);
     rays += radial_from_source(frag_uv, params.source1, params.color1);
 

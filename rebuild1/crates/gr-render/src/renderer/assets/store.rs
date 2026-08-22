@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     import::ImportedScene,
@@ -78,22 +78,29 @@ impl GpuAssetStore {
         )
     }
 
-    /// Invalidates one asset handle and defers destruction until GPU lifetime retirement.
-    pub(crate) fn unload(&mut self, asset: AssetHandle) -> bool {
+    /// Invalidates one asset handle and tags its resources with the last referencing submission.
+    pub(crate) fn unload(&mut self, asset: AssetHandle, retire_after_submission: u64) -> bool {
         match asset {
-            AssetHandle::Scene(scene) => self.unload_scene(scene),
-            AssetHandle::Mesh(mesh) => self.retire_mesh(mesh),
-            AssetHandle::Material(material) => self.retire_material(material),
-            AssetHandle::Texture(texture) => self.retire_texture(texture),
+            AssetHandle::Scene(scene) => self.unload_scene(scene, retire_after_submission),
+            AssetHandle::Mesh(mesh) => self.retire_mesh(mesh, retire_after_submission),
+            AssetHandle::Material(material) => {
+                self.retire_material(material, retire_after_submission)
+            }
+            AssetHandle::Texture(texture) => self.retire_texture(texture, retire_after_submission),
         }
     }
 
-    /// Collects retired handles that are ready for backend-local GPU destruction.
-    pub(crate) fn collect_deferred_destroys(&mut self) -> Vec<AssetHandle> {
-        let retired = self.garbage.collect_ready();
+    /// Collects handles whose last referencing frame submission is fence-complete.
+    pub(crate) fn collect_deferred_destroys(
+        &mut self,
+        completed_submission: u64,
+    ) -> Vec<AssetHandle> {
+        let retired = self.garbage.collect_ready(completed_submission);
         for destroy in &retired {
             tracing::trace!(
                 asset = ?destroy.asset(),
+                retire_after_submission = destroy.retire_after_submission(),
+                completed_submission,
                 "collected deferred asset destroy"
             );
         }
@@ -136,8 +143,10 @@ impl GpuAssetStore {
         &self,
         handles: &[MaterialHandle],
     ) -> Vec<(MaterialHandle, MaterialDescriptor)> {
+        let mut seen = BTreeSet::new();
         handles
             .iter()
+            .filter(|handle| seen.insert(**handle))
             .filter_map(|handle| {
                 self.materials
                     .get(handle)
@@ -215,15 +224,32 @@ impl GpuAssetStore {
         materials: &[crate::import::ImportedMaterial],
         textures: &[TextureHandle],
     ) -> Vec<MaterialHandle> {
-        materials
-            .iter()
-            .map(|material| {
-                let handle = self.alloc_material_handle();
+        let mut handles = Vec::with_capacity(materials.len());
+        let mut unique_materials = 0_usize;
+
+        for material in materials {
+            let asset = GpuMaterialAsset::from_imported(material, textures);
+            if let Some(existing) = handles.iter().copied().find(|handle| {
                 self.materials
-                    .insert(handle, GpuMaterialAsset::from_imported(material, textures));
-                handle
-            })
-            .collect()
+                    .get(handle)
+                    .is_some_and(|stored| stored.descriptor() == asset.descriptor())
+            }) {
+                handles.push(existing);
+                continue;
+            }
+
+            let handle = self.alloc_material_handle();
+            self.materials.insert(handle, asset);
+            handles.push(handle);
+            unique_materials += 1;
+        }
+
+        tracing::trace!(
+            material_slots = materials.len(),
+            unique_materials,
+            "deduplicated imported material descriptors"
+        );
+        handles
     }
 
     /// Allocates one material handle and advances the non-zero counter.
@@ -243,47 +269,51 @@ impl GpuAssetStore {
     }
 
     /// Retires a scene and every child handle tracked through that scene load.
-    fn unload_scene(&mut self, scene: SceneHandle) -> bool {
+    fn unload_scene(&mut self, scene: SceneHandle, retire_after_submission: u64) -> bool {
         let Some(asset) = self.scenes.remove(&scene) else {
             return false;
         };
 
-        self.garbage.defer(AssetHandle::Scene(scene));
+        self.garbage
+            .defer(AssetHandle::Scene(scene), retire_after_submission);
         for mesh in asset.meshes {
-            self.retire_mesh(mesh);
+            self.retire_mesh(mesh, retire_after_submission);
         }
         for material in asset.materials {
-            self.retire_material(material);
+            self.retire_material(material, retire_after_submission);
         }
         for texture in asset.textures {
-            self.retire_texture(texture);
+            self.retire_texture(texture, retire_after_submission);
         }
         true
     }
 
     /// Removes one active mesh handle and queues its GPU resources for later destruction.
-    fn retire_mesh(&mut self, mesh: MeshHandle) -> bool {
+    fn retire_mesh(&mut self, mesh: MeshHandle, retire_after_submission: u64) -> bool {
         let removed = self.meshes.remove(&mesh);
         if removed.is_some() {
-            self.garbage.defer(AssetHandle::Mesh(mesh));
+            self.garbage
+                .defer(AssetHandle::Mesh(mesh), retire_after_submission);
         }
         removed.is_some()
     }
 
     /// Removes one active material handle and queues its GPU resources for later destruction.
-    fn retire_material(&mut self, material: MaterialHandle) -> bool {
+    fn retire_material(&mut self, material: MaterialHandle, retire_after_submission: u64) -> bool {
         let removed = self.materials.remove(&material);
         if removed.is_some() {
-            self.garbage.defer(AssetHandle::Material(material));
+            self.garbage
+                .defer(AssetHandle::Material(material), retire_after_submission);
         }
         removed.is_some()
     }
 
     /// Removes one active texture handle and queues its GPU resources for later destruction.
-    fn retire_texture(&mut self, texture: TextureHandle) -> bool {
+    fn retire_texture(&mut self, texture: TextureHandle, retire_after_submission: u64) -> bool {
         let removed = self.textures.remove(&texture);
         if removed.is_some() {
-            self.garbage.defer(AssetHandle::Texture(texture));
+            self.garbage
+                .defer(AssetHandle::Texture(texture), retire_after_submission);
         }
         removed.is_some()
     }
@@ -316,13 +346,31 @@ mod tests {
         let material = loaded.materials[0];
         let texture = loaded.textures[0];
 
-        assert!(store.unload(AssetHandle::Scene(scene)));
+        assert!(store.unload(AssetHandle::Scene(scene), 7));
 
         assert!(!store.contains_scene(scene));
         assert!(!store.contains_mesh(mesh));
         assert!(!store.contains_material(material));
         assert!(!store.contains_texture(texture));
+        assert!(!store.can_draw(mesh, material));
         assert_eq!(store.pending_destroy_count(), 4);
+    }
+
+    #[test]
+    fn scene_resources_wait_for_the_last_referencing_submission() {
+        let imported = ImportedScene::new("scene.r1scene".into(), 1, 1, 1);
+        let mut store = GpuAssetStore::default();
+        let loaded = store.upload_imported_scene(&imported);
+        let scene = loaded.scene.expect("scene handle is allocated");
+
+        assert!(store.unload(AssetHandle::Scene(scene), 7));
+        assert!(store.collect_deferred_destroys(6).is_empty());
+        assert_eq!(store.pending_destroy_count(), 4);
+
+        let ready = store.collect_deferred_destroys(7);
+        assert_eq!(ready.len(), 4);
+        assert!(ready.contains(&AssetHandle::Scene(scene)));
+        assert_eq!(store.pending_destroy_count(), 0);
     }
 
     // Verifies that Stage 6 material descriptors preserve alpha mode and named texture slots.
@@ -366,9 +414,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn upload_scene_reuses_identical_material_descriptors() {
+        let imported = ImportedScene::new("scene.r1scene".into(), 2, 2, 0);
+        let mut store = GpuAssetStore::default();
+
+        let loaded = store.upload_imported_scene(&imported);
+
+        assert_eq!(loaded.materials.len(), 2);
+        assert_eq!(loaded.materials[0], loaded.materials[1]);
+        assert_eq!(store.materials.len(), 1);
+        assert_eq!(store.material_descriptors(&loaded.materials).len(), 1);
+    }
+
     // Verifies that Stage 7 starts storing real mesh geometry for future Vulkan upload.
     #[test]
-    fn upload_plane_scene_keeps_mesh_geometry() {
+    fn upload_plane_scene_keeps_mesh_readiness_metadata() {
         let light =
             crate::protocol::LocalLightPacket::point([1.0, 2.0, 3.0], [1.0, 0.8, 0.6], 2.0, 8.0)
                 .expect("test light is valid");
@@ -385,8 +446,8 @@ mod tests {
         let mesh = loaded.meshes[0];
         let stored = store.meshes.get(&mesh).expect("mesh should be stored");
 
-        assert_eq!(stored.geometry().vertex_count(), 4);
-        assert_eq!(stored.geometry().index_count(), 6);
+        assert_eq!(stored.vertex_count(), 4);
+        assert_eq!(stored.index_count(), 6);
         assert!(stored.is_draw_ready());
         assert_eq!(loaded.local_lights, vec![light]);
     }

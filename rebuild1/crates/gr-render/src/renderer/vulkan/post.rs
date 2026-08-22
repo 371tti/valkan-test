@@ -5,7 +5,7 @@ use ash::{Device, vk};
 use crate::{
     protocol::{
         AntiAliasingQualitySettings, BloomQualitySettings, CameraEffects, CameraSnapshot,
-        RenderQualitySettings, ShadowSofteningQualitySettings,
+        DebugViewMode, LightPacket, RenderQualitySettings,
     },
     renderer::pipeline::shader_interface,
 };
@@ -20,6 +20,7 @@ use super::{
 const SHADER_ENTRY: &CStr = shader::ENTRY;
 const VERTEX_SHADER: &[u8] = assets::POST_VERT;
 const FRAGMENT_SHADER: &[u8] = assets::POST_FRAG;
+const FAST_FRAGMENT_SHADER: &[u8] = assets::POST_FAST_FRAG;
 const POST_SCENE_COLOR_BINDING: u32 = 0;
 const POST_SCENE_DEPTH_BINDING: u32 = 1;
 const POST_SCENE_NORMAL_ROUGHNESS_BINDING: u32 = 2;
@@ -30,11 +31,12 @@ const POST_GOD_RAY_1_BINDING: u32 = 6;
 
 pub(super) struct PostPipeline {
     pipeline: vk::Pipeline,
+    fast_pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     pass_set_layout: vk::DescriptorSetLayout,
     empty_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     color_sampler: vk::Sampler,
     data_sampler: vk::Sampler,
 }
@@ -42,11 +44,12 @@ pub(super) struct PostPipeline {
 struct PostBuild<'a> {
     device: &'a Device,
     pipeline: Option<vk::Pipeline>,
+    fast_pipeline: Option<vk::Pipeline>,
     pipeline_layout: Option<vk::PipelineLayout>,
     pass_set_layout: Option<vk::DescriptorSetLayout>,
     empty_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
-    descriptor_set: Option<vk::DescriptorSet>,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     color_sampler: Option<vk::Sampler>,
     data_sampler: Option<vk::Sampler>,
     finished: bool,
@@ -58,11 +61,12 @@ impl<'a> PostBuild<'a> {
         Self {
             device,
             pipeline: None,
+            fast_pipeline: None,
             pipeline_layout: None,
             pass_set_layout: None,
             empty_set_layout: None,
             descriptor_pool: None,
-            descriptor_set: None,
+            descriptor_sets: Vec::new(),
             color_sampler: None,
             data_sampler: None,
             finished: false,
@@ -72,22 +76,24 @@ impl<'a> PostBuild<'a> {
     /// Moves all successfully-created objects into the runtime pipeline owner.
     fn finish(mut self) -> PostPipeline {
         let pipeline = take_created(&mut self.pipeline, "post pipeline");
+        let fast_pipeline = take_created(&mut self.fast_pipeline, "fast post pipeline");
         let pipeline_layout = take_created(&mut self.pipeline_layout, "post pipeline layout");
         let pass_set_layout = take_created(&mut self.pass_set_layout, "post pass set layout");
         let empty_set_layout = take_created(&mut self.empty_set_layout, "post empty set layout");
         let descriptor_pool = take_created(&mut self.descriptor_pool, "post descriptor pool");
-        let descriptor_set = take_created(&mut self.descriptor_set, "post descriptor set");
+        let descriptor_sets = std::mem::take(&mut self.descriptor_sets);
         let color_sampler = take_created(&mut self.color_sampler, "post color sampler");
         let data_sampler = take_created(&mut self.data_sampler, "post data sampler");
         self.finished = true;
 
         PostPipeline {
             pipeline,
+            fast_pipeline,
             pipeline_layout,
             pass_set_layout,
             empty_set_layout,
             descriptor_pool,
-            descriptor_set,
+            descriptor_sets,
             color_sampler,
             data_sampler,
         }
@@ -114,10 +120,6 @@ impl<'a> PostBuild<'a> {
     }
 
     /// Returns the descriptor set after it has been allocated.
-    fn descriptor_set(&self) -> vk::DescriptorSet {
-        expect_created(self.descriptor_set, "post descriptor set")
-    }
-
     /// Returns the color sampler after it has been created.
     fn color_sampler(&self) -> vk::Sampler {
         expect_created(self.color_sampler, "post color sampler")
@@ -137,6 +139,9 @@ impl Drop for PostBuild<'_> {
         }
 
         if let Some(pipeline) = self.pipeline.take() {
+            destroy_pipeline(self.device, pipeline);
+        }
+        if let Some(pipeline) = self.fast_pipeline.take() {
             destroy_pipeline(self.device, pipeline);
         }
         if let Some(pool) = self.descriptor_pool.take() {
@@ -161,7 +166,7 @@ impl Drop for PostBuild<'_> {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct PostPushConstants {
     white_balance: [f32; 4],
     camera: [f32; 4],
@@ -169,7 +174,6 @@ struct PostPushConstants {
     ssao: [f32; 4],
     ssr: [f32; 4],
     aa: [f32; 4],
-    shadow: [f32; 4],
     bloom: [f32; 4],
     features: [f32; 4],
     god_ray_source0: [f32; 4],
@@ -191,27 +195,31 @@ impl PostPushConstants {
         quality: RenderQualitySettings,
         has_transparent_scene_items: bool,
         god_ray_history_index: usize,
-        directional_light_intensity: f32,
+        directional_light: LightPacket,
         emissive_lights: EmissiveLightUniforms,
+        debug_view_mode: DebugViewMode,
+        jitter_pixels: [f32; 2],
     ) -> Self {
         let white_balance = camera_effects.white_balance();
         let ssao = quality.ssao();
         let ssr = quality.ssr();
         let anti_aliasing = quality.anti_aliasing();
-        let shadow_softening = quality.shadow_softening();
         let bloom = quality.bloom();
+        let volumetric_god_rays = bloom.volumetric_god_rays() || quality.fog().enabled();
         let post = quality.post();
         let camera_params = Self::camera_params(camera, extent);
-        let god_ray_sources = frame_god_ray_sources(
-            camera,
-            extent,
-            quality,
-            directional_light_intensity,
-            emissive_lights,
-        );
+        let god_ray_sources =
+            frame_god_ray_sources(camera, extent, quality, directional_light, emissive_lights);
 
         Self {
-            white_balance: [white_balance[0], white_balance[1], white_balance[2], 1.0],
+            // Alpha is unused by color grading; carry jitter NDC X so post can map its stable
+            // output grid back to the current jittered scene metadata.
+            white_balance: [
+                white_balance[0],
+                white_balance[1],
+                white_balance[2],
+                jitter_pixels[0] * 2.0 / extent.width.max(1) as f32,
+            ],
             camera: camera_params,
             depth: Self::depth_params(camera),
             ssao: [
@@ -227,7 +235,6 @@ impl PostPushConstants {
                 ssr.thickness(),
             ],
             aa: Self::aa_params(extent, anti_aliasing),
-            shadow: Self::shadow_params(shadow_softening),
             bloom: Self::bloom_params(bloom),
             features: [
                 if has_transparent_scene_items {
@@ -236,13 +243,25 @@ impl PostPushConstants {
                     0.0
                 },
                 god_ray_history_index.min(1) as f32,
-                0.0,
-                0.0,
+                debug_view_mode as u32 as f32,
+                jitter_pixels[1] * 2.0 / extent.height.max(1) as f32,
             ],
             god_ray_source0: god_ray_sources[0].source,
             god_ray_color0: god_ray_sources[0].color,
             god_ray_source1: god_ray_sources[1].source,
-            god_ray_color1: god_ray_sources[1].color,
+            // In the high-quality path the low-resolution target stores volumetric God Ray
+            // scattering and transmittance. Keep an explicit model tag so the post shader selects
+            // the depth-aware upscale instead of the legacy radial path.
+            god_ray_color1: if volumetric_god_rays {
+                [
+                    god_ray_sources[1].color[0],
+                    god_ray_sources[1].color[1],
+                    god_ray_sources[1].color[2],
+                    2.0,
+                ]
+            } else {
+                god_ray_sources[1].color
+            },
             exposure: camera_effects.exposure().value(),
             contrast: (camera_effects.contrast() * post.contrast()).clamp(0.25, 4.0),
             saturation: (camera_effects.saturation() * post.saturation()).clamp(0.0, 4.0),
@@ -283,16 +302,6 @@ impl PostPushConstants {
         ]
     }
 
-    /// Keeps the post push layout stable for shadow cleanup controls.
-    fn shadow_params(shadow_softening: ShadowSofteningQualitySettings) -> [f32; 4] {
-        [
-            shadow_softening.intensity(),
-            shadow_softening.radius_pixels(),
-            shadow_softening.depth_sensitivity(),
-            shadow_softening.max_luma_delta(),
-        ]
-    }
-
     /// Packs the single-pass bloom controls.
     fn bloom_params(bloom: BloomQualitySettings) -> [f32; 4] {
         [
@@ -302,6 +311,26 @@ impl PostPushConstants {
             bloom.god_rays_intensity(),
         ]
     }
+
+    /// Uses the one-sample shader only when every expensive feature is disabled by its packed
+    /// runtime values. These comparisons intentionally match the Slang enable predicates.
+    fn uses_fast_pipeline(self) -> bool {
+        let aa_enabled = self.aa[3] > 0.0;
+        let ssao_enabled = self.ssao[0] > 0.0;
+        let ssr_enabled = self.ssr[0] > 0.0 && self.ssr[1] >= 1.0;
+        let bloom_enabled = self.bloom[0] > 0.0;
+        let debug_view_enabled = self.features[2] > 0.0;
+        let god_rays_enabled = self.god_ray_color1[3] > 1.5
+            || (self.bloom[3] > 0.0
+                && (self.god_ray_source0[3] > 0.0 || self.god_ray_source1[3] > 0.0));
+
+        !(aa_enabled
+            || ssao_enabled
+            || ssr_enabled
+            || bloom_enabled
+            || god_rays_enabled
+            || debug_view_enabled)
+    }
 }
 
 impl PostPipeline {
@@ -309,7 +338,7 @@ impl PostPipeline {
     pub(super) fn create(
         device: &Device,
         render_pass: vk::RenderPass,
-        scene_color_view: vk::ImageView,
+        taa_history_views: [vk::ImageView; 2],
         scene_depth_view: vk::ImageView,
         scene_normal_roughness_view: vk::ImageView,
         scene_transparent_normal_roughness_view: vk::ImageView,
@@ -327,30 +356,36 @@ impl PostPipeline {
         build.color_sampler = Some(create_sampler(device, vk::Filter::LINEAR)?);
         build.data_sampler = Some(create_sampler(device, vk::Filter::NEAREST)?);
         build.descriptor_pool = Some(create_descriptor_pool(device)?);
-        build.descriptor_set = Some(allocate_descriptor_set(
-            device,
-            build.descriptor_pool(),
-            build.pass_set_layout(),
-        )?);
-        update_descriptor_set(
-            device,
-            build.descriptor_set(),
-            scene_color_view,
-            scene_depth_view,
-            scene_normal_roughness_view,
-            scene_transparent_normal_roughness_view,
-            bloom_view,
-            god_ray_history_views,
-            build.color_sampler(),
-            build.data_sampler(),
-        );
+        build.descriptor_sets =
+            allocate_descriptor_sets(device, build.descriptor_pool(), build.pass_set_layout(), 2)?;
+        for (index, descriptor_set) in build.descriptor_sets.iter().copied().enumerate() {
+            update_descriptor_set(
+                device,
+                descriptor_set,
+                taa_history_views[index],
+                scene_depth_view,
+                scene_normal_roughness_view,
+                scene_transparent_normal_roughness_view,
+                bloom_view,
+                god_ray_history_views,
+                build.color_sampler(),
+                build.data_sampler(),
+            );
+        }
         build.pipeline = Some(create_post_pipeline(
             device,
             build.pipeline_layout(),
             render_pass,
+            FRAGMENT_SHADER,
+        )?);
+        build.fast_pipeline = Some(create_post_pipeline(
+            device,
+            build.pipeline_layout(),
+            render_pass,
+            FAST_FRAGMENT_SHADER,
         )?);
 
-        tracing::info!("created Vulkan post pipeline");
+        tracing::info!("created Vulkan full and fast post pipelines");
         Ok(build.finish())
     }
 
@@ -364,9 +399,12 @@ impl PostPipeline {
         camera: CameraSnapshot,
         quality: RenderQualitySettings,
         has_transparent_scene_items: bool,
+        taa_history_index: usize,
         god_ray_history_index: usize,
-        directional_light_intensity: f32,
+        directional_light: LightPacket,
         emissive_lights: EmissiveLightUniforms,
+        debug_view_mode: DebugViewMode,
+        jitter_pixels: [f32; 2],
     ) {
         let viewports = [vk::Viewport::default()
             .x(0.0)
@@ -378,17 +416,28 @@ impl PostPipeline {
         let scissors = [vk::Rect2D::default()
             .offset(vk::Offset2D { x: 0, y: 0 })
             .extent(extent)];
-        let descriptor_sets = [self.descriptor_set];
-        let push = PostPushConstants::new(
+        let descriptor_set = self.descriptor_sets[taa_history_index.min(1)];
+        let descriptor_sets = [descriptor_set];
+        let mut push = PostPushConstants::new(
             camera_effects,
             camera,
             extent,
             quality,
             has_transparent_scene_items,
             god_ray_history_index,
-            directional_light_intensity,
+            directional_light,
             emissive_lights,
+            debug_view_mode,
+            jitter_pixels,
         );
+        // TAA owns anti-aliasing when its HDR history is bound; do not blur edges a second time.
+        push.aa[3] = 0.0;
+        let fast_path = push.uses_fast_pipeline();
+        let pipeline = if fast_path {
+            self.fast_pipeline
+        } else {
+            self.pipeline
+        };
         let push_bytes = push_constant_bytes(&push);
 
         tracing::trace!(
@@ -404,26 +453,22 @@ impl PostPipeline {
             ssr_steps = push.ssr[1],
             aa_threshold = push.aa[2],
             aa_blend = push.aa[3],
-            shadow_softening = push.shadow[0],
-            shadow_softening_radius = push.shadow[1],
             bloom_intensity = push.bloom[0],
             bloom_threshold = push.bloom[1],
             bloom_radius = push.bloom[2],
             god_rays_intensity = push.bloom[3],
+            debug_view = push.features[2],
             god_ray_source0 = ?push.god_ray_source0,
             god_ray_source1 = ?push.god_ray_source1,
             has_transparent_scene_items,
+            fast_path,
             "recording Vulkan post pass"
         );
 
         // Safety: the command buffer is inside the post render pass, the pipeline is compatible
         // with that pass, and the descriptor set points at the live scene color image view.
         unsafe {
-            device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline,
-            );
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_set_viewport(command_buffer, 0, &viewports);
             device.cmd_set_scissor(command_buffer, 0, &scissors);
             device.cmd_bind_descriptor_sets(
@@ -447,6 +492,7 @@ impl PostPipeline {
 
     /// Destroys all swapchain-dependent post resources.
     pub(super) fn destroy(self, device: &Device) {
+        destroy_pipeline(device, self.fast_pipeline);
         destroy_pipeline(device, self.pipeline);
         destroy_descriptor_pool(device, self.descriptor_pool);
         destroy_sampler(device, self.data_sampler);
@@ -530,12 +576,11 @@ fn create_sampler(device: &Device, filter: vk::Filter) -> Result<vk::Sampler, Vu
 
 /// Creates the descriptor pool for post-process sampled image bindings.
 fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, VulkanError> {
-    let pool_size = vk::DescriptorPoolSize::default()
+    let pool_sizes = [vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(7);
-    let pool_sizes = [pool_size];
+        .descriptor_count(14)];
     let create_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(1)
+        .max_sets(2)
         .pool_sizes(&pool_sizes);
 
     // Safety: pool sizes are local values.
@@ -543,20 +588,19 @@ fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, VulkanE
 }
 
 /// Allocates the descriptor set bound by the post pass.
-fn allocate_descriptor_set(
+fn allocate_descriptor_sets(
     device: &Device,
     descriptor_pool: vk::DescriptorPool,
     pass_set_layout: vk::DescriptorSetLayout,
-) -> Result<vk::DescriptorSet, VulkanError> {
-    let layouts = [pass_set_layout];
+    count: usize,
+) -> Result<Vec<vk::DescriptorSet>, VulkanError> {
+    let layouts = vec![pass_set_layout; count];
     let allocate_info = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(descriptor_pool)
         .set_layouts(&layouts);
 
     // Safety: the descriptor pool and set layout are alive for allocation.
-    unsafe { device.allocate_descriptor_sets(&allocate_info) }
-        .map(|mut sets| sets.remove(0))
-        .map_err(VulkanError::Vk)
+    unsafe { device.allocate_descriptor_sets(&allocate_info) }.map_err(VulkanError::Vk)
 }
 
 /// Writes sampled scene color, depth, and normal/roughness images into the post descriptor set.
@@ -651,9 +695,10 @@ fn create_post_pipeline(
     device: &Device,
     pipeline_layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
+    fragment_shader_code: &[u8],
 ) -> Result<vk::Pipeline, VulkanError> {
     let vertex_shader = shader::create_shader_module(device, VERTEX_SHADER)?;
-    let fragment_shader = match shader::create_shader_module(device, FRAGMENT_SHADER) {
+    let fragment_shader = match shader::create_shader_module(device, fragment_shader_code) {
         Ok(shader) => shader,
         Err(error) => {
             shader::destroy_shader_module(device, vertex_shader);
@@ -787,5 +832,53 @@ fn destroy_pipeline(device: &Device, pipeline: vk::Pipeline) {
     if pipeline != vk::Pipeline::null() {
         // Safety: the pipeline was created by this device and is no longer referenced.
         unsafe { device.destroy_pipeline(pipeline, None) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PostPushConstants;
+
+    #[test]
+    fn fast_post_requires_every_expensive_feature_to_be_disabled() {
+        let disabled = PostPushConstants::default();
+        assert!(disabled.uses_fast_pipeline());
+
+        let mut aa = disabled;
+        aa.aa[3] = 1.0;
+        assert!(!aa.uses_fast_pipeline());
+
+        let mut ssao = disabled;
+        ssao.ssao[0] = 1.0;
+        assert!(!ssao.uses_fast_pipeline());
+
+        let mut ssr = disabled;
+        ssr.ssr[0] = 1.0;
+        ssr.ssr[1] = 1.0;
+        assert!(!ssr.uses_fast_pipeline());
+
+        let mut bloom = disabled;
+        bloom.bloom[0] = 1.0;
+        assert!(!bloom.uses_fast_pipeline());
+
+        let mut god_rays = disabled;
+        god_rays.bloom[3] = 1.0;
+        god_rays.god_ray_source1[3] = 1.0;
+        assert!(!god_rays.uses_fast_pipeline());
+
+        let mut debug_view = disabled;
+        debug_view.features[2] = 1.0;
+        assert!(!debug_view.uses_fast_pipeline());
+    }
+
+    #[test]
+    fn fast_post_matches_compound_shader_enable_conditions() {
+        let mut ssr_without_steps = PostPushConstants::default();
+        ssr_without_steps.ssr[0] = 1.0;
+        assert!(ssr_without_steps.uses_fast_pipeline());
+
+        let mut god_rays_without_source = PostPushConstants::default();
+        god_rays_without_source.bloom[3] = 1.0;
+        assert!(god_rays_without_source.uses_fast_pipeline());
     }
 }

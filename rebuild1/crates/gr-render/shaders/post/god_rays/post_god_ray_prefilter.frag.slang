@@ -14,6 +14,15 @@ void add_tap(inout float4 sum, inout float total, float2 uv, float2 offset, floa
 
 [shader("fragment")]
 void main() {
+    // The volumetric mask already contains a directional scattering sample. A source-space 3x3
+    // prefilter has no scene-depth information and would blur it across foliage silhouettes before
+    // the depth-aware full-resolution upscale gets a chance to reject it. Keep the high-quality
+    // path point-preserving; the legacy radial path retains its spatial prefilter below.
+    if (params.features.z > 0.5) {
+        out_color = sample_inside(source_image, frag_uv);
+        return;
+    }
+
     float4 sum = float4(0.0);
     float total = 0.0;
 

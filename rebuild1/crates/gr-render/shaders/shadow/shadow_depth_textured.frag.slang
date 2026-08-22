@@ -1,7 +1,5 @@
 #include "slang_compat.slang"
 
-#include "shadow_alpha.slang"
-
 layout(location = 0) in float2 frag_uv;
 layout(location = 1) in float4 frag_color;
 
@@ -15,23 +13,13 @@ struct MaterialParams {
 
 [[vk::binding(1, 1)]] Sampler2D base_color_texture;
 
-static const uint TEX_BASE_COLOR = 1u << 0;
-
-bool has_base_color_texture() {
-    return (material.flags.y & TEX_BASE_COLOR) != 0u;
-}
-
 [shader("fragment")]
 void main() {
-    float4 base_color = frag_color * material.base_color_factor;
-
-    if (has_base_color_texture()) {
-        base_color *= sample_texture(base_color_texture, frag_uv);
+    // Directional/local depth passes only need alpha; avoid carrying RGB through the alpha test.
+    float alpha = frag_color.a
+        * material.base_color_factor.a
+        * sample_texture(base_color_texture, frag_uv).a;
+    if (alpha <= material.pbr_alpha.z) {
+        discard;
     }
-
-    discard_opaque_shadow_alpha(
-        material.flags.x,
-        material.pbr_alpha.z,
-        base_color.a
-    );
 }

@@ -5,3 +5,8 @@
 !/rebuild1/assets/*.r1scene
 /old/target
 /old/assets
+/rebuild1/crates/gr-render/.codex-target
+/rebuild1/.codex-target
+/.codex-target
+/.codex
+/.agents

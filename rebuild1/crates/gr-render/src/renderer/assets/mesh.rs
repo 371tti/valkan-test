@@ -2,31 +2,42 @@ use crate::{import::ImportedMesh, math::length3, protocol::SceneBounds};
 
 #[derive(Clone, Debug)]
 pub(crate) struct GpuMeshAsset {
-    geometry: MeshGeometry,
+    vertex_count: usize,
+    index_count: usize,
 }
 
 impl GpuMeshAsset {
-    /// Builds renderer mesh geometry from the importer-owned intermediate mesh record.
+    /// Retains only the readiness metadata shared by renderer backends.
+    ///
+    /// Vulkan builds and owns its device-local geometry separately. Keeping another full CPU
+    /// vertex/index copy in the generic handle store scaled permanent memory with polygon count
+    /// without serving any draw path.
     pub(crate) fn from_imported(imported: &ImportedMesh) -> Self {
-        let geometry = MeshGeometry::from_imported(imported);
-        tracing::trace!(
-            vertices = geometry.vertex_count(),
-            indices = geometry.index_count(),
-            "registered mesh geometry"
-        );
+        let (vertex_count, index_count) = match imported {
+            ImportedMesh::Plane => (4, 6),
+            ImportedMesh::Indexed(data) => (data.vertices().len(), data.indices().len()),
+        };
+        tracing::trace!(vertex_count, index_count, "registered mesh metadata");
 
-        Self { geometry }
+        Self {
+            vertex_count,
+            index_count,
+        }
     }
 
     /// Returns whether this mesh has enough geometry for indexed triangle rendering.
     pub(crate) fn is_draw_ready(&self) -> bool {
-        self.geometry.vertex_count() >= 3 && self.geometry.index_count() >= 3
+        self.vertex_count >= 3 && self.index_count >= 3
     }
 
-    /// Returns the immutable geometry payload kept for the Vulkan mesh uploader.
     #[cfg(test)]
-    pub(crate) fn geometry(&self) -> &MeshGeometry {
-        &self.geometry
+    pub(crate) fn vertex_count(&self) -> usize {
+        self.vertex_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_count(&self) -> usize {
+        self.index_count
     }
 }
 
@@ -91,11 +102,6 @@ impl MeshGeometry {
             ],
             indices: vec![0, 1, 2, 2, 3, 0],
         }
-    }
-
-    /// Returns the number of vertices available for upload.
-    pub(crate) fn vertex_count(&self) -> usize {
-        self.vertices.len()
     }
 
     /// Returns vertices in the memory layout expected by the Vulkan mesh uploader.
@@ -173,7 +179,7 @@ impl MeshVertex {
         Self::new_with_tangent(position, normal, uv, [1.0, 0.0, 0.0, 1.0], color)
     }
 
-    /// Creates one vertex in the exact memory layout used by scene and shadow mesh shaders.
+    /// Creates one full-precision CPU vertex later packed into the device-facing GPU layout.
     pub(crate) fn new_with_tangent(
         position: [f32; 3],
         normal: [f32; 3],

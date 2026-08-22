@@ -1,0 +1,41 @@
+#include "slang_compat.slang"
+
+layout(location = 0) in float3 in_position;
+
+struct FrameCamera {
+    float4x4 view_proj;
+    float4x4 view;
+    float4x4 shadow_view_proj[4];
+    float4 stable_csm_pcss_params;
+    float4 stable_csm_receiver_params;
+    float4 shadow_cascade_splits;
+    float4 shadow_cascade_texel_world;
+    float4 shadow_cascade_depth_span;
+    float4 shadow_cascade_resolution;
+    float4 camera_pos;
+    float4 light_dir;
+    float4 light_color;
+    float4 ambient_color;
+    float4x4 local_shadow_view_proj[24];
+    float4 local_shadow_params[4];
+};
+[[vk::binding(0, 0)]] ConstantBuffer<FrameCamera> frame_camera;
+
+struct ShadowCascade {
+    uint cascade_index;
+};
+[[vk::push_constant]] ConstantBuffer<ShadowCascade> shadow_cascade;
+
+[shader("vertex")]
+void main(out float4 out_position : SV_Position) {
+    uint index = shadow_cascade.cascade_index;
+#ifdef SHADOW_LOCAL
+    // Local passes always encode 4 + light_index * 6 + face_index in the push constant.
+    uint local_index = min(index - 4u, 23u);
+    float4x4 shadow_view_proj = frame_camera.local_shadow_view_proj[local_index];
+#else
+    // Directional passes always encode the stable cascade layer [0, 3].
+    float4x4 shadow_view_proj = frame_camera.shadow_view_proj[index];
+#endif
+    out_position = mul(shadow_view_proj, float4(in_position, 1.0));
+}
