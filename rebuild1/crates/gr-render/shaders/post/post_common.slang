@@ -13,9 +13,8 @@ float3 sample_scene_color(float2 uv) {
     return sample_texture(scene_color, clamp_screen_uv(uv)).rgb;
 }
 
-// TAA resolves color onto a stable output grid, while the scene MRTs retain the current
-// projection jitter. A raw MRT coordinate r represents stable coordinate r - jitter_ndc / 2,
-// therefore post effects must read metadata at stable_uv + jitter_ndc / 2.
+// The production SMAA path has no projection jitter. Keep this offset helper for the dormant
+// temporal compatibility path and for tools that still feed jittered metadata.
 float2 post_jitter_ndc() {
     return float2(params.white_balance.w, params.features.w);
 }
@@ -24,12 +23,94 @@ float2 post_metadata_uv(float2 stable_uv) {
     return clamp_screen_uv(stable_uv + post_jitter_ndc() * 0.5);
 }
 
+int2 stable_metadata_coordinate(float2 stable_uv, Sampler2D metadata) {
+    int2 dimensions = max(texture_dimensions(metadata, 0), int2(1));
+    int2 coordinate = int2(floor(clamp_screen_uv(stable_uv) * float2(dimensions)));
+    return clamp(coordinate, int2(0), dimensions - int2(1));
+}
+
+bool post_has_stable_taa_metadata() {
+    return params.temporal.x > 0.5;
+}
+
+static const uint POST_FEATURE_SSAO = 1u << 0;
+static const uint POST_FEATURE_SSR = 1u << 1;
+static const uint POST_FEATURE_ANTI_ALIASING = 1u << 2;
+static const uint POST_FEATURE_BLOOM = 1u << 3;
+static const uint POST_FEATURE_GOD_RAYS = 1u << 4;
+static const uint POST_FEATURE_VOLUMETRIC_FOG = 1u << 5;
+
+uint post_feature_bits() {
+    return uint(max(params.temporal.y, 0.0) + 0.5);
+}
+
+bool post_feature_enabled(uint feature) {
+    return (post_feature_bits() & feature) != 0u;
+}
+
+// The TAA metadata attachment stores positive view-space depth in world units.  The post
+// pipeline, however, uses the scene depth convention everywhere else (reversed/finite device
+// depth): `is_background_depth`, `linear_depth`, SSR and SSAO all expect that representation.
+// Keep the conversion at this boundary instead of feeding linear depth through `linear_depth`
+// a second time.  The latter produces plausible values near the camera but explodes with distance
+// and makes geometry/sky classification change whenever the history sample moves by one texel.
+float device_depth_from_linear_depth(float view_depth) {
+    if (!isfinite(view_depth) || view_depth <= params.depth.x * 0.5) {
+        // A zero value is the clear/invalid value of the history attachment. Treat it as sky;
+        // clamping it to near would manufacture a foreground surface at the camera plane.
+        return 1.0;
+    }
+
+    return saturate(
+        (params.depth.y - params.depth.z * rcp_safe(view_depth, 0.0001)) /
+        max(params.depth.w, 0.0001)
+    );
+}
+
 float depth_at(float2 stable_uv) {
+    if (post_has_stable_taa_metadata()) {
+        // A legacy temporal caller may provide linear-depth history on this stable lattice. Keep
+        // this lookup nearest: filtering depth across a foreground/background edge would
+        // manufacture a surface that does not exist.
+        float linear = load_texel(
+            taa_linear_depth_history,
+            stable_metadata_coordinate(stable_uv, taa_linear_depth_history),
+            0
+        ).r;
+        return device_depth_from_linear_depth(linear);
+    }
+
+    // Production SMAA frames intentionally omit TAA. The current scene depth attachment is the
+    // only metadata source and is sampled directly on the unjittered raster.
     return sample_texture(scene_depth, post_metadata_uv(stable_uv)).r;
 }
 
 float4 opaque_metadata_at(float2 stable_uv) {
+    if (post_has_stable_taa_metadata()) {
+        return load_texel(
+            taa_normal_history,
+            stable_metadata_coordinate(stable_uv, taa_normal_history),
+            0
+        );
+    }
     return sample_texture(scene_normal_roughness, post_metadata_uv(stable_uv));
+}
+
+float4 decode_taa_normal_metadata(float4 packed) {
+    bool transparent_class = packed.w > 0.5;
+    float reflectance = transparent_class
+        ? saturate((packed.w - 0.52) / 0.48)
+        : saturate(packed.w / 0.48);
+    return float4(packed.xyz, reflectance);
+}
+
+float4 stable_opaque_metadata_at(float2 stable_uv) {
+    // Keep the legacy stable history branch available, while the production SMAA path uses the
+    // current raw MRT fallback below.
+    if (post_has_stable_taa_metadata()) {
+        return decode_taa_normal_metadata(opaque_metadata_at(stable_uv));
+    }
+    return opaque_metadata_at(stable_uv);
 }
 
 float4 transparent_metadata_at(float2 stable_uv) {
@@ -75,29 +156,30 @@ float screen_edge_fade(float2 uv) {
 }
 
 bool post_ssao_enabled() {
-    return params.ssao.x > 0.0;
+    return post_feature_enabled(POST_FEATURE_SSAO) && params.ssao.x > 0.0;
 }
 
 bool post_ssr_enabled() {
-    return params.ssr.x > 0.0 && params.ssr.y >= 1.0;
+    return post_feature_enabled(POST_FEATURE_SSR) && params.ssr.x > 0.0 && params.ssr.y >= 1.0;
 }
 
 bool post_aa_enabled() {
-    return params.aa.w > 0.0;
+    return post_feature_enabled(POST_FEATURE_ANTI_ALIASING);
 }
 
 bool post_bloom_enabled() {
-    return params.bloom.x > 0.0;
+    return post_feature_enabled(POST_FEATURE_BLOOM) && params.bloom.x > 0.0;
 }
 
 bool post_god_rays_enabled() {
-    return params.god_ray_color1.a > 1.5 ||
+    return post_feature_enabled(POST_FEATURE_GOD_RAYS) &&
+        (params.god_ray_color1.a > 1.5 ||
         (params.bloom.w > 0.0 &&
-            (params.god_ray_source0.w > 0.0 || params.god_ray_source1.w > 0.0));
+            (params.god_ray_source0.w > 0.0 || params.god_ray_source1.w > 0.0)));
 }
 
 bool post_volumetric_fog_enabled() {
-    return params.god_ray_color1.a > 1.5;
+    return post_feature_enabled(POST_FEATURE_VOLUMETRIC_FOG) && params.god_ray_color1.a > 1.5;
 }
 
 bool post_transparent_metadata_enabled() {
@@ -112,19 +194,19 @@ bool post_debug_color(float2 uv, out float3 color) {
     uint mode = post_debug_view();
     if (mode == 0u) return false;
 
-    if (mode == 3u) {
+    if (mode == 3u || mode >= 14u) {
         // Scene shading already contains the per-cascade PCSS radius visualization. Bypass tone
-        // mapping and post effects so the requested normalized value remains directly readable.
-        color = sample_texture(scene_color, frag_uv).rgb;
+        // mapping and post effects so the requested normalized diagnostic value remains directly
+        // readable. Modes 14 and 15 are the raw PCSS visibility/history A/B views.
+        color = sample_texture(scene_color, uv).rgb;
         return true;
     }
-
     float depth = depth_at(uv);
     if (mode == 1u) {
         if (is_background_depth(depth)) {
             color = float3(0.015, 0.02, 0.03);
         } else {
-            color = oct_decode(opaque_metadata_at(uv).xy) * 0.5 + 0.5;
+            color = oct_decode(stable_opaque_metadata_at(uv).xy) * 0.5 + 0.5;
         }
         return true;
     }
@@ -253,10 +335,7 @@ SurfaceMaterial surface_material(float2 uv) {
             return empty_surface_material(opaque_depth);
         }
 
-        return opaque_surface_material(
-            opaque_metadata_at(uv),
-            opaque_depth
-        );
+        return opaque_surface_material(stable_opaque_metadata_at(uv), opaque_depth);
     }
 
     float4 transparent = transparent_metadata_at(uv);
@@ -272,7 +351,7 @@ SurfaceMaterial surface_material(float2 uv) {
         return empty_surface_material(opaque_depth);
     }
 
-    float4 opaque = opaque_metadata_at(uv);
+    float4 opaque = stable_opaque_metadata_at(uv);
 
     if (has_transparent) {
         float transparent_depth = clamp(

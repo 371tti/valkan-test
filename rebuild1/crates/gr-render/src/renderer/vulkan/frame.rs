@@ -11,8 +11,9 @@ use crate::{
     renderer::graph::{
         BarrierLocation, FrameGraphPlan, GOD_RAY_MASK_PASS, GOD_RAY_PREFILTER_PASS,
         GOD_RAY_RADIAL_PASS, GOD_RAY_TEMPORAL_PASS, GraphPass, PassOutput, ResourceBarrier,
-        ResourceState, SHADOW_CASCADE_COUNT, TAA_RESOLVE_PASS, bloom_downsample_pass_index,
-        bloom_upsample_pass_index, shadow_pass_index, translucent_shadow_pass_index,
+        ResourceState, SHADOW_CASCADE_COUNT, SMAA_EDGE_PASS, SMAA_PASS, SMAA_WEIGHT_PASS,
+        TAA_RESOLVE_PASS, bloom_downsample_pass_index, bloom_upsample_pass_index,
+        shadow_pass_index, translucent_shadow_pass_index,
     },
     renderer::visibility::MeshLodLevel,
 };
@@ -29,18 +30,18 @@ use super::{
     },
     readback::{FramebufferReadbackCopy, FramebufferReadbackSample, record_image_to_buffer},
     shadow::{
-        LocalShadowFrameData, LocalShadowLightData, has_local_shadow_light,
-        local_shadow_face_contains_bounds_cached, local_shadow_face_culls, local_shadow_frame_data,
-        local_shadow_frame_signature, mesh_frame_uniform_for_light, shadow_cascade_cull,
-        stable_csm_frame_data_for_resolution,
+        LocalShadowFrameData, LocalShadowLightData, directional_shadow_caster_signature,
+        has_local_shadow_light, local_shadow_face_contains_bounds_cached, local_shadow_face_culls,
+        local_shadow_frame_data, local_shadow_frame_signature, mesh_frame_uniform_for_light,
+        shadow_cascade_cull, stable_csm_frame_data_for_resolution,
     },
     swapchain::{ShadowResources, VulkanSwapchain},
+    taa::TEMPORAL_AA_ENABLED,
 };
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.015, 0.018, 0.026, 1.0];
 const LOCAL_SHADOW_CASCADE_INDEX: usize = SHADOW_CASCADE_COUNT;
-
 pub(super) struct VulkanFrames {
     command_pool: vk::CommandPool,
     slots: Vec<VulkanFrameSlot>,
@@ -249,8 +250,11 @@ impl VulkanFrames {
             "rebuilding per-image Vulkan present semaphores"
         );
 
+        // Allocate the replacement set first. If semaphore creation fails during a resize, the
+        // existing swapchain can still be presented with its original synchronization objects.
+        let replacement = create_semaphores(device, image_count)?;
         destroy_semaphores(device, std::mem::take(&mut self.image_render_finished));
-        self.image_render_finished = create_semaphores(device, image_count)?;
+        self.image_render_finished = replacement;
         Ok(())
     }
 
@@ -297,13 +301,52 @@ impl VulkanDevice {
         let features = frame_feature_flags(&self.materials, &snapshot.render_items);
         let camera = active_camera(snapshot);
         let emissive_lights = local_light_uniforms(snapshot, camera);
-        // TAA reprojection requires a fresh normal target every frame.
+        // SMAA and the screen-space post effects require fresh full-resolution normal metadata
+        // every frame. This flag is retained as the scene-pass metadata selector, independent of
+        // the dormant temporal resolver.
         let use_full_scene_pass = true;
+        // Debug scene views may replace the fragment output with a radius/raw-visibility
+        // diagnostic. Never let those values enter the recursive PCSS history; doing so makes an
+        // A/B comparison feed diagnostic data back into the next normal scene frame.
+        let pcss_shadow_temporal = use_full_scene_pass
+            && snapshot.debug_draw.view_mode == crate::protocol::DebugViewMode::Disabled;
         let wants_local_shadow =
             features.has_opaque_shadow_casters && has_local_shadow_light(&emissive_lights);
         if features.has_shadow_casters || wants_local_shadow {
             self.ensure_shadow_resources()?;
         }
+        // A quality switch can replace the CSM view before the next frame. Synchronize the
+        // dedicated GodRay shadow descriptors before recording any pass that samples them.
+        let directional_shadow_view = self.shadows.as_ref().map_or_else(
+            || {
+                self.shadow_fallback
+                    .mesh_pass_resources()
+                    .directional_shadow_view()
+            },
+            |shadows| shadows.mesh_pass_resources().directional_shadow_view(),
+        );
+        let translucent_shadow_views = self.shadows.as_ref().map_or_else(
+            || self.shadow_fallback.translucent_shadow_views(),
+            |shadows| shadows.translucent_shadow_views(),
+        );
+        if swapchain
+            .god_ray_shadow_views_changed(directional_shadow_view, &translucent_shadow_views)
+        {
+            // Descriptor updates are not allowed while an older command buffer may still be
+            // reading the set. Quality switches and lazy shadow creation are infrequent, so the
+            // device-wide wait keeps both the old image view and the replacement route safe.
+            self.wait_idle()?;
+            swapchain.update_god_ray_shadow_view(
+                &self.device,
+                directional_shadow_view,
+                translucent_shadow_views,
+            );
+        }
+        let bloom = self.quality.bloom();
+        let quality_features = self.quality.features();
+        // The feature mask selects the dedicated camera-ray volume; fog values remain continuous
+        // controls consumed by that route.
+        let volumetric_enabled = quality_features.volumetric_fog_enabled();
         let frame = match self
             .frames
             .acquire(&self.device, &self.swapchain_loader, swapchain)?
@@ -323,31 +366,35 @@ impl VulkanDevice {
             camera,
             self.quality,
             use_full_scene_pass,
+            volumetric_enabled,
+            TEMPORAL_AA_ENABLED,
         )?;
-        let volumetric_god_rays_active =
-            self.quality.bloom().volumetric_god_rays() || self.quality.fog().enabled();
-        if volumetric_god_rays_active && taa_frame.reset_reprojection_history {
-            // Volumetric God Rays and Fog are accumulated on the low-resolution screen grid. A
-            // camera cut, scene discontinuity, or TAA reset must not retain the old ray field.
-            swapchain.invalidate_god_ray_history();
-        }
         let directional_light = frame_global_light(snapshot);
+        swapchain.prepare_temporal_effects(snapshot, camera, directional_light);
         let stable_quality = self.quality.stable_csm_pcss();
-        let refresh_shadows = features.has_shadow_casters;
+        // The opaque scene still uses its compact camera clip range, but directional maps sampled
+        // by the camera-ray volume must cover the configured medium.
+        let volumetric_shadow_camera = shadow_camera_for_volumetric_god_ray(camera, self.quality);
+        let shadow_data = features.has_shadow_casters.then(|| {
+            stable_csm_frame_data_for_resolution(
+                volumetric_shadow_camera,
+                swapchain.extent_2d(),
+                directional_light,
+                self.shadow_map_resolution(),
+            )
+        });
+        let directional_shadow_signature = features
+            .has_shadow_casters
+            .then(|| directional_shadow_caster_signature(&snapshot.render_items));
+        let refresh_shadows = self
+            .shadow_cache
+            .directional_needs_refresh(directional_shadow_signature, shadow_data);
         tracing::trace!(
             refresh_shadows,
             blocker_search_samples = stable_quality.blocker_search_samples(),
             filter_samples = stable_quality.filter_samples(),
             "selected stable CSM + PCSS directional shadow frame"
         );
-        let shadow_data = features.has_shadow_casters.then(|| {
-            stable_csm_frame_data_for_resolution(
-                camera,
-                swapchain.extent_2d(),
-                directional_light,
-                self.shadow_map_resolution(),
-            )
-        });
         let local_shadow_signature = wants_local_shadow
             .then(|| local_shadow_frame_signature(&snapshot.render_items, &emissive_lights));
         let refresh_local_shadows = self
@@ -383,7 +430,11 @@ impl VulkanDevice {
             local_shadow_render_data,
         );
         let translucent_shadow_cascades = if features.has_translucent_shadow_casters {
-            draw_lists.translucent_shadow_cascades()
+            if refresh_shadows {
+                draw_lists.translucent_shadow_cascades()
+            } else {
+                self.shadow_cache.directional_translucent_cascades()
+            }
         } else {
             [false; SHADOW_CASCADE_COUNT]
         };
@@ -391,7 +442,7 @@ impl VulkanDevice {
             translucent_shadow_cascades = ?translucent_shadow_cascades,
             "selected cascade-local translucent shadow work"
         );
-        let bloom_enabled = self.quality.bloom().intensity() > 0.0;
+        let bloom_enabled = quality_features.bloom_enabled() && bloom.intensity() > 0.0;
         let god_ray_sources = frame_god_ray_sources(
             camera,
             swapchain.god_ray_extent_2d(),
@@ -399,11 +450,12 @@ impl VulkanDevice {
             directional_light,
             emissive_lights,
         );
-        let volumetric_god_rays = volumetric_god_rays_active;
         // The legacy path is source-gated, while the volumetric path represents the directional
         // sun field and must run even when the source projects outside the camera frustum.
-        let god_rays_enabled =
-            volumetric_god_rays || god_ray_sources.iter().any(|source| source.source[3] > 0.0);
+        let god_rays_enabled = volumetric_enabled
+            || (quality_features.god_rays_enabled()
+                && bloom.god_rays_intensity() > 0.0
+                && god_ray_sources.iter().any(|source| source.source[3] > 0.0));
         let god_ray_history_write_index = swapchain.god_ray_history_write_index();
         let graph =
             FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa_mode(
@@ -417,9 +469,11 @@ impl VulkanDevice {
                 bloom_enabled,
                 god_rays_enabled,
                 god_ray_history_write_index,
-                true,
+                false, // production AA is the dedicated three-pass SMAA chain after composition
                 taa_frame.write_history_index,
-                volumetric_god_rays,
+                pcss_shadow_temporal,
+                swapchain.pcss_history_write_index(),
+                volumetric_enabled,
             )
             .map_err(|error| VulkanError::GraphCompile(error.to_string()))?;
         trace_compiled_graph("standard_frame_executor", &graph);
@@ -437,20 +491,33 @@ impl VulkanDevice {
             snapshot.debug_draw.view_mode,
         );
         mesh_frame_uniform.view_proj = taa_frame.jittered_view_projection;
+        let temporal_effects = swapchain.temporal_frame();
+        mesh_frame_uniform.previous_view_projection = temporal_effects.previous_view_projection;
+        mesh_frame_uniform.pcss_temporal = [
+            if swapchain.pcss_history_valid() && !temporal_effects.reset {
+                1.0
+            } else {
+                0.0
+            },
+            temporal_effects.pcss_feedback,
+            temporal_effects.sample_phase,
+            // PCSS reacts to both directional-light motion and camera motion. Ordinary light
+            // motion is deliberately weighted down so its visibility still accumulates; a true
+            // light cut is handled by the shared reset predicate.
+            temporal_effects.pcss_reactivity(),
+        ];
+        self.meshes.update_pcss_history_descriptor(
+            &self.device,
+            frame.slot_index,
+            swapchain.pcss_history_sampler(),
+            swapchain.pcss_history_read_view(),
+        )?;
         self.meshes
             .write_frame_uniform(&self.device, frame.slot_index, mesh_frame_uniform)?;
         let scene_pass_resources = shadows.map_or_else(
             || self.shadow_fallback.mesh_pass_resources(),
             ShadowResources::mesh_pass_resources,
         );
-        let directional_shadow_view = scene_pass_resources.directional_shadow_view();
-        if swapchain.god_ray_shadow_view() != directional_shadow_view {
-            // Descriptor updates are not allowed while an older command buffer may still be
-            // reading the set. This transition happens only when lazy CSM resources are created
-            // or resized, so the one-time device wait keeps all in-flight frames safe.
-            self.wait_idle()?;
-            swapchain.update_god_ray_shadow_view(&self.device, directional_shadow_view);
-        }
         let gpu_timer = self.frames.gpu_timer_mut();
         record_graph_command_buffer(
             &self.device,
@@ -467,6 +534,7 @@ impl VulkanDevice {
             features,
             self.quality,
             use_full_scene_pass,
+            pcss_shadow_temporal,
             emissive_lights,
             local_shadow_render_data,
         )?;
@@ -474,6 +542,13 @@ impl VulkanDevice {
         swapchain.apply_graph_final_states(frame.image_index, &graph)?;
         if let Some(shadows) = self.shadows.as_mut() {
             shadows.apply_graph_final_states(&graph);
+        }
+        if refresh_shadows {
+            self.shadow_cache.mark_directional_refreshed(
+                directional_shadow_signature,
+                shadow_data,
+                translucent_shadow_cascades,
+            );
         }
         if refresh_local_shadows {
             self.shadow_cache
@@ -679,6 +754,7 @@ fn record_graph_command_buffer(
     features: FrameFeatureFlags,
     quality: RenderQualitySettings,
     use_full_scene_pass: bool,
+    pcss_shadow_temporal: bool,
     emissive_lights: EmissiveLightUniforms,
     local_shadow_data: Option<LocalShadowFrameData>,
 ) -> Result<(), VulkanError> {
@@ -703,6 +779,7 @@ fn record_graph_command_buffer(
             use_full_scene_pass,
             emissive_lights,
             draw_lists,
+            pcss_shadow_temporal,
         );
         if let (Some(shadows), Some(local_shadow)) = (shadows, local_shadow_data) {
             record_local_shadow_passes(
@@ -762,7 +839,7 @@ fn record_graph_command_buffer(
             graph,
             BarrierLocation::AfterGraph,
         )?;
-        if let Some(gpu_timer) = gpu_timer.as_deref_mut() {
+        if let Some(gpu_timer) = gpu_timer.as_mut() {
             gpu_timer.record_end(device, frame.command_buffer, frame.slot_index);
         }
         device.end_command_buffer(frame.command_buffer)?;
@@ -785,6 +862,7 @@ struct FrameRecordState<'a> {
     use_full_scene_pass: bool,
     emissive_lights: EmissiveLightUniforms,
     draw_lists: FrameDrawLists<'a>,
+    pcss_shadow_temporal: bool,
 }
 
 impl<'a> FrameRecordState<'a> {
@@ -795,6 +873,7 @@ impl<'a> FrameRecordState<'a> {
         use_full_scene_pass: bool,
         emissive_lights: EmissiveLightUniforms,
         draw_lists: FrameDrawLists<'a>,
+        pcss_shadow_temporal: bool,
     ) -> Self {
         Self {
             features,
@@ -802,6 +881,7 @@ impl<'a> FrameRecordState<'a> {
             use_full_scene_pass,
             emissive_lights,
             draw_lists,
+            pcss_shadow_temporal,
         }
     }
 }
@@ -868,28 +948,27 @@ impl<'a> FrameDrawLists<'a> {
         let mut translucent_shadow = std::array::from_fn(|_| Vec::new());
         if record_directional_shadow_draws
             && (features.has_opaque_shadow_casters || features.has_translucent_shadow_casters)
+            && let Some(shadow_data) = shadow_data.as_ref()
         {
-            if let Some(shadow_data) = shadow_data.as_ref() {
-                // ShadowCascadeCull is Copy, but it contains the full projection payload. Build it
-                // once per cascade instead of once for each material class.
-                let cascade_culls: [ShadowCascadeCull; SHADOW_CASCADE_COUNT] =
-                    std::array::from_fn(|cascade_index| {
-                        shadow_cascade_cull(camera, cascade_index, shadow_data)
-                    });
-                for cascade_index in 0..SHADOW_CASCADE_COUNT {
-                    let (opaque, translucent) = shadow_draw_items_for_cascade(
-                        &resolved_items,
-                        meshes,
-                        cascade_index,
-                        shadow_data.texel_world[cascade_index],
-                        shadow_data.cascade_resolution[cascade_index] as u32,
-                        cascade_culls[cascade_index],
-                        features.has_opaque_shadow_casters,
-                        features.has_translucent_shadow_casters,
-                    );
-                    opaque_shadow[cascade_index] = opaque;
-                    translucent_shadow[cascade_index] = translucent;
-                }
+            // ShadowCascadeCull is Copy, but it contains the full projection payload. Build it
+            // once per cascade instead of once for each material class.
+            let cascade_culls: [ShadowCascadeCull; SHADOW_CASCADE_COUNT] =
+                std::array::from_fn(|cascade_index| {
+                    shadow_cascade_cull(camera, cascade_index, shadow_data)
+                });
+            for cascade_index in 0..SHADOW_CASCADE_COUNT {
+                let (opaque, translucent) = shadow_draw_items_for_cascade(
+                    &resolved_items,
+                    meshes,
+                    cascade_index,
+                    shadow_data.texel_world[cascade_index],
+                    shadow_data.cascade_resolution[cascade_index] as u32,
+                    cascade_culls[cascade_index],
+                    features.has_opaque_shadow_casters,
+                    features.has_translucent_shadow_casters,
+                );
+                opaque_shadow[cascade_index] = opaque;
+                translucent_shadow[cascade_index] = translucent;
             }
         }
         let local_shadow = if local_shadow_data.is_some() {
@@ -1208,6 +1287,9 @@ fn record_graph_pass(
             state,
         ),
         "post" => record_post_pass(device, frame, swapchain, snapshot, state),
+        SMAA_EDGE_PASS => record_smaa_edge_pass(device, frame, swapchain, snapshot, state),
+        SMAA_WEIGHT_PASS => record_smaa_weight_pass(device, frame, swapchain, snapshot, state),
+        SMAA_PASS => record_smaa_blend_pass(device, frame, swapchain, snapshot, state),
         "framebuffer_readback" => record_framebuffer_readback_pass(
             device,
             frame.command_buffer,
@@ -1360,7 +1442,7 @@ fn record_scene_pass(
     state: &FrameRecordState<'_>,
 ) -> Result<(), VulkanError> {
     let metadata_required = state.use_full_scene_pass;
-    let clear_values = scene_clear_values(pass, metadata_required)?;
+    let clear_values = scene_clear_values(pass, metadata_required, state.pcss_shadow_temporal)?;
     let render_area = vk::Rect2D::default()
         .offset(vk::Offset2D { x: 0, y: 0 })
         .extent(swapchain.extent_2d());
@@ -1370,7 +1452,7 @@ fn record_scene_pass(
         swapchain.scene_fast_render_pass()
     };
     let framebuffer = if metadata_required {
-        swapchain.scene_framebuffer()
+        swapchain.scene_framebuffer(swapchain.pcss_history_write_index())?
     } else {
         swapchain.scene_fast_framebuffer()
     };
@@ -1388,6 +1470,26 @@ fn record_scene_pass(
             &render_pass_info,
             vk::SubpassContents::INLINE,
         );
+        if state.pcss_shadow_temporal {
+            // The PCSS history attachment uses LOAD so diagnostic views can preserve the
+            // previous ping-pong image. A normal scene frame still needs a known lit value for
+            // pixels not covered by geometry, so clear just that attachment explicitly before
+            // any mesh draw. This keeps the clear conditional without making the render pass
+            // overwrite history during an A/B diagnostic.
+            let clear_attachments = [vk::ClearAttachment::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .color_attachment(3)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [1.0, 0.0, 0.0, 1.0],
+                    },
+                })];
+            let clear_rects = [vk::ClearRect::default()
+                .rect(render_area)
+                .base_array_layer(0)
+                .layer_count(1)];
+            device.cmd_clear_attachments(frame.command_buffer, &clear_attachments, &clear_rects);
+        }
         let opaque_pipeline = if metadata_required {
             swapchain.mesh_pipeline()
         } else {
@@ -1601,7 +1703,7 @@ fn record_local_shadow_face_pass(
     Ok(())
 }
 
-/// Records multiplicative transmittance for transparent shadow casters.
+/// Records deep multiplicative transmittance for transparent shadow casters.
 fn record_translucent_shadow_pass(
     device: &Device,
     frame: ActiveFrame,
@@ -1610,7 +1712,9 @@ fn record_translucent_shadow_pass(
     meshes: &VulkanMeshStore,
     items: &[ShadowDrawItem<'_>],
 ) -> Result<(), VulkanError> {
-    let clear_values = [color_clear_value([1.0, 1.0, 1.0, 1.0]), depth_clear_value()];
+    // RGB is an additive log-transmittance field; zero is the identity. Alpha stores the
+    // nearest transparent depth via MIN blending and starts at the far plane.
+    let clear_values = [color_clear_value([0.0, 0.0, 0.0, 1.0]), depth_clear_value()];
     let shadow_extent = shadows.extent_2d(cascade_index)?;
     let render_area = vk::Rect2D::default()
         .offset(vk::Offset2D { x: 0, y: 0 })
@@ -1621,9 +1725,9 @@ fn record_translucent_shadow_pass(
         .render_area(render_area)
         .clear_values(&clear_values);
 
-    // Safety: graph barriers place transmittance in color-attachment layout. A dedicated cleared
-    // depth target keeps the nearest translucent layer; the fragment shader rejects samples behind
-    // the immutable opaque blocker-depth map.
+    // Safety: graph barriers place transmittance in color-attachment layout. RGB is accumulated as
+    // log-transmittance and alpha keeps the nearest transparent depth; the fragment shader rejects
+    // samples behind the immutable opaque blocker-depth map.
     unsafe {
         device.cmd_begin_render_pass(
             frame.command_buffer,
@@ -1687,7 +1791,6 @@ fn record_bloom_downsample_pass(
             source_extent,
             target_extent,
             quality.bloom(),
-            swapchain.taa_history_write_index(),
         )?;
         device.cmd_end_render_pass(frame.command_buffer);
     }
@@ -1744,6 +1847,10 @@ fn god_ray_push_constants(
         jitter_pixels[0] * 2.0 / extent.width.max(1) as f32,
         jitter_pixels[1] * 2.0 / extent.height.max(1) as f32,
     ];
+    // The legacy GodRay mask is recorded after TAA in the frame graph.  Use the depth history
+    // target just written by this frame; selecting the ping-pong read target here leaves the mask
+    // one frame behind and causes foliage/geometry coverage to pulse as the index alternates.
+    let taa_history_write_index = swapchain.taa_history_write_index().min(1);
     GodRayPushConstants::new(
         active_camera(snapshot),
         swapchain.god_ray_extent_2d(),
@@ -1754,6 +1861,9 @@ fn god_ray_push_constants(
         swapchain.god_ray_history_valid(),
         snapshot.frame_id.raw(),
         jitter_ndc,
+        taa_history_write_index,
+        swapchain.taa_stable_metadata_valid(),
+        swapchain.temporal_frame(),
     )
 }
 
@@ -1884,6 +1994,7 @@ fn record_god_ray_temporal_pass(
             frame.command_buffer,
             swapchain.god_ray_extent_2d(),
             write_history_index,
+            state.quality.features().volumetric_fog_enabled(),
             push,
         )?;
         device.cmd_end_render_pass(frame.command_buffer);
@@ -1892,7 +2003,7 @@ fn record_god_ray_temporal_pass(
     Ok(())
 }
 
-/// Records the post pass that samples scene color and writes the swapchain image.
+/// Records the composition pass that writes the complete post result to the intermediate target.
 fn record_post_pass(
     device: &Device,
     frame: ActiveFrame,
@@ -1906,11 +2017,11 @@ fn record_post_pass(
         .extent(swapchain.extent_2d());
     let render_pass_info = vk::RenderPassBeginInfo::default()
         .render_pass(swapchain.post_render_pass())
-        .framebuffer(swapchain.post_framebuffer_for_image(frame.image_index)?)
+        .framebuffer(swapchain.post_color_framebuffer())
         .render_area(render_area)
         .clear_values(&clear_values);
 
-    // Safety: graph barriers place scene color in shader-read layout and the swapchain image in
+    // Safety: graph barriers place scene inputs in shader-read layout and the PostColor target in
     // color-attachment layout before this render pass begins.
     unsafe {
         device.cmd_begin_render_pass(
@@ -1926,12 +2037,12 @@ fn record_post_pass(
             active_camera(snapshot),
             state.quality,
             state.features.has_transparent_scene_items,
-            swapchain.taa_history_write_index(),
             swapchain.god_ray_history_write_index(),
             frame_global_light(snapshot),
             state.emissive_lights,
             snapshot.debug_draw.view_mode,
             swapchain.taa_jitter_pixels(),
+            swapchain.taa_stable_metadata_valid(),
         );
         device.cmd_end_render_pass(frame.command_buffer);
     }
@@ -1939,7 +2050,128 @@ fn record_post_pass(
     Ok(())
 }
 
-/// Records the app-requested final framebuffer copy after post and before presentation.
+/// Records SMAA pass 1: luma edge detection into the persistent RG edges target.
+fn record_smaa_edge_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
+) -> Result<(), VulkanError> {
+    let clear_values = [color_clear_value([0.0, 0.0, 0.0, 1.0])];
+    let render_area = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(swapchain.extent_2d());
+    let render_pass_info = vk::RenderPassBeginInfo::default()
+        .render_pass(swapchain.smaa_edge_render_pass())
+        .framebuffer(swapchain.smaa_edge_framebuffer())
+        .render_area(render_area)
+        .clear_values(&clear_values);
+
+    // Safety: graph barriers place PostColor in shader-read layout and the edge target in color
+    // attachment layout before this pass begins.
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.smaa_pipeline().draw_edges(
+            device,
+            frame.command_buffer,
+            swapchain.extent_2d(),
+            state.quality.anti_aliasing(),
+            state.quality.features().anti_aliasing_enabled(),
+            active_camera(snapshot),
+        );
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+/// Records SMAA pass 2: AreaTex/searchTex weights into the persistent RGBA blend target.
+fn record_smaa_weight_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
+) -> Result<(), VulkanError> {
+    let clear_values = [color_clear_value([0.0, 0.0, 0.0, 0.0])];
+    let render_area = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(swapchain.extent_2d());
+    let render_pass_info = vk::RenderPassBeginInfo::default()
+        .render_pass(swapchain.smaa_weight_render_pass())
+        .framebuffer(swapchain.smaa_weight_framebuffer())
+        .render_area(render_area)
+        .clear_values(&clear_values);
+
+    // Safety: graph barriers place edgesTex in shader-read layout and the weight target in color
+    // attachment layout before this pass begins.
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.smaa_pipeline().draw_weights(
+            device,
+            frame.command_buffer,
+            swapchain.extent_2d(),
+            state.quality.anti_aliasing(),
+            state.quality.features().anti_aliasing_enabled(),
+            active_camera(snapshot),
+        );
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+/// Records SMAA pass 3: neighbourhood blending from PostColor and blendTex into the swapchain.
+fn record_smaa_blend_pass(
+    device: &Device,
+    frame: ActiveFrame,
+    swapchain: &VulkanSwapchain,
+    snapshot: &FrameSnapshot,
+    state: &FrameRecordState,
+) -> Result<(), VulkanError> {
+    let clear_values = [color_clear_value([0.0, 0.0, 0.0, 1.0])];
+    let render_area = vk::Rect2D::default()
+        .offset(vk::Offset2D { x: 0, y: 0 })
+        .extent(swapchain.extent_2d());
+    let render_pass_info = vk::RenderPassBeginInfo::default()
+        .render_pass(swapchain.smaa_render_pass())
+        .framebuffer(swapchain.post_framebuffer_for_image(frame.image_index)?)
+        .render_area(render_area)
+        .clear_values(&clear_values);
+
+    // Safety: graph barriers place PostColor/blendTex in shader-read layout and the acquired
+    // swapchain image in color-attachment layout before this pass begins.
+    unsafe {
+        device.cmd_begin_render_pass(
+            frame.command_buffer,
+            &render_pass_info,
+            vk::SubpassContents::INLINE,
+        );
+        swapchain.smaa_pipeline().draw_blend(
+            device,
+            frame.command_buffer,
+            swapchain.extent_2d(),
+            state.quality.anti_aliasing(),
+            state.quality.features().anti_aliasing_enabled(),
+            active_camera(snapshot),
+            snapshot.debug_draw.view_mode,
+        );
+        device.cmd_end_render_pass(frame.command_buffer);
+    }
+
+    Ok(())
+}
+
+/// Records the app-requested final framebuffer copy after final SMAA and before presentation.
 fn record_framebuffer_readback_pass(
     device: &Device,
     command_buffer: vk::CommandBuffer,
@@ -2021,9 +2253,13 @@ fn shadow_draw_items_for_cascade<'a>(
 ) -> (Vec<ShadowDrawItem<'a>>, Vec<ShadowDrawItem<'a>>) {
     let mut opaque = Vec::new();
     let mut translucent = Vec::new();
-    // Many render items are instances of the same mesh. LOD selection only depends on the mesh and
-    // cascade metrics, so memoize it for this one cascade while retaining the existing per-frame
-    // list lifetime (no persistent shadow-map cache is introduced).
+    // Many render items are instances of the same mesh.  LOD selection normally only depends on
+    // the mesh and cascade metrics, so memoize it for this one cascade while retaining the
+    // existing per-frame list lifetime; the owning Vulkan device decides whether these lists
+    // are needed for a persistent-map refresh.  The
+    // alpha/cutout class is part of the key: the same mesh can be instanced with an opaque and a
+    // cutout material, and a low LOD chosen for the opaque instance must never leak into the
+    // cutout shadow caster.
     let mut lod_by_mesh = HashMap::new();
 
     for resolved in items {
@@ -2040,9 +2276,24 @@ fn shadow_draw_items_for_cascade<'a>(
 
         // A material can only be in one alpha class today, but retain both branches so this
         // helper remains correct if a future material intentionally writes both shadow targets.
-        let lod = *lod_by_mesh.entry(item.mesh.raw()).or_insert_with(|| {
+        let lod_key = (
+            item.mesh.raw(),
+            material.uses_shadow_alpha_test,
+            material.transparent,
+        );
+        let mut lod = *lod_by_mesh.entry(lod_key).or_insert_with(|| {
             meshes.directional_shadow_lod(item.mesh, cascade_index, texel_world, shadow_resolution)
         });
+        if material.uses_shadow_alpha_test || material.transparent {
+            // Cutout foliage, wire meshes, and transparent panes carry their silhouette in the
+            // material/UV stream.  Replacing their index stream with a distant LOD changes the
+            // projected coverage (often into one convex slab); the camera-ray volume evaluates
+            // that shadow at many points and exposes the slab as a stack of rectangular GodRay
+            // boxes. Keep these shadow casters at full geometric detail. `record_mesh_draws`
+            // already falls back to the nearest uploaded level when a mesh has no Full stream,
+            // so this remains safe for compact assets while preserving their alpha silhouette.
+            lod = MeshLodLevel::Full;
+        }
         if accepts_opaque {
             let pipeline_key = MeshPipelineKey {
                 uses_textures: material.uses_shadow_alpha_texture,
@@ -2238,6 +2489,23 @@ fn active_camera(snapshot: &FrameSnapshot) -> CameraSnapshot {
         .unwrap_or_default()
 }
 
+/// Keeps the CSM receiver range in sync with the dedicated camera-ray medium without changing
+/// the raster camera projection used by the scene pass.
+fn shadow_camera_for_volumetric_god_ray(
+    camera: CameraSnapshot,
+    quality: RenderQualitySettings,
+) -> CameraSnapshot {
+    if !quality.features().volumetric_fog_enabled() {
+        return camera;
+    }
+
+    let mut expanded = camera;
+    expanded.far = camera
+        .far
+        .max(quality.fog().max_distance().max(camera.near + 0.05));
+    expanded
+}
+
 fn frame_global_light(snapshot: &FrameSnapshot) -> LightPacket {
     snapshot
         .lights
@@ -2408,6 +2676,7 @@ fn trace_compiled_graph(label: &'static str, graph: &FrameGraphPlan) {
 fn scene_clear_values(
     pass: &GraphPass,
     metadata_required: bool,
+    pcss_shadow_temporal: bool,
 ) -> Result<Vec<vk::ClearValue>, VulkanError> {
     let mut clear_values = vec![color_clear_value(clear_color_for_output(
         pass,
@@ -2423,6 +2692,16 @@ fn scene_clear_values(
             pass,
             crate::renderer::graph::GraphResource::SceneTransparentNormalRoughness,
         )?));
+        let pcss_clear = if pcss_shadow_temporal {
+            pass.writes()
+                .iter()
+                .find(|output| output.resource().pcss_shadow_history().is_some())
+                .map(PassOutput::clear_color)
+                .unwrap_or([1.0, 0.0, 0.0, 1.0])
+        } else {
+            [1.0, 0.0, 0.0, 1.0]
+        };
+        clear_values.push(color_clear_value(pcss_clear));
     }
 
     clear_values.push(depth_clear_value());
@@ -2665,5 +2944,29 @@ fn destroy_command_pool(device: &Device, command_pool: vk::CommandPool) {
     // Safety: all command buffer work has completed and command buffers are freed with the pool.
     unsafe {
         device.destroy_command_pool(command_pool, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volumetric_shadow_camera_keeps_configured_medium_range_when_clip_is_short() {
+        let camera = CameraSnapshot::perspective(
+            [0.0, 1.8, 5.0],
+            [0.0, 1.5, 4.0],
+            [0.0, 1.0, 0.0],
+            60.0_f32.to_radians(),
+            0.03,
+            32.0,
+        )
+        .expect("valid test camera");
+
+        let shadow_camera =
+            shadow_camera_for_volumetric_god_ray(camera, RenderQualitySettings::high_quality());
+
+        assert_eq!(shadow_camera.near, camera.near);
+        assert_eq!(shadow_camera.far, 160.0);
     }
 }

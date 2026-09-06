@@ -457,17 +457,32 @@ pub enum DebugViewMode {
     Normals = 1,
     Depth = 2,
     PcssFilterRadius = 3,
+    /// Shows the SMAA edge target produced by pass 1 (R=west, G=north).
+    SmaaEdges = 5,
+    /// Shows the SMAA blend target produced by pass 2 (R=horizontal, G=vertical, B=sum).
+    SmaaWeights = 6,
+    /// Shows the raw GTAO visibility term before the post material multiplier.
+    Ssao = 7,
+    /// Shows the raw directional PCSS visibility before the scene's temporal history.
+    PcssVisibilityRaw = 14,
+    /// Shows the previous PCSS visibility history buffer sampled at the current raster pixel.
+    PcssHistory = 15,
 }
 
 impl DebugViewMode {
-    pub const COUNT: u32 = 4;
+    pub const COUNT: u32 = 16;
 
     pub fn next(self) -> Self {
         match self {
             Self::Disabled => Self::Normals,
             Self::Normals => Self::Depth,
             Self::Depth => Self::PcssFilterRadius,
-            Self::PcssFilterRadius => Self::Disabled,
+            Self::PcssFilterRadius => Self::SmaaEdges,
+            Self::SmaaEdges => Self::SmaaWeights,
+            Self::SmaaWeights => Self::Ssao,
+            Self::Ssao => Self::PcssVisibilityRaw,
+            Self::PcssVisibilityRaw => Self::PcssHistory,
+            Self::PcssHistory => Self::Disabled,
         }
     }
 
@@ -477,6 +492,11 @@ impl DebugViewMode {
             Self::Normals => "normals",
             Self::Depth => "linear_depth",
             Self::PcssFilterRadius => "pcss_filter_radius",
+            Self::SmaaEdges => "smaa_edges",
+            Self::SmaaWeights => "smaa_weights",
+            Self::Ssao => "ssao_gtao",
+            Self::PcssVisibilityRaw => "pcss_visibility_raw",
+            Self::PcssHistory => "pcss_history",
         }
     }
 }
@@ -585,7 +605,14 @@ pub struct FrameSnapshot {
     pub camera_effects: CameraEffects,
     pub debug_draw: DebugDraw,
     pub optimization: RenderOptimizationSettings,
+    /// Target presentation rate used to convert time-based temporal filters into per-frame rates.
+    /// The app-side window pacing populates this from its configured frame interval.
+    pub frame_rate_hz: f32,
 }
+
+const DEFAULT_FRAME_RATE_HZ: f32 = 120.0;
+const MIN_FRAME_RATE_HZ: f32 = 15.0;
+const MAX_FRAME_RATE_HZ: f32 = 240.0;
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {
@@ -605,6 +632,7 @@ pub struct FrameSnapshotBuilder {
     camera_effects: CameraEffects,
     debug_draw: DebugDraw,
     optimization: RenderOptimizationSettings,
+    frame_rate_hz: f32,
 }
 
 impl FrameSnapshotBuilder {
@@ -627,6 +655,7 @@ impl FrameSnapshotBuilder {
             camera_effects: CameraEffects::default(),
             debug_draw: DebugDraw::default(),
             optimization: RenderOptimizationSettings::default(),
+            frame_rate_hz: DEFAULT_FRAME_RATE_HZ,
         }
     }
 
@@ -678,6 +707,20 @@ impl FrameSnapshotBuilder {
         self
     }
 
+    /// Sets the configured presentation rate used by frame-rate-aware temporal filters.
+    ///
+    /// Invalid values are ignored and values outside the supported window pacing range are
+    /// clamped, so a malformed app setting cannot produce a zero or non-finite decay interval.
+    pub fn set_frame_rate_hz(&mut self, frame_rate_hz: f32) -> &mut Self {
+        self.frame_rate_hz = finite_clamp(
+            frame_rate_hz,
+            MIN_FRAME_RATE_HZ,
+            MAX_FRAME_RATE_HZ,
+            DEFAULT_FRAME_RATE_HZ,
+        );
+        self
+    }
+
     /// Builds an owned snapshot and rejects missing view data.
     pub fn build(self) -> Result<FrameSnapshot, SnapshotError> {
         if self.views.is_empty() {
@@ -696,6 +739,7 @@ impl FrameSnapshotBuilder {
             camera_effects: self.camera_effects,
             debug_draw: self.debug_draw,
             optimization: self.optimization,
+            frame_rate_hz: self.frame_rate_hz,
         })
     }
 }
@@ -824,6 +868,24 @@ mod tests {
         assert_eq!(snapshot.local_lights, vec![light]);
         assert_eq!(snapshot.local_lights[0].kind, LocalLightKind::Rectangle);
         assert_eq!(snapshot.local_lights[0].source_radius, (4.25_f32).sqrt());
+    }
+
+    #[test]
+    fn snapshot_carries_configured_frame_rate_for_temporal_filters() {
+        let frame = FrameId::from_raw(1).expect("test frame id is non-zero");
+        let scene = SceneHandle::from_raw(1).expect("test scene id is non-zero");
+        let surface = SurfaceId::from_raw(1).expect("test surface id is non-zero");
+        let generation = SurfaceGeneration::from_raw(1).expect("test generation is non-zero");
+        let view = ViewId::from_raw(1).expect("test view id is non-zero");
+        let extent = NonZeroExtent::new(320, 180).expect("test extent is non-zero");
+
+        let mut builder = FrameSnapshotBuilder::new(frame, scene, surface, generation);
+        builder
+            .add_view(ViewPacket::new(view, extent))
+            .set_frame_rate_hz(60.0);
+        let snapshot = builder.build().expect("snapshot has one view");
+
+        assert_eq!(snapshot.frame_rate_hz, 60.0);
     }
 
     // Verifies that spotlights keep their direction and cone falloff values for shaders.

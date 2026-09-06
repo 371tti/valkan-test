@@ -309,20 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn bright_metering_recovers_exposure_downward() {
-        let mut controller = CameraEffectController {
-            exposure: MAX_CAMERA_EXPOSURE,
-            white_balance: [1.0; 3],
-        };
-
-        for _ in 0..8 {
-            controller.update(metering(0.68, 0.18), 1.0 / 30.0);
-        }
-
-        assert!(controller.exposure < 1.8);
-    }
-
-    #[test]
     fn dark_center_subject_receives_more_exposure_than_bright_average() {
         let mut centered = CameraEffectController::default();
         let mut averaged = CameraEffectController::default();

@@ -47,8 +47,8 @@ impl VulkanTexture {
             }
         };
         if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
-            free_memory(device, memory);
             destroy_image(device, image);
+            free_memory(device, memory);
             staging.destroy(device);
             return Err(VulkanError::Vk(error));
         }
@@ -63,13 +63,17 @@ impl VulkanTexture {
             descriptor.height(),
         );
         staging.destroy(device);
-        upload_result?;
+        if let Err(error) = upload_result {
+            destroy_image(device, image);
+            free_memory(device, memory);
+            return Err(error);
+        }
 
         let view = match create_texture_image_view(device, image, format) {
             Ok(view) => view,
             Err(error) => {
-                free_memory(device, memory);
                 destroy_image(device, image);
+                free_memory(device, memory);
                 return Err(error);
             }
         };
@@ -89,8 +93,8 @@ impl VulkanTexture {
     /// Destroys the sampled texture image, view, and memory allocation.
     pub(super) fn destroy(self, device: &Device) {
         destroy_image_view(device, self.view);
-        free_memory(device, self.memory);
         destroy_image(device, self.image);
+        free_memory(device, self.memory);
     }
 }
 

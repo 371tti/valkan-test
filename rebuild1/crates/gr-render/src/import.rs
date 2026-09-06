@@ -1121,18 +1121,18 @@ fn apply_first_animation_pose(
             .unwrap_or(0);
 
         match reader.read_outputs() {
-            Some(gltf::animation::util::ReadOutputs::Translations(outputs)) => {
-                if let Some(value) = outputs.skip(sample_index).next() {
+            Some(gltf::animation::util::ReadOutputs::Translations(mut outputs)) => {
+                if let Some(value) = outputs.nth(sample_index) {
                     pose.translation = value;
                 }
             }
             Some(gltf::animation::util::ReadOutputs::Rotations(outputs)) => {
-                if let Some(value) = outputs.into_f32().skip(sample_index).next() {
+                if let Some(value) = outputs.into_f32().nth(sample_index) {
                     pose.rotation = normalize_quat(value);
                 }
             }
-            Some(gltf::animation::util::ReadOutputs::Scales(outputs)) => {
-                if let Some(value) = outputs.skip(sample_index).next() {
+            Some(gltf::animation::util::ReadOutputs::Scales(mut outputs)) => {
+                if let Some(value) = outputs.nth(sample_index) {
                     pose.scale = value;
                 }
             }
@@ -1400,9 +1400,11 @@ fn import_gltf_primitive(
     // Tangents are only consumed by normal-mapped materials.  Generating a TBN frame for every
     // imported primitive is expensive on dense assets and cannot affect materials without a
     // normal map, so retain the inexpensive default tangent for those paths instead.
-    let tangents = material_uses_normal_map(&material)
-        .then(|| compute_vertex_tangents(&positions, &normals, &uvs, &indices))
-        .unwrap_or_default();
+    let tangents = if material_uses_normal_map(&material) {
+        compute_vertex_tangents(&positions, &normals, &uvs, &indices)
+    } else {
+        Vec::new()
+    };
 
     let vertices = positions
         .into_iter()

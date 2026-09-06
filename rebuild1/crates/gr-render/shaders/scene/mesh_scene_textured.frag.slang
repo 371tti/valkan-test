@@ -9,6 +9,7 @@ layout(location = 10) in float frag_view_depth;
 layout(location = 0) out float4 out_color;
 layout(location = 1) out float4 out_normal_roughness;
 layout(location = 2) out float4 out_transparent_normal_roughness;
+layout(location = 3) out float4 out_pcss_shadow;
 
 struct FrameCamera {
     float4x4 view_proj;
@@ -32,8 +33,11 @@ struct FrameCamera {
     float4 emissive_light_size_kind[4];
     float4 emissive_light_count;
     float4 debug_view;
+    float4x4 previous_view_projection;
+    float4 pcss_temporal;
 };
 [[vk::binding(0, 0)]] ConstantBuffer<FrameCamera> frame_camera;
+[[vk::binding(1, 0)]] Sampler2D pcss_shadow_history;
 
 struct MaterialParams {
     float4 base_color_factor;
@@ -218,6 +222,7 @@ void main(float4 sv_position : SV_Position, bool front_facing : SV_IsFrontFace) 
     float3 geometric_normal = surface_geometric_normal(front_facing);
     float3 normal = surface_normal(geometric_normal);
     float4 material_meta = pack_view_normal_material(normal, roughness, metallic, base_color.rgb);
+    float pcss_visibility;
     out_color = float4(
         shade_pbr(
             base_color.rgb,
@@ -228,9 +233,16 @@ void main(float4 sv_position : SV_Position, bool front_facing : SV_IsFrontFace) 
             read_occlusion(),
             read_emissive(),
             base_color.a,
-            sv_position.xy
+            sv_position.xy,
+            pcss_visibility
         ),
         base_color.a
+    );
+    out_pcss_shadow = float4(
+        pcss_visibility,
+        frag_view_depth,
+        0.0,
+        pcss_history_output_alpha()
     );
 #ifdef SCENE_OPAQUE
     out_normal_roughness = material_meta;

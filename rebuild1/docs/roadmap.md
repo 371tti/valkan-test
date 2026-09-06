@@ -224,7 +224,7 @@ Stage 7 から外したもの:
 - GLB の importer 側 clip-space 正規化は削除し、world-space position を `CameraSnapshot` の view-projection で描画する。
 - window app は left click で cursor capture、Escape で release、WASD/arrow、Space/E、Shift/Q、Ctrl、mouse wheel を old-style free camera として処理する。
 - scene pass は scene color + depth attachment を持ち、mesh pipeline は depth test/write を有効化する。
-- post pass は scene color を sampled image として読み、swapchain image へ fullscreen triangle で書く。
+- post composition pass は scene color を sampled image として読み、`PostColor` へ fullscreen triangle で書く。専用 SMAA edge pass が `edgesTex`、weight pass が `blendTex` を生成し、neighbourhood pass が `PostColor` と `blendTex` を読み swapchain image へ書く。
 - `pass_schedule.rs` は frame snapshot から shadow / scene / post / present の cadence を作り、Vulkan recording の外で trace できるようにする。
 
 ## Stage 7.5: graph compiler foundation and real targets
@@ -237,7 +237,7 @@ Stage 7 から外したもの:
 - [x] resource lifetime と barrier plan
 - [x] unused pass culling
 - [x] barrier merge / transient alias / render pass merge の候補情報
-- [x] scene color + depth -> post -> swapchain present の graph
+- [x] scene color + depth -> post composition -> SMAA edge/weight/neighbourhood 3-pass -> swapchain present の graph
 - [x] actual post process shader
 - [x] `--window-smoke` で GLB load 後の graph-driven mesh frame を検証
 - [x] Vulkan imported texture image upload
@@ -264,7 +264,7 @@ Stage 7 から外したもの:
 - scene pass は shadow cascade と translucent transmittance を graph read として宣言する。
 - imported texture は renderer asset store の owned `TextureDescriptor` clone から Vulkan sampled image へ upload する。
 - material は named slot と alpha policy を descriptor set へ upload する。暗黙 white texture は作らない。
-- mesh shader での sampled material 表示は Stage 8 の visual verification と shader interface validation の入口として扱う。
+- mesh shader の sampled material 表示と shader interface validation は Stage 8 で完了済み。残りは high-quality dedicated GodRay smoke と必要な visual acceptance の運用です。
 
 ## Stage 8: verification
 
@@ -297,6 +297,7 @@ Stage 7 から外したもの:
 - mesh pipeline は back-face culling を有効化する。double-sided material が必要になったら pipeline variant と material policy として明示的に追加する。
 - `REBUILD1_WINDOW_ASSET=assets/stage8_textured_cutout.r1scene cargo run -- --window-smoke` で fixed verification scene を選べる。
 - `REBUILD1_WINDOW_ASSET=assets/stage9_translucent_shadow.r1scene cargo run -- --window-smoke` で transparent shadow verification scene を選べる。
+- `scripts/verify-renderer.ps1 -Mode smoke -Quality high -SmokeFrames 1` で dedicated GodRay の API/validation 経路を確認できる。
 - `assets/model.glb` smoke は old model 相当の geometry/material/texture import と camera 操作確認の入口として残す。
 
 ## Open questions

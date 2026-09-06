@@ -29,10 +29,10 @@ shaders/
   shared/             型に依存しない数学・Slang compatibility
   scene/              mesh entrypoint・material sampling・PBR lighting
   shadow/             Stable CSM・PCSS・local/translucent shadow
-  post/               TAA・compose・SSAO・SSR
+  post/               compose・SMAA・SSAO・SSR
     bloom/            bloom downsample/upsample
-    god_rays/         legacy mask/prefilter/radial/temporal + CSM/Fog volumetric quality branch
-                       blue-noise ray marching + temporally clamped accumulation
+    god_rays/         camera-ray density・CSM/translucent lighting・Beer-Lambert integration・temporal resolve
+    god_rays/         camera-ray mask/temporal volume; low-quality prefilter/radial compatibility branch
 ```
 
 entrypoint と include 専用 module をファイル名だけで区別せず、責務をディレクトリで固定します。`build.rs` の `SHADERS` manifest が entrypoint、stage、SPIR-V output、Rust asset 名を一元管理し、各ディレクトリを明示的な include search path として渡します。
@@ -115,11 +115,15 @@ Stage 8 では `renderer::pipeline::shader_interface` に mesh shader binding co
 
 ## Mesh and post pipeline
 
+Temporal PCSS はラスタピクセル/cascade hash に共有64フレームの低差異位相を加えてタップを回し、visibility と receiver depth だけを再投影履歴へ積分します。カメラ回転/移動はPCSS専用の連続反応度として履歴保持を短くし、通常の方向光移動はその半分の反応度で履歴を残します。履歴参照は深度一致した4近傍だけを再構成します。production Sun Shaft は GodRay の camera-ray strata を同じ temporal phase/light-motion で jitter し、専用 GodRay volume の積分結果をその履歴へ渡します。
+
 temporary debug triangle pipeline は削除済みです。first draw 後は `FrameSnapshot.render_items` が唯一の scene draw 入力になり、asset 未ロード時は scene clear frame を present します。
 
-Stage 7 の mesh pipeline は set 0 binding 0 に `CameraSnapshot` 由来の view/projection uniform を持ちます。scene pass は scene HDR、depth、normal/material のMRTを出力し、Stable CSMのPCSS visibilityをその場で反映します。PCSSの最終filterはset 2 binding 9の比較サンプラ（LINEAR + `LESS_OR_EQUAL`）でhardware 2x2 PCFを使い、binding 10のraw depthはblocker探索だけに使います。blocker/filter各タップにはreceiver-planeのlight-space深度勾配を加え、斜面で同じ比較深度を反復する横縞を抑えます。receiver biasはD16量子化の2段余裕、texel/depth-span、法線角度に応じたslope、receiver-planeの1 texel深度勾配を合成し、balanced/highでは各スケールを引き上げます。タップ回転はラスタピクセルとcascadeの整数hashから生成し、連続ワールド座標sinハッシュ由来の短周期パターンを避けます。その後のHDR TAAは16位相のzero-centroid jitter、stable-grid reprojection、depth/normal confidence、YCoCg variance clampで履歴を蓄積します。post pass はTAA済みHDRとscene metadataを読み、SSR / SSAO / camera effects / tone mappingを適用します。FXAAはTAAとの二重適用を避けるためproduction postでは無効です。SSR / SSAO / AA / lighting wrap / renderer-wide contrast は `SetQualitySettings` で更新される renderer 状態からpush constantとframe uniformへpackします。
+Stage 7 の mesh pipeline は set 0 binding 0 に `CameraSnapshot` 由来の view/projection uniform を持ちます。scene pass は scene HDR、depth、normal/material、PCSS visibility/receiver-depth のMRTを出力し、Stable CSMのPCSS visibilityをその場で反映します。PCSSの最終filterはset 2 binding 9の比較サンプラ（LINEAR + `LESS_OR_EQUAL`）でhardware 2x2 PCFを使い、binding 10のraw depthはblocker探索だけに使います。visibility history は receiver を前フレーム VP へ再投影し、可視率と受け手深度だけを ping-pong で時間積分します。履歴は深度一致した4近傍だけを手動bilinear再構成し、CSM遷移の投影無効値を補間しません。BRDF、transmittance、直接光全体は現フレーム値のままです。blocker/filter各タップにはreceiver-planeのlight-space深度勾配を加え、斜面で同じ比較深度を反復する横縞を抑えます。receiver biasはD16量子化の2段余裕、texel/depth-span、法線角度に応じたslope、receiver-planeの1 texel深度勾配を合成し、balanced/highでは各スケールを引き上げます。タップ回転はラスタピクセルとcascadeの整数hashから生成し、連続ワールド座標sinハッシュ由来の短周期パターンを避けます。high-quality の本番 GodRay shader は analytic density → camera-ray 48-strata → CSM/PCSS・deep translucent log-transmittance → Henyey-Greenstein scattering → Beer-Lambert integration → half-resolution bilateral upscale を実行し、専用 history は前フレームの共有 temporal state で再投影します。Scene/GodRay HDR と scene metadata を post composition に渡します。post composition はGTAO型SSAO / SSR / bloom / GodRay / camera effects / tone mappingを `PostColor` へ書く。SSAOはview-space normalをslice planeへ射影し、両側の最大horizonを距離フォールオフ付きで探索してcosine-weighted arcを解析積分する。quality sample countは2/3/4 slicesと2/3/4 stepsへ展開し、near-field falloffとthin-occluder compensationを適用する。SMAA edge pass が luma edge を `edgesTex` に、weight pass が SearchTex/AreaTex の pattern weight を `blendTex` に、neighbourhood pass がその同じ PostColor と blendTex に対して公式のSMAA 1xを実行します。交差サンプルは水平検索で R、垂直検索で G を読む。F12 の `smaa_edges` / `smaa_weights` は中間値を画面へ出す診断経路です。TAA shader と history layout は optional な実装として残しますが、production default は temporal color history と frame jitter を使わず、TAA resources も確保しません。SSR / SSAO / SMAA / lighting wrap / renderer-wide contrast の連続値は `SetQualitySettings`、各機能のON/OFFは `SetQualityFeatures(RenderFeatureToggles)` で更新される renderer 状態からpush constantとframe uniformへpackします。
 
 full descriptor contents と hot reload error handling は shader interface validation / reload 実装時に扱います。
+
+SMAA の実装メモ: 最終 `PostColor` に対して公式 1x の local-contrast edge detection、SearchTex line search、AreaTex pattern coverage、directional neighborhood resolve を3つのfullscreen passで評価する。edge passの色入力はpoint texel、edgesTexの検索/weightとblendTexはlinear/clamp、resolveの色入力もlinearとし、隣接色の事前平均によるエッジ消失を避ける。resolve の neighbor/channel 対応は公式の `(+x,+y)`（right alpha / bottom green / current blue+red）を維持し、輪郭の反対方向へぼかさない。
 
 ## Material variants
 

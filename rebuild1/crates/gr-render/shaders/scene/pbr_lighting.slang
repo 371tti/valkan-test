@@ -635,6 +635,116 @@ float3 pbr_shadow(
     );
 }
 
+// The visibility history stores the scalar in R and the previous receiver depth in G. Rebuild a
+// depth-aware bilinear footprint explicitly instead of asking the linear sampler to average the
+// two channels first: at an oblique shadow edge, a foreground and a background texel can be at
+// nearly the same screen-space distance while carrying unrelated PCSS visibility values.
+float4 pcss_depth_aware_history(
+    float2 previous_uv,
+    float expected_previous_depth,
+    out float depth_confidence
+) {
+    int2 dimensions = max(texture_dimensions(pcss_shadow_history, 0), int2(1));
+    float2 texel_position = previous_uv * float2(dimensions) - float2(0.5);
+    float2 texel_floor = floor(texel_position);
+    int2 base_coordinate = int2(texel_floor);
+    float2 fraction = saturate(texel_position - texel_floor);
+    float depth_tolerance = max(0.01, abs(expected_previous_depth) * 0.006);
+
+    float4 weighted_history = float4(0.0);
+    float weight_sum = 0.0;
+    [unroll]
+    for (int y = 0; y <= 1; ++y) {
+        [unroll]
+        for (int x = 0; x <= 1; ++x) {
+            int2 coordinate = clamp(
+                base_coordinate + int2(x, y),
+                int2(0),
+                dimensions - int2(1)
+            );
+            float spatial_weight =
+                (x == 0 ? 1.0 - fraction.x : fraction.x) *
+                (y == 0 ? 1.0 - fraction.y : fraction.y);
+            float4 candidate = load_texel(pcss_shadow_history, coordinate, 0);
+            float candidate_depth_confidence = 1.0 - smoothstep(
+                depth_tolerance,
+                depth_tolerance * 4.0,
+                abs(candidate.g - expected_previous_depth)
+            );
+            float weight = spatial_weight * candidate_depth_confidence;
+            weighted_history += candidate * weight;
+            weight_sum += weight;
+        }
+    }
+
+    depth_confidence = saturate(weight_sum);
+    if (weight_sum <= 0.0001) {
+        depth_confidence = 0.0;
+        return float4(0.0);
+    }
+    return weighted_history / weight_sum;
+}
+
+// Temporal filtering is intentionally limited to the directional PCSS visibility scalar. The
+// BRDF, transmittance, local lights, and emissive terms remain current-frame values, so shadow
+// history cannot smear highlights or alter the energy of unrelated lighting paths.
+float pcss_temporal_visibility(float current_visibility) {
+#ifdef SCENE_FAST_PATH
+    return current_visibility;
+#else
+    if (frame_camera.pcss_temporal.x <= 0.5 || frame_camera.pcss_temporal.y <= 0.0001) {
+        return current_visibility;
+    }
+    float3 world_position = frag_world_pos;
+    float4 previous_clip = mul(
+        frame_camera.previous_view_projection,
+        float4(world_position, 1.0)
+    );
+    if (previous_clip.w <= 0.0001) {
+        return current_visibility;
+    }
+    float2 previous_uv = previous_clip.xy / previous_clip.w * 0.5 + 0.5;
+    if (!all(previous_uv >= float2(0.0)) || !all(previous_uv <= float2(1.0))) {
+        return current_visibility;
+    }
+    // The visibility history belongs to the previous frame's rasterization. Reproject the
+    // receiver into that frame before sampling; using the current pixel coordinate here would
+    // blur a moving shadow in screen space and is especially visible when the light and camera
+    // approach a right angle.
+    float expected_previous_depth = abs(previous_clip.w);
+    float depth_confidence;
+    float4 history = pcss_depth_aware_history(
+        previous_uv,
+        expected_previous_depth,
+        depth_confidence
+    );
+    if (depth_confidence <= 0.0001) {
+        return current_visibility;
+    }
+    // Keep PCSS history strong enough to suppress finite-tap flicker, but let a moving Sun reduce
+    // retention so the old visibility scalar does not trail across the new shadow edge.
+    float camera_or_light_reactivity = saturate(frame_camera.pcss_temporal.w);
+    // A visibility difference is exactly the signal temporal PCSS is meant to suppress: finite
+    // blocker/filter taps can toggle a receiver between two values even while its world/depth
+    // reprojection is valid. The old fixed `current +/- 0.5` clamp prevented a static receiver
+    // from ever converging (a 0/1 sequence was forced to alternate around 0.5). Use the full
+    // visibility range while the camera and Sun are stationary; only tighten the clamp when the
+    // reprojection is reactive enough that a shadow edge may genuinely have moved.
+    float visibility_history_delta = lerp(1.0, 0.25, camera_or_light_reactivity);
+    float bounded_history = clamp(
+        history.r,
+        current_visibility - visibility_history_delta,
+        current_visibility + visibility_history_delta
+    );
+    // The CPU packs ordinary light motion at half strength, so a moving Sun still keeps useful
+    // temporal averaging. Camera motion remains fully reactive in the same lane; a true light cut
+    // disables the history before this shader is reached.
+    float feedback = frame_camera.pcss_temporal.y * depth_confidence *
+        (1.0 - camera_or_light_reactivity * 0.35);
+    return saturate(lerp(current_visibility, bounded_history, feedback));
+#endif
+}
+
 bool scene_lighting_disabled() {
     bool directional =
         dot(frame_camera.light_color.rgb, frame_camera.light_color.rgb) > 0.000001;
@@ -649,6 +759,14 @@ bool scene_lighting_disabled() {
 #endif
 }
 
+// The scene render pass keeps the PCSS attachment bound for every metadata/debug view. The
+// backend uses this alpha as a write gate: normal shading replaces the cleared history sample,
+// while diagnostics leave the LOADed previous image untouched so raw/history comparisons do not
+// feed their own visualization back into the temporal buffer.
+float pcss_history_output_alpha() {
+    return frame_camera.debug_view.x < 0.5 ? 1.0 : 0.0;
+}
+
 float3 shade_pbr(
     float3 base_color,
     float3 normal,
@@ -658,20 +776,52 @@ float3 shade_pbr(
     float occlusion,
     float3 emissive,
     float alpha,
-    float2 shadow_sample_seed
+    float2 shadow_sample_seed,
+    out float pcss_visibility
 ) {
+    pcss_visibility = 1.0;
     bool debug_filter_radius = frame_camera.debug_view.x > 2.5 && frame_camera.debug_view.x < 3.5;
-    if (debug_filter_radius) {
+    bool debug_pcss_visibility_raw = frame_camera.debug_view.x > 13.5 &&
+        frame_camera.debug_view.x < 14.5;
+    bool debug_pcss_history = frame_camera.debug_view.x > 14.5 &&
+        frame_camera.debug_view.x < 15.5;
+    if (debug_pcss_history) {
+        // The graph disables the history attachment write while this view is active, so this is
+        // the previous frame's stored value rather than a value produced by the current debug
+        // shading. It exposes whether temporal integration is actually receiving valid data.
+        int2 dimensions = max(texture_dimensions(pcss_shadow_history, 0), int2(1));
+        // SV_Position is already at the pixel center (x+0.5,y+0.5). Do not add another half
+        // texel here; that would make this diagnostic average the four neighboring history
+        // pixels and hide the reprojection/accumulation behavior it is meant to expose.
+        float2 history_uv = shadow_sample_seed / float2(dimensions);
+        float history_visibility = sample_texture_level(
+            pcss_shadow_history,
+            saturate(history_uv),
+            0.0
+        ).r;
+        pcss_visibility = history_visibility;
+        return history_visibility.xxx;
+    }
+    if (debug_filter_radius || debug_pcss_visibility_raw) {
         float debug_visibility;
         float3 debug_transmittance;
         if (frame_camera.light_dir.w > 0.5) {
-            return pbr_shadow(
+            float3 debug_shadow = pbr_shadow(
                 shadow_normal,
                 -frame_camera.light_dir.xyz,
                 shadow_sample_seed,
                 debug_visibility,
                 debug_transmittance
             );
+            if (debug_pcss_visibility_raw) {
+                // This branch intentionally bypasses pcss_temporal_visibility. It is the A/B
+                // reference for deciding whether close-up noise is produced by spatial PCSS or
+                // by the visibility-history reprojection/feedback path.
+                pcss_visibility = debug_visibility;
+                return debug_visibility.xxx;
+            }
+            pcss_visibility = pcss_temporal_visibility(debug_visibility);
+            return debug_shadow;
         }
         return float3(0.0);
     }
@@ -712,6 +862,10 @@ float3 shade_pbr(
                     directional_visibility,
                     directional_transmittance
                 );
+                directional_visibility = pcss_temporal_visibility(
+                    directional_visibility
+                );
+                pcss_visibility = directional_visibility;
             } else {
                 directional_visibility = 1.0;
             }

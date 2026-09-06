@@ -30,7 +30,7 @@
 - per-swapchain-image present semaphore
 - render graph compiler: pass/resource declaration, dependency sort, lifetime, barrier plan
 - explicit barrier plan generated from resource usage
-- executable graph path: Stable CSM + PCSS -> scene -> TAA -> post -> optional readback -> present
+- executable graph path: Stable CSM + PCSS -> scene -> optional TAA -> post composition (`PostColor`) -> SMAA edge detection -> blending weights -> neighbourhood blending -> optional readback -> present
 - build-time Slang -> SPIR-V with generated Vulkan shader asset registry
 - temporary debug triangle pipeline was removed; startup without assets presents a clear scene frame
 - window capture で triangle 表示確認
@@ -59,19 +59,19 @@
 - window extraction submits every loaded mesh/material pair, not only the first mesh
 - scene framebuffer has a depth target and mesh pipeline uses depth test/write
 - pass cadence is visible through `pass_schedule.rs`
-- post pipeline samples scene color and writes the acquired swapchain image
+- post composition samples resolved scene color and writes `PostColor`; the dedicated three-pass SMAA chain writes `edgesTex`, then `blendTex`, then samples `PostColor` and writes the acquired swapchain image
 - directional shadow passes address one four-layer D16 array as `cascade`
 - translucent shadow uses only the reference direction and keeps the nearest visible transmittance layer
 - Stable CSM keeps each cascade center snapped to its light-space texel grid; PCSS uses raw blocker taps followed by a hardware-comparison PCF filter
 - Vulkan material module uploads imported texture payloads into sampled images
 - Vulkan material module uploads material parameter buffers and descriptor sets
-- `--window-smoke` verifies Vulkan startup, `assets/model.glb` load, mesh draw, post, present, and shutdown
+- `--window-smoke` requires an existing asset, then verifies Vulkan startup, asset load, mesh draw, post, present, and shutdown. `REBUILD1_WINDOW_QUALITY=high` additionally exercises the dedicated GodRay volume; `-QualitySequence '1,4,1,4'` repeats the asset-backed CSM/GodRay quality transition (quote the sequence in PowerShell).
 
-未着手または次の gate:
+残りの gate:
 
-- shader interface validation
-- sampled material texture use in the mesh shader
-- visual verification scenes for texture, alpha cutout, cascade shadow, translucent shadow, and camera effects
+- high-quality dedicated GodRay smoke を検証スクリプトの標準手順に含める
+- SMAA の edge/resolve 負荷を profiler 実測後に最適化する
+- screenshot/RenderDoc による視覚 acceptance を必要な scene ごとに実施する
 
 ## Thread And Ownership
 
@@ -168,12 +168,14 @@ The current graph treats shadows as real resources, not a fake pre-pass:
 1. `shadow_direction_0..3/cascade_0..3` write hard comparison depth into the four stable CSM layers.
 2. `translucent_shadow_0..3` uses the CSM layer and keeps the nearest colored transmittance layer.
 3. `scene` evaluates PCSS using raw blocker taps plus a LINEAR comparison sampler, blends adjacent cascades, and writes HDR plus scene metadata.
-4. `TAA` samples the scene HDR directly, removes current/previous jitter phase from history UVs, selects a matching 2x2 depth/normal candidate, and uses reactive history only when transparent coverage matches.
-5. `post` samples TAA output, maps stable output UVs to the current jittered metadata grid for SSAO/SSR, and writes the acquired swapchain image.
-6. `framebuffer_readback` runs only for requested final-frame summaries.
-7. `present` is the external side-effect pass.
+4. `god_ray_*` is inserted for the high-quality volumetric route; it evaluates analytic height density along 48 camera-ray strata, applies CSM/PCSS plus translucent transmittance, integrates Beer-Lambert scattering, and resolves through a half-resolution bilateral upscale.
+5. `TAA` is an optional history route. It samples scene HDR directly, removes current/previous jitter phase from history UVs, selects a matching 2x2 depth/normal candidate, and uses reactive history only when transparent coverage matches. The production default keeps it dormant and uses the dedicated three-pass SMAA chain.
+6. `post` samples resolved scene output, maps stable output UVs to the current jittered metadata grid for SSAO/SSR, runs bloom/GodRay/camera effects/tone mapping, and writes the complete composition to `PostColor`.
+7. `smaa_edges` reads `PostColor` and writes the luma edge field; `smaa_weights` reads that field and writes AreaTex blending weights; `smaa` reads `PostColor` plus `blendTex` and writes the final anti-aliased image to the acquired swapchain image.
+8. `framebuffer_readback` runs only for requested final-frame summaries.
+9. `present` is the external side-effect pass.
 
-Directional depth is device-owned and does not follow swapchain extent. The four cascade layers and split layout are fixed; each quality profile selects one shared resolution for all layers (with `REBUILD1_SHADOW_MAP_SIZE` as a process override). A fixed frustum-bounding sphere, symmetric receiver overlap at each split, square projection, and one-texel light-space snap keep the four cascade projections stable. PCSS uses receiver-plane depth gradients for per-tap comparisons. TAA history follows swapchain extent and is recreated on resize.
+Directional depth is device-owned and does not follow swapchain extent. The four cascade layers and split layout are fixed; continuous shadow resolution, tap counts, and bias scales are sent through `SetQualitySettings`, while `SetQualityFeatures(RenderFeatureToggles)` changes only feature ON/OFF state. A fixed frustum-bounding sphere, symmetric receiver overlap at each split, square projection, and one-texel light-space snap keep the four cascade projections stable. PCSS uses receiver-plane depth gradients for per-tap comparisons. Optional TAA history and dedicated GodRay targets follow swapchain extent and are recreated with the swapchain; PCSS and GodRay histories are kept as separate ping-pong resources.
 
 ## Module Shape
 
@@ -213,7 +215,8 @@ renderer/
     frame.rs     # frames-in-flight and command recording
     material.rs  # backend-local sampled images and material descriptors
     mesh.rs      # backend-local mesh buffers and mesh pipeline
-    post.rs      # scene_color sampler and post pipeline
+    post.rs      # scene color samplers and post pipeline
+    taa.rs       # optional temporal history route (dormant by default)
     swapchain.rs # swapchain-owned resources
 ```
 

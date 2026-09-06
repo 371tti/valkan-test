@@ -4,8 +4,9 @@
 //
 // Stable CSM keeps the four orthographic receiver projections aligned to a texel grid. PCSS is
 // evaluated spatially in the current frame: a small blocker search estimates the penumbra and a
-// variable-radius percentage-closer filter resolves the final visibility. There is deliberately
-// no directional sample cursor or shadow-history buffer in this path.
+// variable-radius percentage-closer filter resolves the final visibility. This include remains
+// stateless; the scene lighting pass may apply a separate, visibility-only temporal history after
+// this spatial result is produced.
 
 static const uint STABLE_CSM_CASCADE_COUNT = 4u;
 static const uint STABLE_CSM_MAX_BLOCKER_SAMPLES = 16u;
@@ -143,19 +144,30 @@ float2 stable_csm_receiver_plane_gradient(
 float stable_csm_depth_sample(
     Sampler2DArray shadow_depth,
     float2 uv,
-    uint cascade_index
+    uint cascade_index,
+    float cascade_resolution
 ) {
-    return shadow_depth.SampleLevel(float3(uv, float(cascade_index)), 0.0).r;
+    // The shadow sampler uses an opaque-white border for out-of-map accesses.  Letting a PCSS
+    // disk cross that border makes a tiny motion of the projected receiver switch taps from real
+    // depth to guaranteed-lit depth, which is temporal noise rather than a valid penumbra. Keep
+    // every footprint inside the same cascade texel domain; the center projection is still
+    // rejected outside [0,1] by `stable_csm_projection_valid`.
+    float edge = 0.5 * stable_csm_rcp_safe(cascade_resolution, 1.0);
+    float2 safe_uv = clamp(uv, float2(edge), float2(1.0 - edge));
+    return shadow_depth.SampleLevel(float3(safe_uv, float(cascade_index)), 0.0).r;
 }
 
 float stable_csm_compare(
     Sampler2DArrayShadow shadow_depth,
     float2 uv,
     uint cascade_index,
-    float receiver_depth
+    float receiver_depth,
+    float cascade_resolution
 ) {
+    float edge = 0.5 * stable_csm_rcp_safe(cascade_resolution, 1.0);
+    float2 safe_uv = clamp(uv, float2(edge), float2(1.0 - edge));
     return shadow_depth.SampleCmpLevelZero(
-        float3(uv, float(cascade_index)),
+        float3(safe_uv, float(cascade_index)),
         receiver_depth
     );
 }
@@ -176,8 +188,10 @@ float stable_csm_pcss_visibility(
     float cascade_resolution,
     float4 pcss_params,
     float4 receiver_params,
-    bool debug_filter_radius
+    bool debug_filter_radius,
+    out bool projection_valid
 ) {
+    projection_valid = true;
     float3 projected;
     float2 uv;
     float4 shadow_position = stable_csm_project(
@@ -191,6 +205,7 @@ float stable_csm_pcss_visibility(
         uv
     );
     if (!stable_csm_projection_valid(shadow_position, projected, uv)) {
+        projection_valid = false;
         return debug_filter_radius ? 0.0 : 1.0;
     }
 
@@ -218,7 +233,14 @@ float stable_csm_pcss_visibility(
     float cascade_width_world = max(texel_world * cascade_resolution, 0.001);
     float inverse_cascade_width = stable_csm_rcp_safe(cascade_width_world, 0.001);
     float angular_radius = max(pcss_params.z, 0.0);
-    float rotation = stable_csm_hash(sample_pixel, cascade_index) * 6.2831853;
+    // Keep the base PCSS disk orientation tied to the output pixel, then add the shared
+    // low-discrepancy temporal phase. A fixed pattern makes map-texel quantization repeat every
+    // frame, so the PCSS history has no new samples to average. The phase changes only the tap
+    // placement; reprojection and the visibility-only history remove the resulting noise without
+    // delaying BRDF or direct-light evaluation.
+    float rotation = (
+        stable_csm_hash(sample_pixel, cascade_index) + frame_camera.pcss_temporal.z
+    ) * 6.2831853;
     uint blocker_count = min(
         uint(max(pcss_params.x, 1.0) + 0.5),
         STABLE_CSM_MAX_BLOCKER_SAMPLES
@@ -236,9 +258,6 @@ float stable_csm_pcss_visibility(
         1.5 * inverse_resolution,
         angular_radius * 0.18
     );
-    if (pcss_params.w > 0.5) {
-        search_radius_uv = max(search_radius_uv, 2.5 * inverse_resolution);
-    }
 
     float blocker_sum = 0.0;
     float blocker_receiver_sum = 0.0;
@@ -257,7 +276,8 @@ float stable_csm_pcss_visibility(
         float sample_depth = stable_csm_depth_sample(
             raw_shadow_depth,
             uv + sample_offset_uv,
-            cascade_index
+            cascade_index,
+            cascade_resolution
         );
         // The compare depth is the same receiver-plane estimate minus the center bias. Reuse the
         // estimate instead of evaluating its gradient dot product a second time for every blocker.
@@ -270,7 +290,12 @@ float stable_csm_pcss_visibility(
         }
     }
 
-    if (blocker_weight <= 0.25) {
+    // A partially covered search disk is not the same as "no blocker".  The old 0.25 cut-off
+    // made one quantized tap crossing the receiver-depth band switch the whole pixel from a
+    // filtered shadow to fully lit.  That binary event is especially visible when the camera
+    // jitter changes a foliage/CSM edge.  Keep the exact zero-blocker fast path, but turn the
+    // finite blocker coverage into a continuous confidence used after the hardware PCF pass.
+    if (blocker_weight <= 0.0001) {
         return debug_filter_radius ? 0.0 : 1.0;
     }
 
@@ -302,10 +327,17 @@ float stable_csm_pcss_visibility(
             shadow_depth,
             uv + sample_offset_uv,
             cascade_index,
-            sample_receiver_depth
+            sample_receiver_depth,
+            cascade_resolution
         );
     }
-    return saturate(visibility * inverse_filter_count);
+    float filtered_visibility = saturate(visibility * inverse_filter_count);
+    // Exponential coverage avoids a new hard threshold at one blocker tap: a sparse/uncertain
+    // disk starts mostly lit, while a well-covered disk converges to the normal hardware-PCF
+    // result.  The PCSS radius itself remains unchanged, so debug_filter_radius still exposes
+    // the physical filter radius rather than this confidence.
+    float blocker_confidence = 1.0 - exp(-blocker_weight * 0.70);
+    return lerp(1.0, filtered_visibility, saturate(blocker_confidence));
 }
 
 float3 stable_csm_transmittance(
@@ -338,8 +370,13 @@ float3 stable_csm_transmittance(
     float receiver_depth = projected.z;
     float4 sample_value = translucent_shadow.SampleLevel(uv, 0.0);
     float depth_tolerance = max(texel_world, 0.00001) * inverse_depth_span * 2.0;
-    return sample_value.a + depth_tolerance >= receiver_depth
-        ? clamp(sample_value.rgb, float3(0.0), float3(1.0))
+    // Shadow-map depth increases away from the light.  Apply the stored transmittance only when
+    // this receiver lies behind the nearest translucent caster; points in front of it see the
+    // light directly. RGB is additive log-transmittance, so decode only after all layers have
+    // been accumulated. The clear depth is 1 and RGB is zero, which remains a white/no-caster
+    // result after decode.
+    return receiver_depth + depth_tolerance >= sample_value.a
+        ? exp(clamp(sample_value.rgb, float3(-16.0), float3(0.0)))
         : float3(1.0);
 }
 
@@ -375,7 +412,10 @@ float3 stable_csm_sample_transmittance(
 }
 
 float stable_csm_cascade_transition_width(float split) {
-    return max(split * 0.045, 1.0);
+    // Keep the map overlap broad enough that a stable receiver never presents two complete PCSS
+    // silhouettes at a cascade boundary.  The CPU fits every neighboring sphere with the same
+    // 10% expansion, so both maps remain valid for the entire blend interval.
+    return max(split * 0.10, 1.0);
 }
 
 float3 shadow_factor(
@@ -448,6 +488,7 @@ float3 shadow_factor(
         );
     }
 
+    bool primary_projection_valid;
     float primary_visibility = stable_csm_pcss_visibility(
         raw_shadow_depth,
         shadow_depth,
@@ -464,10 +505,12 @@ float3 shadow_factor(
         cascade_resolution[primary],
         pcss_params,
         receiver_params,
-        debug_filter_radius
+        debug_filter_radius,
+        primary_projection_valid
     );
     float visibility = primary_visibility;
     if (transition_active) {
+        bool secondary_projection_valid;
         float secondary_visibility = stable_csm_pcss_visibility(
             raw_shadow_depth,
             shadow_depth,
@@ -484,9 +527,18 @@ float3 shadow_factor(
             cascade_resolution[secondary],
             pcss_params,
             receiver_params,
-            debug_filter_radius
+            debug_filter_radius,
+            secondary_projection_valid
         );
-        visibility = lerp(primary_visibility, secondary_visibility, transition_t);
+        // A cascade outside its orthographic footprint returns the debug/normal fallback, not a
+        // measured visibility. Never interpolate that sentinel with the valid cascade: at an
+        // oblique view the transition interval can otherwise turn a tiny projection excursion
+        // into a camera-angle-dependent PCSS flash.
+        if (primary_projection_valid && secondary_projection_valid) {
+            visibility = lerp(primary_visibility, secondary_visibility, transition_t);
+        } else if (!primary_projection_valid && secondary_projection_valid) {
+            visibility = secondary_visibility;
+        }
     }
 
     if (debug_filter_radius) {

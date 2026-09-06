@@ -1,14 +1,183 @@
+/// Continuous renderer controls plus explicit feature switches.
+///
+/// The scalar fields remain available for renderer-internal tuning. Use [`Self::with_features`]
+/// when a command only needs to turn a feature on or off.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderQualitySettings {
     ssao: SsaoQualitySettings,
     ssr: SsrQualitySettings,
     anti_aliasing: AntiAliasingQualitySettings,
-    shadow_softening: ShadowSofteningQualitySettings,
     stable_csm_pcss: StableCsmPcssQualitySettings,
-    contact_hard_shadows: bool,
     bloom: BloomQualitySettings,
     fog: VolumetricFogQualitySettings,
     post: PostQualitySettings,
+    features: RenderFeatureToggles,
+}
+
+/// Explicit ON/OFF switches for renderer features.
+///
+/// This is intentionally separate from [`RenderQualitySettings`]' continuous controls.  A
+/// feature command can therefore enable or disable a pass without silently changing its sample
+/// budget, radius, or visual strength.  New switches can be added here without changing the
+/// numeric quality contract used by the renderer internals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RenderFeatureToggles {
+    ssao: bool,
+    ssr: bool,
+    anti_aliasing: bool,
+    bloom: bool,
+    god_rays: bool,
+    volumetric_fog: bool,
+}
+
+impl RenderFeatureToggles {
+    pub const SSAO_BIT: u32 = 1 << 0;
+    pub const SSR_BIT: u32 = 1 << 1;
+    pub const ANTI_ALIASING_BIT: u32 = 1 << 2;
+    pub const BLOOM_BIT: u32 = 1 << 3;
+    pub const GOD_RAYS_BIT: u32 = 1 << 4;
+    pub const VOLUMETRIC_FOG_BIT: u32 = 1 << 5;
+
+    /// Returns a feature set with every optional effect disabled.
+    pub const fn disabled() -> Self {
+        Self {
+            ssao: false,
+            ssr: false,
+            anti_aliasing: false,
+            bloom: false,
+            god_rays: false,
+            volumetric_fog: false,
+        }
+    }
+
+    /// Key `2`: enable the inexpensive spatial effects needed for navigation.
+    pub const fn spatial() -> Self {
+        Self {
+            anti_aliasing: true,
+            ssao: true,
+            ..Self::disabled()
+        }
+    }
+
+    /// Key `3`: add screen-space reflections and the legacy post God Ray path.
+    pub const fn post() -> Self {
+        Self {
+            ssr: true,
+            bloom: true,
+            god_rays: true,
+            ..Self::spatial()
+        }
+    }
+
+    /// Key `4`: enable every currently implemented optional feature.
+    pub const fn full() -> Self {
+        Self {
+            volumetric_fog: true,
+            ..Self::post()
+        }
+    }
+
+    /// Compatibility names for callers that still refer to the four keyboard levels.
+    pub const fn performance() -> Self {
+        Self::disabled()
+    }
+
+    pub const fn interactive() -> Self {
+        Self::spatial()
+    }
+
+    pub const fn balanced() -> Self {
+        Self::post()
+    }
+
+    pub const fn high_quality() -> Self {
+        Self::full()
+    }
+
+    /// Creates a feature set from a protocol bit mask. Unknown bits are ignored for forward
+    /// compatibility with newer clients.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self {
+            ssao: bits & Self::SSAO_BIT != 0,
+            ssr: bits & Self::SSR_BIT != 0,
+            anti_aliasing: bits & Self::ANTI_ALIASING_BIT != 0,
+            bloom: bits & Self::BLOOM_BIT != 0,
+            god_rays: bits & Self::GOD_RAYS_BIT != 0,
+            volumetric_fog: bits & Self::VOLUMETRIC_FOG_BIT != 0,
+        }
+    }
+
+    /// Returns the compact protocol representation used by post push constants and traces.
+    pub const fn bits(self) -> u32 {
+        (if self.ssao { Self::SSAO_BIT } else { 0 })
+            | (if self.ssr { Self::SSR_BIT } else { 0 })
+            | (if self.anti_aliasing {
+                Self::ANTI_ALIASING_BIT
+            } else {
+                0
+            })
+            | (if self.bloom { Self::BLOOM_BIT } else { 0 })
+            | (if self.god_rays { Self::GOD_RAYS_BIT } else { 0 })
+            | (if self.volumetric_fog {
+                Self::VOLUMETRIC_FOG_BIT
+            } else {
+                0
+            })
+    }
+
+    pub const fn ssao_enabled(self) -> bool {
+        self.ssao
+    }
+
+    pub const fn ssr_enabled(self) -> bool {
+        self.ssr
+    }
+
+    pub const fn anti_aliasing_enabled(self) -> bool {
+        self.anti_aliasing
+    }
+
+    pub const fn bloom_enabled(self) -> bool {
+        self.bloom
+    }
+
+    pub const fn god_rays_enabled(self) -> bool {
+        self.god_rays
+    }
+
+    pub const fn volumetric_fog_enabled(self) -> bool {
+        self.volumetric_fog
+    }
+
+    pub const fn with_ssao(mut self, enabled: bool) -> Self {
+        self.ssao = enabled;
+        self
+    }
+
+    pub const fn with_ssr(mut self, enabled: bool) -> Self {
+        self.ssr = enabled;
+        self
+    }
+
+    pub const fn with_anti_aliasing(mut self, enabled: bool) -> Self {
+        self.anti_aliasing = enabled;
+        self
+    }
+
+    pub const fn with_bloom(mut self, enabled: bool) -> Self {
+        self.bloom = enabled;
+        self
+    }
+
+    pub const fn with_god_rays(mut self, enabled: bool) -> Self {
+        self.god_rays = enabled;
+        self
+    }
+
+    pub const fn with_volumetric_fog(mut self, enabled: bool) -> Self {
+        self.volumetric_fog = enabled;
+        self
+    }
 }
 
 impl RenderQualitySettings {
@@ -17,24 +186,24 @@ impl RenderQualitySettings {
         ssao: SsaoQualitySettings,
         ssr: SsrQualitySettings,
         anti_aliasing: AntiAliasingQualitySettings,
-        shadow_softening: ShadowSofteningQualitySettings,
         stable_csm_pcss: StableCsmPcssQualitySettings,
-        contact_hard_shadows: bool,
         bloom: BloomQualitySettings,
         fog: VolumetricFogQualitySettings,
         post: PostQualitySettings,
+        features: RenderFeatureToggles,
     ) -> Self {
-        Self {
+        let mut settings = Self {
             ssao,
             ssr,
             anti_aliasing,
-            shadow_softening,
             stable_csm_pcss,
-            contact_hard_shadows,
             bloom,
             fog,
             post,
-        }
+            features,
+        };
+        settings.sync_feature_routes();
+        settings
     }
 
     /// Creates a complete renderer quality profile for fullscreen post effects.
@@ -53,93 +222,75 @@ impl RenderQualitySettings {
         anti_aliasing: AntiAliasingQualitySettings,
         post: PostQualitySettings,
     ) -> Self {
-        Self::new_with_shadow_softening(
-            ssao,
-            ssr,
-            anti_aliasing,
-            ShadowSofteningQualitySettings::balanced(),
-            post,
-        )
-    }
-
-    /// Creates a complete renderer quality profile including post-process shadow cleanup.
-    pub fn new_with_shadow_softening(
-        ssao: SsaoQualitySettings,
-        ssr: SsrQualitySettings,
-        anti_aliasing: AntiAliasingQualitySettings,
-        shadow_softening: ShadowSofteningQualitySettings,
-        post: PostQualitySettings,
-    ) -> Self {
+        let features = RenderFeatureToggles::post()
+            .with_ssao(ssao.intensity() > 0.0)
+            .with_ssr(ssr.intensity() > 0.0)
+            .with_anti_aliasing(anti_aliasing.blend() > 0.0);
         Self::from_parts(
             ssao,
             ssr,
             anti_aliasing,
-            shadow_softening,
             StableCsmPcssQualitySettings::balanced(),
-            false,
             BloomQualitySettings::balanced(),
-            VolumetricFogQualitySettings::disabled(),
+            VolumetricFogQualitySettings::high_quality().with_enabled(false),
             post,
+            features,
         )
     }
 
-    /// Returns the lightest profile intended for editing and camera navigation.
+    /// Returns the low-cost continuous profile used by keyboard preset `1` and renderer tuning.
     pub fn performance() -> Self {
         Self::from_parts(
             SsaoQualitySettings::disabled(),
             SsrQualitySettings::disabled(),
             AntiAliasingQualitySettings::disabled(),
-            ShadowSofteningQualitySettings::disabled(),
             StableCsmPcssQualitySettings::performance(),
-            false,
             BloomQualitySettings::disabled(),
-            VolumetricFogQualitySettings::disabled(),
+            VolumetricFogQualitySettings::high_quality().with_enabled(false),
             PostQualitySettings::natural(),
+            RenderFeatureToggles::disabled(),
         )
     }
 
-    /// Returns the interactive profile used when the app does not override renderer quality.
+    /// Returns the interactive continuous profile used by keyboard preset `2`.
     pub fn interactive() -> Self {
         Self::from_parts(
             SsaoQualitySettings::interactive(),
             SsrQualitySettings::interactive(),
             AntiAliasingQualitySettings::interactive(),
-            ShadowSofteningQualitySettings::interactive(),
             StableCsmPcssQualitySettings::interactive(),
-            false,
             BloomQualitySettings::interactive(),
-            VolumetricFogQualitySettings::disabled(),
+            VolumetricFogQualitySettings::high_quality().with_enabled(false),
             PostQualitySettings::natural(),
+            RenderFeatureToggles::post(),
         )
     }
 
-    /// Returns the balanced profile for scenes that can spend more post-process budget.
+    /// Returns the balanced continuous profile used by keyboard preset `3`.
     pub fn balanced() -> Self {
         Self::from_parts(
             SsaoQualitySettings::balanced(),
             SsrQualitySettings::balanced(),
             AntiAliasingQualitySettings::balanced(),
-            ShadowSofteningQualitySettings::balanced(),
             StableCsmPcssQualitySettings::balanced(),
-            false,
             BloomQualitySettings::balanced(),
-            VolumetricFogQualitySettings::disabled(),
+            VolumetricFogQualitySettings::high_quality().with_enabled(false),
             PostQualitySettings::natural(),
+            RenderFeatureToggles::post(),
         )
     }
 
-    /// Returns the expensive profile used when visual inspection matters more than frame time.
+    /// Returns the high-cost continuous profile used by keyboard preset `4`.
     pub fn high_quality() -> Self {
         Self::from_parts(
             SsaoQualitySettings::high_quality(),
             SsrQualitySettings::high_quality(),
             AntiAliasingQualitySettings::high_quality(),
-            ShadowSofteningQualitySettings::high_quality(),
             StableCsmPcssQualitySettings::high_quality(),
-            true,
             BloomQualitySettings::high_quality(),
             VolumetricFogQualitySettings::high_quality(),
             PostQualitySettings::natural(),
+            RenderFeatureToggles::full(),
         )
     }
 
@@ -149,32 +300,41 @@ impl RenderQualitySettings {
         self
     }
 
-    /// Returns a copy with a different post-process shadow cleanup profile.
-    pub fn with_shadow_softening(
-        mut self,
-        shadow_softening: ShadowSofteningQualitySettings,
-    ) -> Self {
-        self.shadow_softening = shadow_softening;
-        self
-    }
-
-    /// Enables a wider PCSS blocker search for near-contact detail without changing CSM layout.
-    pub fn with_contact_hard_shadows(mut self, enabled: bool) -> Self {
-        self.contact_hard_shadows = enabled;
-        self.stable_csm_pcss = self.stable_csm_pcss.with_contact_shadows(enabled);
-        self
-    }
-
-    /// Returns a copy with a different bloom profile.
+    /// Returns a copy with different continuous bloom controls. Feature ON/OFF state is
+    /// intentionally unchanged; use [`Self::with_features`] for that.
     pub fn with_bloom(mut self, bloom: BloomQualitySettings) -> Self {
         self.bloom = bloom;
+        self.sync_feature_routes();
         self
     }
 
-    /// Returns a copy with a different world-space volumetric fog profile.
+    /// Returns a copy with different continuous volumetric-fog controls. Feature ON/OFF state is
+    /// intentionally unchanged; use [`Self::with_features`] for that.
     pub fn with_fog(mut self, fog: VolumetricFogQualitySettings) -> Self {
         self.fog = fog;
+        self.sync_feature_routes();
         self
+    }
+
+    /// Returns a copy with explicit feature ON/OFF switches while preserving every continuous
+    /// quality value in this settings object.
+    pub fn with_features(mut self, features: RenderFeatureToggles) -> Self {
+        self.features = features;
+        self.sync_feature_routes();
+        self
+    }
+
+    /// Returns the feature ON/OFF switches carried by this renderer configuration.
+    pub fn features(self) -> RenderFeatureToggles {
+        self.features
+    }
+
+    /// Keeps legacy route fields as derived values for shader/resource compatibility.  The
+    /// feature mask remains the single owner of user-visible ON/OFF state.
+    fn sync_feature_routes(&mut self) {
+        let volumetric = self.features.volumetric_fog_enabled();
+        self.bloom = self.bloom.with_volumetric_god_rays(volumetric);
+        self.fog = self.fog.with_enabled(volumetric);
     }
 
     /// Returns the screen-space ambient occlusion quality applied by the post pass.
@@ -187,14 +347,9 @@ impl RenderQualitySettings {
         self.ssr
     }
 
-    /// Returns the post-pass antialiasing quality applied before tone mapping.
+    /// Returns the final spatial SMAA quality applied to the complete post result.
     pub fn anti_aliasing(self) -> AntiAliasingQualitySettings {
         self.anti_aliasing
-    }
-
-    /// Returns the post-process shadow cleanup applied before tone mapping.
-    pub fn shadow_softening(self) -> ShadowSofteningQualitySettings {
-        self.shadow_softening
     }
 
     /// Returns the spatial Stable CSM + PCSS directional-shadow policy.
@@ -205,12 +360,8 @@ impl RenderQualitySettings {
     /// Returns a copy with a different Stable CSM + PCSS shadow policy.
     pub fn with_stable_csm_pcss(mut self, stable_csm_pcss: StableCsmPcssQualitySettings) -> Self {
         self.stable_csm_pcss = stable_csm_pcss;
+        self.sync_feature_routes();
         self
-    }
-
-    /// Returns whether the wider contact-detail blocker search is enabled.
-    pub fn contact_hard_shadows(self) -> bool {
-        self.contact_hard_shadows
     }
 
     /// Returns the bloom quality applied by the post pass.
@@ -239,8 +390,8 @@ impl Default for RenderQualitySettings {
 /// Spatial quality controls for the Stable CSM + PCSS directional shadow path.
 ///
 /// These values describe the fixed four-layer map resolution and spatial work performed by the
-/// current frame. Increasing blocker/filter counts improves penumbra stability without a
-/// shadow-history horizon.
+/// current frame. Increasing blocker/filter counts improves penumbra stability; temporal reuse is
+/// controlled separately by the scene lighting path and is not part of this spatial budget.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StableCsmPcssQualitySettings {
     blocker_search_samples: u32,
@@ -251,7 +402,6 @@ pub struct StableCsmPcssQualitySettings {
     slope_bias_scale: f32,
     normal_offset_scale: f32,
     receiver_plane_bias_scale: f32,
-    contact_shadows: bool,
 }
 
 impl StableCsmPcssQualitySettings {
@@ -282,7 +432,6 @@ impl StableCsmPcssQualitySettings {
             slope_bias_scale: 1.0,
             normal_offset_scale: 1.0,
             receiver_plane_bias_scale: 1.0,
-            contact_shadows: false,
         }
     }
 
@@ -315,11 +464,6 @@ impl StableCsmPcssQualitySettings {
     /// Scales the receiver-plane depth gradient used for PCSS tap comparisons.
     pub fn with_receiver_plane_bias_scale(mut self, scale: f32) -> Self {
         self.receiver_plane_bias_scale = finite_clamp(scale, 0.0, 8.0, 1.0);
-        self
-    }
-
-    pub fn with_contact_shadows(mut self, enabled: bool) -> Self {
-        self.contact_shadows = enabled;
         self
     }
 
@@ -357,7 +501,6 @@ impl StableCsmPcssQualitySettings {
             .with_slope_bias_scale(2.5)
             .with_normal_offset_scale(2.5)
             .with_receiver_plane_bias_scale(2.5)
-            .with_contact_shadows(true)
     }
 
     pub fn blocker_search_samples(self) -> u32 {
@@ -394,80 +537,6 @@ impl StableCsmPcssQualitySettings {
 
     pub fn receiver_plane_bias_scale(self) -> f32 {
         self.receiver_plane_bias_scale
-    }
-
-    pub fn contact_shadows(self) -> bool {
-        self.contact_shadows
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ShadowSofteningQualitySettings {
-    intensity: f32,
-    radius_pixels: f32,
-    depth_sensitivity: f32,
-    max_luma_delta: f32,
-}
-
-impl ShadowSofteningQualitySettings {
-    /// Creates bounded controls for post-process cleanup of noisy soft shadow edges.
-    ///
-    /// The pass upscales low-frequency shadow edges in screen space. It only adjusts
-    /// local luminance and uses depth/normal weights, so it can hide lower-resolution
-    /// shadow-map stair steps without blurring object silhouettes as aggressively as
-    /// a full color blur.
-    pub fn new(
-        intensity: f32,
-        radius_pixels: f32,
-        depth_sensitivity: f32,
-        max_luma_delta: f32,
-    ) -> Self {
-        Self {
-            intensity: finite_clamp(intensity, 0.0, 1.0, 0.0),
-            radius_pixels: finite_clamp(radius_pixels, 0.5, 12.0, 4.5),
-            depth_sensitivity: finite_clamp(depth_sensitivity, 0.1, 8.0, 1.7),
-            max_luma_delta: finite_clamp(max_luma_delta, 0.005, 0.25, 0.075),
-        }
-    }
-
-    /// Disables shadow cleanup so the post shader can skip the extra taps.
-    pub fn disabled() -> Self {
-        Self::new(0.0, 0.75, 1.8, 0.040)
-    }
-
-    /// Returns a light cleanup profile for normal camera movement.
-    pub fn interactive() -> Self {
-        Self::new(0.28, 2.50, 3.6, 0.070)
-    }
-
-    /// Returns the default cleanup profile for balanced soft-shadow quality.
-    pub fn balanced() -> Self {
-        Self::new(0.66, 5.75, 2.45, 0.160)
-    }
-
-    /// Returns the stronger cleanup profile for visual inspection.
-    pub fn high_quality() -> Self {
-        Self::new(0.92, 10.50, 1.85, 0.240)
-    }
-
-    /// Returns the final blend strength of the shadow cleanup.
-    pub fn intensity(self) -> f32 {
-        self.intensity
-    }
-
-    /// Returns the filter radius in screen pixels.
-    pub fn radius_pixels(self) -> f32 {
-        self.radius_pixels
-    }
-
-    /// Returns how strongly depth differences reject neighboring taps.
-    pub fn depth_sensitivity(self) -> f32 {
-        self.depth_sensitivity
-    }
-
-    /// Returns the maximum local luma shift applied by the cleanup pass.
-    pub fn max_luma_delta(self) -> f32 {
-        self.max_luma_delta
     }
 }
 
@@ -599,9 +668,35 @@ impl SsaoQualitySettings {
         self.bias
     }
 
-    /// Returns how many fixed kernel samples the shader should evaluate.
+    /// Returns the quality tier that the GTAO shader expands into slices and steps.
     pub fn sample_count(self) -> u32 {
         self.sample_count
+    }
+
+    /// Returns the number of opposite-direction horizon slices used by the GTAO shader.
+    ///
+    /// Existing serialized quality values remain valid while the practical work budget is explicit
+    /// in diagnostics.
+    pub fn slice_count(self) -> u32 {
+        match self.sample_count {
+            0..=2 => 2,
+            3..=4 => 3,
+            _ => 4,
+        }
+    }
+
+    /// Returns the number of radial samples taken on each side of one GTAO slice.
+    pub fn steps_per_slice(self) -> u32 {
+        match self.sample_count {
+            0..=2 => 2,
+            3..=4 => 3,
+            _ => 4,
+        }
+    }
+
+    /// Returns the total number of depth taps evaluated by one GTAO pixel.
+    pub fn sample_budget(self) -> u32 {
+        self.slice_count() * self.steps_per_slice() * 2
     }
 }
 
@@ -612,8 +707,8 @@ pub struct AntiAliasingQualitySettings {
 }
 
 impl AntiAliasingQualitySettings {
-    /// Creates bounded temporal-AA controls. `blend` controls maximum history feedback; the edge
-    /// threshold remains available to the non-production spatial fallback/debug path.
+    /// Creates bounded SMAA controls. `blend` controls the spatial neighborhood contribution and
+    /// `edge_threshold` controls the luma/geometry edge detector.
     pub fn new(edge_threshold: f32, blend: f32) -> Self {
         Self {
             edge_threshold: finite_clamp(edge_threshold, 0.004, 0.08, 0.028),
@@ -621,22 +716,22 @@ impl AntiAliasingQualitySettings {
         }
     }
 
-    /// Disables projection jitter and color-history blending for the lowest-latency profile.
+    /// Disables spatial anti-aliasing for the lowest-latency profile.
     pub fn disabled() -> Self {
         Self::new(0.08, 0.0)
     }
 
-    /// Returns a responsive temporal-AA profile for interactive camera movement.
+    /// Returns a responsive SMAA profile for interactive camera movement.
     pub fn interactive() -> Self {
         Self::new(0.034, 0.45)
     }
 
-    /// Returns the default temporal-AA history feedback.
+    /// Returns the default balanced SMAA blend.
     pub fn balanced() -> Self {
         Self::new(0.018, 0.78)
     }
 
-    /// Returns the strongest temporal accumulation profile.
+    /// Returns the strongest SMAA blend.
     pub fn high_quality() -> Self {
         Self::new(0.010, 0.98)
     }
@@ -646,7 +741,7 @@ impl AntiAliasingQualitySettings {
         self.edge_threshold
     }
 
-    /// Returns the temporal accumulation strength in the range zero through one.
+    /// Returns the spatial SMAA neighborhood blend in the range zero through one.
     pub fn blend(self) -> f32 {
         self.blend
     }
@@ -724,7 +819,9 @@ impl BloomQualitySettings {
         self.god_rays_intensity
     }
 
-    /// Enables the shadow-aware camera-ray volume integration used by the quality profile.
+    /// Sets the derived route marker used by low-level callers. For a complete renderer
+    /// configuration, prefer [`RenderQualitySettings::with_features`] so the feature owner is
+    /// unambiguous.
     pub fn with_volumetric_god_rays(mut self, enabled: bool) -> Self {
         self.volumetric_god_rays = enabled;
         self
@@ -778,7 +875,9 @@ impl VolumetricFogQualitySettings {
         Self::new(0.0035, 0.018, 0.0, 160.0)
     }
 
-    /// Enables or disables the medium without changing its tuned physical parameters.
+    /// Enables or disables the medium without changing its tuned physical parameters. This is a
+    /// derived route marker for low-level callers; complete renderer configurations should use
+    /// [`RenderQualitySettings::with_features`] for the ON/OFF decision.
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled && self.density > 0.0;
         self
@@ -864,7 +963,6 @@ mod tests {
         assert_eq!(settings.ssao().sample_count(), 8);
         assert!(settings.ssr().max_distance().is_finite());
         assert_eq!(settings.anti_aliasing().blend(), 1.0);
-        assert!(settings.shadow_softening().radius_pixels().is_finite());
         assert!(
             settings
                 .stable_csm_pcss()
@@ -877,29 +975,78 @@ mod tests {
     }
 
     #[test]
+    fn feature_presets_are_explicit_on_off_sets() {
+        let disabled = RenderFeatureToggles::disabled();
+        let spatial = RenderFeatureToggles::spatial();
+        let post = RenderFeatureToggles::post();
+        let full = RenderFeatureToggles::full();
+
+        assert_eq!(disabled.bits(), 0);
+        assert!(spatial.anti_aliasing_enabled() && spatial.ssao_enabled());
+        assert!(!spatial.ssr_enabled() && !spatial.bloom_enabled());
+        assert!(post.ssr_enabled() && post.bloom_enabled() && post.god_rays_enabled());
+        assert!(!post.volumetric_fog_enabled());
+        assert!(full.volumetric_fog_enabled());
+        assert_eq!(RenderFeatureToggles::from_bits(full.bits()), full);
+        assert_eq!(
+            RenderFeatureToggles::from_bits(full.bits() | (1 << 31)),
+            full
+        );
+    }
+
+    #[test]
+    fn feature_switches_preserve_continuous_quality_values() {
+        let settings = RenderQualitySettings::high_quality();
+        let switched = settings.with_features(RenderFeatureToggles::disabled());
+
+        assert_eq!(switched.ssr(), settings.ssr());
+        assert_eq!(switched.ssao(), settings.ssao());
+        assert_eq!(switched.anti_aliasing(), settings.anti_aliasing());
+        assert_eq!(switched.bloom().intensity(), settings.bloom().intensity());
+        assert_eq!(switched.bloom().threshold(), settings.bloom().threshold());
+        assert_eq!(
+            switched.bloom().radius_pixels(),
+            settings.bloom().radius_pixels()
+        );
+        assert_eq!(
+            switched.bloom().god_rays_intensity(),
+            settings.bloom().god_rays_intensity()
+        );
+        assert!(!switched.bloom().volumetric_god_rays());
+        assert!(!switched.fog().enabled());
+        assert_eq!(switched.features(), RenderFeatureToggles::disabled());
+    }
+
+    #[test]
     fn performance_profile_disables_fullscreen_expensive_effects() {
         let settings = RenderQualitySettings::performance();
 
         assert_eq!(settings.ssao().intensity(), 0.0);
         assert_eq!(settings.ssr().intensity(), 0.0);
         assert_eq!(settings.anti_aliasing().blend(), 0.0);
-        assert_eq!(settings.shadow_softening().intensity(), 0.0);
         assert_eq!(settings.bloom().intensity(), 0.0);
         assert_eq!(settings.bloom().god_rays_intensity(), 0.0);
         assert!(!settings.fog().enabled());
-        assert!(!settings.contact_hard_shadows());
     }
 
     #[test]
-    fn contact_hard_shadows_are_explicit_and_high_quality_only_by_default() {
-        assert!(!RenderQualitySettings::interactive().contact_hard_shadows());
-        assert!(!RenderQualitySettings::balanced().contact_hard_shadows());
-        assert!(RenderQualitySettings::high_quality().contact_hard_shadows());
-        assert!(
-            RenderQualitySettings::balanced()
-                .with_contact_hard_shadows(true)
-                .contact_hard_shadows()
-        );
+    fn ssao_profiles_expand_to_bounded_gtao_budgets() {
+        let interactive = RenderQualitySettings::interactive().ssao();
+        let balanced = RenderQualitySettings::balanced().ssao();
+        let high = RenderQualitySettings::high_quality().ssao();
+
+        assert_eq!(interactive.sample_count(), 2);
+        assert_eq!(interactive.slice_count(), 2);
+        assert_eq!(interactive.steps_per_slice(), 2);
+        assert_eq!(interactive.sample_budget(), 8);
+        assert_eq!(balanced.slice_count(), 3);
+        assert_eq!(balanced.steps_per_slice(), 3);
+        assert_eq!(balanced.sample_budget(), 18);
+        assert_eq!(high.slice_count(), 4);
+        assert_eq!(high.steps_per_slice(), 4);
+        assert_eq!(high.sample_budget(), 32);
+        assert!(interactive.sample_budget() < balanced.sample_budget());
+        assert!(balanced.sample_budget() < high.sample_budget());
     }
 
     #[test]
@@ -910,8 +1057,7 @@ mod tests {
             .with_receiver_bias_scale(f32::INFINITY)
             .with_slope_bias_scale(f32::INFINITY)
             .with_normal_offset_scale(f32::NAN)
-            .with_receiver_plane_bias_scale(f32::INFINITY)
-            .with_contact_shadows(true);
+            .with_receiver_plane_bias_scale(f32::INFINITY);
 
         assert_eq!(low.blocker_search_samples(), 4);
         assert_eq!(low.filter_samples(), 4);
@@ -924,7 +1070,6 @@ mod tests {
         assert_eq!(high.slope_bias_scale(), 1.0);
         assert_eq!(high.normal_offset_scale(), 1.0);
         assert_eq!(high.receiver_plane_bias_scale(), 1.0);
-        assert!(high.contact_shadows());
     }
 
     #[test]
@@ -962,16 +1107,6 @@ mod tests {
         assert_eq!(settings.max_steps(), 64);
         assert!(settings.max_distance().is_finite());
         assert_eq!(settings.thickness(), 0.01);
-    }
-
-    #[test]
-    fn shadow_softening_settings_bound_post_work() {
-        let settings = ShadowSofteningQualitySettings::new(5.0, 100.0, f32::INFINITY, -1.0);
-
-        assert_eq!(settings.intensity(), 1.0);
-        assert_eq!(settings.radius_pixels(), 12.0);
-        assert!(settings.depth_sensitivity().is_finite());
-        assert_eq!(settings.max_luma_delta(), 0.005);
     }
 
     #[test]
@@ -1022,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn visual_quality_profiles_have_clear_cost_steps() {
+    fn continuous_quality_profiles_have_clear_cost_steps() {
         let interactive = RenderQualitySettings::interactive();
         let balanced = RenderQualitySettings::balanced();
         let high = RenderQualitySettings::high_quality();

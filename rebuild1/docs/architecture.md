@@ -83,7 +83,7 @@ renderer/
   graph/
     pass 宣言、resource 宣言、barrier、実行順。
   targets/
-    depth, scene color, fixed cascade shadow などの render target。
+    depth, scene color, PCSS ping-pong history, optional TAA history, fixed cascade shadow などの render target。
   assets/
     GPU mesh, GPU texture, material buffer, descriptor。
   import/
@@ -103,9 +103,9 @@ renderer/
 | `Protocol` | command/event/snapshot type | no | raw pointer と Vulkan handle を入れない。 |
 | `RendererTask` | renderer subsystem orchestration | no | dedicated thread で command を順に処理する境界。 |
 | `DeviceContext` | instance, device, queues, debug utils | no | 最長 lifetime。ほかのほぼ全ての親。 |
-| `SwapchainContext` | surface, swapchain, images, image views, render pass, framebuffers | yes | window size と surface format に依存。破棄順は framebuffer -> render pass -> image view -> swapchain。 |
+| `SwapchainContext` | surface, swapchain, images, image views, render pass, framebuffers, PCSS history, optional TAA resources | yes | window size と surface format に依存。破棄順は child framebuffer/target -> pipeline/render pass -> image view -> swapchain。履歴は swapchain extent と常に同期する。 |
 | `FrameResources` | command buffers, fences, semaphores, upload scratch | maybe | frames-in-flight 単位。 |
-| `RenderTargets` | depth, scene color, fixed cascade shadow | partly | scene/post は resize で作り直す。shadow cascade は device lifetime 側に置き、swapchain extent に依存させない。 |
+| `RenderTargets` | depth, scene color, PCSS ping-pong history, optional TAA, fixed cascade shadow | partly | scene/post と history は resize で作り直す。shadow cascade は device lifetime 側に置く。 |
 | `RenderGraph` | pass list, resource state plan | yes | resource が変わったら再構築。 |
 | `AssetStore` | GPU mesh, texture, material buffers | no | resize では壊さない。 |
 | `PipelineLibrary` | shader modules, pipeline layouts, pipelines | maybe | swapchain format や render target format に依存。 |
@@ -134,7 +134,7 @@ renderer/
 6. `RendererTask` が command queue を drain する
 7. `RendererTask` が swapchain image を acquire する
 8. `RendererTask` が `FrameSnapshot` を renderer 内部の `SceneCache` に反映する
-9. `graph` が pass 順に command buffer を記録する
+9. `graph` が shadow -> scene/PCSS history -> dedicated GodRay volume -> optional TAA -> post の pass 順に command buffer を記録する
 10. queue submit
 11. present
 12. renderer が `FramePresented` や error event を返す

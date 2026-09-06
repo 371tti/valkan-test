@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use super::{
     FrameId, FrameSnapshot, FramebufferReadback, FramebufferReadbackOptions, LocalLightPacket,
     MaterialHandle, MeshHandle, MessageEnvelope, NativeSurfacePlatform, NonZeroExtent,
-    RenderQualitySettings, RequestId, SceneHandle, SurfaceDescriptor, SurfaceGeneration, SurfaceId,
-    TextureHandle,
+    RenderFeatureToggles, RenderQualitySettings, RequestId, SceneHandle, SurfaceDescriptor,
+    SurfaceGeneration, SurfaceId, TextureHandle,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -38,8 +38,13 @@ pub enum RendererCommand {
     SetFramebufferReadback {
         options: FramebufferReadbackOptions,
     },
+    /// Updates continuous renderer controls (sample counts, radii, strengths, and resolutions).
     SetQualitySettings {
         settings: RenderQualitySettings,
+    },
+    /// Updates feature ON/OFF switches without changing continuous renderer quality values.
+    SetQualityFeatures {
+        features: RenderFeatureToggles,
     },
     SubmitFrame {
         snapshot: FrameSnapshot,
@@ -63,6 +68,7 @@ impl RendererCommand {
             Self::SetDebugOptions { .. } => "SetDebugOptions",
             Self::SetFramebufferReadback { .. } => "SetFramebufferReadback",
             Self::SetQualitySettings { .. } => "SetQualitySettings",
+            Self::SetQualityFeatures { .. } => "SetQualityFeatures",
             Self::SubmitFrame { .. } => "SubmitFrame",
             Self::CaptureScreenshot { .. } => "CaptureScreenshot",
             Self::Shutdown => "Shutdown",

@@ -154,14 +154,14 @@ BarrierPlan
 Execute callback
 ```
 
-最初の実装では swapchain main pass だけで始めましたが、現在は scene/post/present graph に進んでいます。
+最初の実装では swapchain main pass だけで始めましたが、現在は scene/post/SMAA/present graph に進んでいます。
 
 ```text
 undefined/present -> color_attachment
 color_attachment -> present
 ```
 
-現在は compiled graph が fixed shadow cascades、translucent shadow transmittance、scene color、scene depth、swapchain image の resource state と barrier を管理し、Vulkan executor は shadow cascade -> translucent shadow -> scene -> post -> optional readback -> present side effect の順で記録します。fake shadow graph は置かず、実 target と executor を graph resource に対応させます。
+現在は compiled graph が fixed shadow cascades、translucent shadow transmittance、scene color、scene depth、`PostColor`、SMAA `edgesTex`/`blendTex`、swapchain image の resource state と barrier を管理し、Vulkan executor は shadow cascade -> translucent shadow -> scene -> post composition -> SMAA edge detection -> blending weight calculation -> neighbourhood blending -> optional readback -> present side effect の順で記録します。fake shadow graph は置かず、実 target と executor を graph resource に対応させます。
 
 pass 順序と image layout transition を手作業で各 pass に分散させません。layout transition / barrier は render graph 側に集めます。
 

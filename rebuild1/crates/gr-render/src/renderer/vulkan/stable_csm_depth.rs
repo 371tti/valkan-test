@@ -68,8 +68,8 @@ impl StableCsmDepthArray {
         };
         if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
             unsafe {
-                device.free_memory(memory, None);
                 device.destroy_image(image, None);
+                device.free_memory(memory, None);
             }
             return Err(VulkanError::Vk(error));
         }
@@ -83,8 +83,8 @@ impl StableCsmDepthArray {
             Ok(view) => view,
             Err(error) => {
                 unsafe {
-                    device.free_memory(memory, None);
                     device.destroy_image(image, None);
+                    device.free_memory(memory, None);
                 }
                 return Err(error);
             }
@@ -99,8 +99,8 @@ impl StableCsmDepthArray {
                             device.destroy_image_view(view, None);
                         }
                         device.destroy_image_view(sampled_view, None);
-                        device.free_memory(memory, None);
                         device.destroy_image(image, None);
+                        device.free_memory(memory, None);
                     }
                     return Err(error);
                 }
@@ -155,6 +155,7 @@ impl StableCsmDepthArray {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
                 vk::PipelineStageFlags::TRANSFER,
+                // The first consumer is the scene or dedicated volumetric GodRay fragment path.
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::SHADER_READ,
@@ -175,6 +176,8 @@ impl StableCsmDepthArray {
             self.layer_range(layer),
             vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            // A previous frame may have sampled this layer from the scene or dedicated volumetric
+            // fragment path before it is reused as a depth attachment.
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
@@ -199,6 +202,8 @@ impl StableCsmDepthArray {
             vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            // The current frame's scene and dedicated volumetric GodRay fragment pass sample the
+            // same array after the depth attachment writes.
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             vk::AccessFlags::SHADER_READ,

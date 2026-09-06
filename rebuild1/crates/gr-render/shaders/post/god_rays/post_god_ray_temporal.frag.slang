@@ -57,7 +57,12 @@ void main() {
     float current_luma = luminance_of(current.rgb);
     float history_luma = luminance_of(clamped_history);
     float disocclusion = smoothstep(0.12, 0.65, abs(current_luma - history_luma));
-    float history_weight = lerp(0.86, 0.42, disocclusion);
+    // The shared temporal contract supplies a frame-rate-aware feedback value. The old resolve
+    // used a fixed 0.86 weight, so a moving source could keep a stale layer indefinitely while a
+    // static source received no benefit from the actual sample sequence. Apply the contract first,
+    // then retain the local disocclusion response and the light-motion reduction below.
+    float history_weight = lerp(0.86, 0.42, disocclusion) *
+        saturate(params.temporal.x);
 
     if (params.features.z > 0.5) {
         // The volume is a directional signal, but this low-resolution history has no motion
@@ -72,7 +77,8 @@ void main() {
         float volume_disocclusion = smoothstep(0.035, 0.22, transmittance_change);
         history_weight *= lerp(0.72, 0.30, directional_disocclusion);
         history_weight *= lerp(1.0, 0.32, volume_disocclusion);
-        history_weight = min(history_weight, 0.70);
+        history_weight *= lerp(1.0, 0.28, saturate(params.temporal.y));
+        history_weight = min(history_weight, 0.92);
     }
 
     float3 color = lerp(current.rgb, clamped_history, history_weight);

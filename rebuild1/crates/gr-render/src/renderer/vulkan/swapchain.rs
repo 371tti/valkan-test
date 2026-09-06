@@ -1,13 +1,15 @@
 use ash::{Device, Instance, khr, vk};
 
-use crate::protocol::{CameraSnapshot, FrameSnapshot, NonZeroExtent, RenderQualitySettings};
+use crate::protocol::{
+    CameraSnapshot, FrameSnapshot, LightPacket, NonZeroExtent, RenderQualitySettings,
+};
 
 use super::{
     VulkanDevice, VulkanError,
     bloom::BloomPipeline,
     god_rays::GodRaysPipeline,
     mesh::{MAX_LOCAL_LIGHTS, MeshPassResources, MeshPipelineSet, VulkanMeshStore},
-    post::PostPipeline,
+    post::{PostPipeline, SmaaPipeline},
     stable_csm_depth::{STABLE_CSM_DEPTH_FORMAT, StableCsmDepthArray},
     swapchain_pass::{
         create_bloom_downsample_render_pass, create_bloom_upsample_render_pass,
@@ -15,6 +17,7 @@ use super::{
         create_local_shadow_render_pass, create_post_framebuffer, create_post_render_pass,
         create_scene_fast_framebuffer, create_scene_fast_render_pass, create_scene_framebuffer,
         create_scene_render_pass, create_shadow_framebuffer, create_shadow_render_pass,
+        create_smaa_edge_render_pass, create_smaa_render_pass, create_smaa_weight_render_pass,
         create_translucent_shadow_framebuffer, create_translucent_shadow_render_pass,
         destroy_framebuffer, destroy_render_pass,
     },
@@ -24,12 +27,15 @@ use super::{
         destroy_image_view, initialize_depth_cube_shader_read_image,
         initialize_mipped_color_shader_read_image,
     },
-    taa::{TaaFrameInfo, TemporalAntiAliasing},
+    taa::{
+        TEMPORAL_AA_ENABLED, TaaFrameInfo, TemporalAntiAliasing, TemporalEffectFrame,
+        TemporalEffectsState,
+    },
 };
 use crate::renderer::graph::{
     BLOOM_MIP_COUNT, FrameGraphInitialStates, GOD_RAY_HISTORY_COUNT, GOD_RAY_HISTORY_RESOURCES,
-    GOD_RAY_TEMPORAL_PASS, GraphResource, ResourceState, SHADOW_CASCADE_COUNT,
-    SHADOW_CASCADE_RESOURCES, TRANSLUCENT_SHADOW_RESOURCES,
+    GOD_RAY_TEMPORAL_PASS, GraphResource, PCSS_SHADOW_HISTORY_COUNT, PCSS_SHADOW_HISTORY_RESOURCES,
+    ResourceState, SHADOW_CASCADE_COUNT, SHADOW_CASCADE_RESOURCES, TRANSLUCENT_SHADOW_RESOURCES,
 };
 
 pub(super) const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -41,6 +47,11 @@ pub(super) const STABLE_CSM_LAYER_COUNT: usize = SHADOW_CASCADE_COUNT;
 // lighting to [0, 1], which makes close-camera specular highlights and reflections collapse.
 const SCENE_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+// SMAA intermediate targets are non-sRGB data attachments. The edge pass stores two binary
+// channels and the weight pass stores the four directional AreaTex weights.
+const SMAA_EDGE_FORMAT: vk::Format = vk::Format::R8G8_UNORM;
+const SMAA_WEIGHT_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
 // Opaque metadata fits in UNORM8: oct-encoded normal.xy, roughness, reflectance.
 const SCENE_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 
@@ -48,11 +59,19 @@ const SCENE_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 // UNORM8 would clamp that to 1.0, so post.frag's `transparent.w > 1.0` test can never work.
 const SCENE_TRANSPARENT_NORMAL_ROUGHNESS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-// RGB stores the nearest translucent layer's transmittance while alpha stores its shadow depth.
-// FP16 avoids the 256 depth levels of UNORM8, which visibly terrace thin or sloped receivers.
+// PCSS temporal integration stores visibility in R and the projected receiver depth in G. The
+// depth lane lets the scene shader reject a reprojected sample that crossed a silhouette.
+const PCSS_SHADOW_HISTORY_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+// RGB stores additive log-transmittance for all translucent layers while alpha stores the nearest
+// layer's shadow depth. FP16 avoids the 256 depth levels of UNORM8, which visibly terrace thin or
+// sloped receivers.
 // This sampled color-attachment format is already required by SCENE_COLOR_FORMAT.
 const TRANSLUCENT_SHADOW_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
-const FALLBACK_SHADOW_TRANSMITTANCE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+// The translucent shadow RGB lanes store additive log-transmittance. Keep the fallback target in
+// the same FP16 format as the real cascades; UNORM would clamp the negative logs to zero and make
+// every fallback sample appear fully transparent/black after decode.
+const FALLBACK_SHADOW_TRANSMITTANCE_FORMAT: vk::Format = TRANSLUCENT_SHADOW_FORMAT;
 
 /// Verifies the optimal-tiling features required by the directional shadow pipeline.
 ///
@@ -80,6 +99,13 @@ pub(super) fn validate_shadow_format_support(
             TRANSLUCENT_SHADOW_FORMAT,
             vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE,
             "FP16 translucent shadow",
+        ),
+        (
+            PCSS_SHADOW_HISTORY_FORMAT,
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+            "FP16 PCSS visibility history",
         ),
     ];
 
@@ -119,6 +145,9 @@ pub(super) struct VulkanSwapchain {
     bloom_upsample_render_pass: vk::RenderPass,
     god_ray_render_pass: vk::RenderPass,
     post_render_pass: vk::RenderPass,
+    smaa_edge_render_pass: vk::RenderPass,
+    smaa_weight_render_pass: vk::RenderPass,
+    smaa_render_pass: vk::RenderPass,
     mesh_pipeline: MeshPipelineSet,
     mesh_fast_pipeline: MeshPipelineSet,
     transparent_mesh_pipeline: MeshPipelineSet,
@@ -126,15 +155,28 @@ pub(super) struct VulkanSwapchain {
     bloom_pipeline: BloomPipeline,
     god_rays_pipeline: GodRaysPipeline,
     post_pipeline: PostPipeline,
+    smaa_pipeline: SmaaPipeline,
     taa: TemporalAntiAliasing,
-    scene_framebuffer: vk::Framebuffer,
+    scene_framebuffers: Vec<vk::Framebuffer>,
     scene_fast_framebuffer: vk::Framebuffer,
     bloom: BloomTargets,
     god_rays: GodRayTargets,
     bloom_downsample_framebuffers: Vec<vk::Framebuffer>,
     bloom_upsample_framebuffers: Vec<vk::Framebuffer>,
     god_ray_framebuffers: GodRayFramebuffers,
+    post_color: ColorTarget,
+    post_color_state: ResourceState,
+    post_color_framebuffer: vk::Framebuffer,
+    smaa_edges: ColorTarget,
+    smaa_edges_state: ResourceState,
+    smaa_edge_framebuffer: vk::Framebuffer,
+    smaa_weights: ColorTarget,
+    smaa_weights_state: ResourceState,
+    smaa_weight_framebuffer: vk::Framebuffer,
     post_framebuffers: Vec<vk::Framebuffer>,
+    pcss_history_sampler: vk::Sampler,
+    temporal_effects: TemporalEffectsState,
+    temporal_frame: TemporalEffectFrame,
 }
 
 pub(super) struct ShadowResources {
@@ -178,10 +220,14 @@ struct SceneTargets {
     normal_roughness: ColorTarget,
     transparent_normal_roughness: ColorTarget,
     depth: DepthTarget,
+    pcss_histories: Vec<ColorTarget>,
     color_state: ResourceState,
     normal_roughness_state: ResourceState,
     transparent_normal_roughness_state: ResourceState,
     depth_state: ResourceState,
+    pcss_history_states: [ResourceState; PCSS_SHADOW_HISTORY_COUNT],
+    pcss_history_write_index: usize,
+    pcss_history_valid: bool,
 }
 
 struct BloomLevelTarget {
@@ -231,16 +277,26 @@ impl SceneTargets {
         normal_roughness: ColorTarget,
         transparent_normal_roughness: ColorTarget,
         depth: DepthTarget,
+        pcss_histories: Vec<ColorTarget>,
     ) -> Self {
+        assert_eq!(
+            pcss_histories.len(),
+            PCSS_SHADOW_HISTORY_COUNT,
+            "PCSS shadow history target count must match graph resource count"
+        );
         Self {
             color,
             normal_roughness,
             transparent_normal_roughness,
             depth,
+            pcss_histories,
             color_state: ResourceState::Undefined,
             normal_roughness_state: ResourceState::Undefined,
             transparent_normal_roughness_state: ResourceState::Undefined,
             depth_state: ResourceState::Undefined,
+            pcss_history_states: [ResourceState::Undefined; PCSS_SHADOW_HISTORY_COUNT],
+            pcss_history_write_index: 0,
+            pcss_history_valid: false,
         }
     }
 
@@ -252,6 +308,28 @@ impl SceneTargets {
             self.transparent_normal_roughness_state,
             self.depth_state,
         )
+    }
+
+    fn pcss_history_write_index(&self) -> usize {
+        self.pcss_history_write_index
+    }
+
+    fn pcss_history_valid(&self) -> bool {
+        self.pcss_history_valid
+    }
+
+    fn pcss_history_read_view(&self) -> vk::ImageView {
+        self.pcss_histories[1 - self.pcss_history_write_index].view
+    }
+
+    fn invalidate_pcss_history(&mut self) {
+        self.pcss_history_valid = false;
+        self.pcss_history_write_index = 0;
+        self.pcss_history_states = [ResourceState::Undefined; PCSS_SHADOW_HISTORY_COUNT];
+    }
+
+    fn pcss_history_states(&self) -> [ResourceState; PCSS_SHADOW_HISTORY_COUNT] {
+        self.pcss_history_states
     }
 
     /// Applies graph final states back into the tracked scene attachment states.
@@ -268,6 +346,25 @@ impl SceneTargets {
         if let Some(state) = plan.final_state_for(GraphResource::SceneDepth) {
             self.depth_state = state;
         }
+        for (index, history) in self.pcss_history_states.iter_mut().enumerate() {
+            if let Some(state) = plan.final_state_for(PCSS_SHADOW_HISTORY_RESOURCES[index]) {
+                *history = state;
+            }
+        }
+        if plan.passes().iter().any(|pass| {
+            pass.name() == "scene" && {
+                pass.writes().iter().any(|output| {
+                    output.resource().pcss_shadow_history().is_some()
+                            // A diagnostic pass uses a color-load output solely to transition
+                            // the framebuffer attachment while preserving the history value. Only
+                            // the normal color-clear/write output advances the ping-pong pair.
+                            && output.load() == crate::renderer::graph::LoadOp::Clear
+                })
+            }
+        }) {
+            self.pcss_history_valid = true;
+            self.pcss_history_write_index = 1 - self.pcss_history_write_index;
+        }
     }
 
     /// Resolves one scene graph resource to its image and aspect range.
@@ -282,6 +379,10 @@ impl SceneTargets {
                 vk::ImageAspectFlags::COLOR,
             )),
             GraphResource::SceneDepth => Some((self.depth.image, vk::ImageAspectFlags::DEPTH)),
+            resource if resource.pcss_shadow_history().is_some() => resource
+                .pcss_shadow_history()
+                .and_then(|index| self.pcss_histories.get(index))
+                .map(|target| (target.image, vk::ImageAspectFlags::COLOR)),
             _ => None,
         }
     }
@@ -292,6 +393,9 @@ impl SceneTargets {
         destroy_color_target(device, self.transparent_normal_roughness);
         destroy_color_target(device, self.normal_roughness);
         destroy_color_target(device, self.color);
+        for history in self.pcss_histories {
+            destroy_color_target(device, history);
+        }
     }
 }
 
@@ -496,6 +600,7 @@ struct SwapchainBuild<'a> {
     scene_normal_roughness: Option<ColorTarget>,
     scene_transparent_normal_roughness: Option<ColorTarget>,
     scene_depth: Option<DepthTarget>,
+    pcss_histories: Vec<ColorTarget>,
     bloom_levels: Vec<BloomLevelTarget>,
     god_ray_mask: Option<GodRayTarget>,
     god_ray_prefilter: Option<GodRayTarget>,
@@ -507,6 +612,9 @@ struct SwapchainBuild<'a> {
     bloom_upsample_render_pass: Option<vk::RenderPass>,
     god_ray_render_pass: Option<vk::RenderPass>,
     post_render_pass: Option<vk::RenderPass>,
+    smaa_edge_render_pass: Option<vk::RenderPass>,
+    smaa_weight_render_pass: Option<vk::RenderPass>,
+    smaa_render_pass: Option<vk::RenderPass>,
     mesh_pipeline: Option<MeshPipelineSet>,
     mesh_fast_pipeline: Option<MeshPipelineSet>,
     transparent_mesh_pipeline: Option<MeshPipelineSet>,
@@ -514,13 +622,21 @@ struct SwapchainBuild<'a> {
     bloom_pipeline: Option<BloomPipeline>,
     god_rays_pipeline: Option<GodRaysPipeline>,
     post_pipeline: Option<PostPipeline>,
+    smaa_pipeline: Option<SmaaPipeline>,
     taa: Option<TemporalAntiAliasing>,
-    scene_framebuffer: Option<vk::Framebuffer>,
+    scene_framebuffers: Vec<vk::Framebuffer>,
     scene_fast_framebuffer: Option<vk::Framebuffer>,
     bloom_downsample_framebuffers: Vec<vk::Framebuffer>,
     bloom_upsample_framebuffers: Vec<vk::Framebuffer>,
     god_ray_framebuffers: GodRayFramebuffers,
+    post_color: Option<ColorTarget>,
+    post_color_framebuffer: Option<vk::Framebuffer>,
+    smaa_edges: Option<ColorTarget>,
+    smaa_edge_framebuffer: Option<vk::Framebuffer>,
+    smaa_weights: Option<ColorTarget>,
+    smaa_weight_framebuffer: Option<vk::Framebuffer>,
     post_framebuffers: Vec<vk::Framebuffer>,
+    pcss_history_sampler: Option<vk::Sampler>,
     finished: bool,
 }
 
@@ -547,6 +663,7 @@ impl<'a> SwapchainBuild<'a> {
             scene_normal_roughness: None,
             scene_transparent_normal_roughness: None,
             scene_depth: None,
+            pcss_histories: Vec::new(),
             bloom_levels: Vec::new(),
             god_ray_mask: None,
             god_ray_prefilter: None,
@@ -558,6 +675,9 @@ impl<'a> SwapchainBuild<'a> {
             bloom_upsample_render_pass: None,
             god_ray_render_pass: None,
             post_render_pass: None,
+            smaa_edge_render_pass: None,
+            smaa_weight_render_pass: None,
+            smaa_render_pass: None,
             mesh_pipeline: None,
             mesh_fast_pipeline: None,
             transparent_mesh_pipeline: None,
@@ -565,13 +685,21 @@ impl<'a> SwapchainBuild<'a> {
             bloom_pipeline: None,
             god_rays_pipeline: None,
             post_pipeline: None,
+            smaa_pipeline: None,
             taa: None,
-            scene_framebuffer: None,
+            scene_framebuffers: Vec::new(),
             scene_fast_framebuffer: None,
             bloom_downsample_framebuffers: Vec::new(),
             bloom_upsample_framebuffers: Vec::new(),
             god_ray_framebuffers: GodRayFramebuffers::default(),
+            post_color: None,
+            post_color_framebuffer: None,
+            smaa_edges: None,
+            smaa_edge_framebuffer: None,
+            smaa_weights: None,
+            smaa_weight_framebuffer: None,
             post_framebuffers: Vec::new(),
+            pcss_history_sampler: None,
             finished: false,
         }
     }
@@ -597,6 +725,7 @@ impl<'a> SwapchainBuild<'a> {
                     "scene transparent normal roughness",
                 ),
                 take_created(&mut self.scene_depth, "scene depth"),
+                std::mem::take(&mut self.pcss_histories),
             ),
             scene_render_pass: take_created(&mut self.scene_render_pass, "scene render pass"),
             scene_fast_render_pass: take_created(
@@ -613,6 +742,15 @@ impl<'a> SwapchainBuild<'a> {
             ),
             god_ray_render_pass: take_created(&mut self.god_ray_render_pass, "god-ray render pass"),
             post_render_pass: take_created(&mut self.post_render_pass, "post render pass"),
+            smaa_edge_render_pass: take_created(
+                &mut self.smaa_edge_render_pass,
+                "SMAA edge render pass",
+            ),
+            smaa_weight_render_pass: take_created(
+                &mut self.smaa_weight_render_pass,
+                "SMAA weight render pass",
+            ),
+            smaa_render_pass: take_created(&mut self.smaa_render_pass, "SMAA render pass"),
             mesh_pipeline: take_created(&mut self.mesh_pipeline, "mesh pipeline"),
             mesh_fast_pipeline: take_created(&mut self.mesh_fast_pipeline, "fast mesh pipeline"),
             transparent_mesh_pipeline: take_created(
@@ -626,8 +764,9 @@ impl<'a> SwapchainBuild<'a> {
             bloom_pipeline: take_created(&mut self.bloom_pipeline, "bloom pipeline"),
             god_rays_pipeline: take_created(&mut self.god_rays_pipeline, "god-ray pipeline"),
             post_pipeline: take_created(&mut self.post_pipeline, "post pipeline"),
+            smaa_pipeline: take_created(&mut self.smaa_pipeline, "SMAA pipeline"),
             taa: take_created(&mut self.taa, "temporal anti-aliasing"),
-            scene_framebuffer: take_created(&mut self.scene_framebuffer, "scene framebuffer"),
+            scene_framebuffers: std::mem::take(&mut self.scene_framebuffers),
             scene_fast_framebuffer: take_created(
                 &mut self.scene_fast_framebuffer,
                 "fast scene framebuffer",
@@ -642,7 +781,31 @@ impl<'a> SwapchainBuild<'a> {
             bloom_downsample_framebuffers: std::mem::take(&mut self.bloom_downsample_framebuffers),
             bloom_upsample_framebuffers: std::mem::take(&mut self.bloom_upsample_framebuffers),
             god_ray_framebuffers: std::mem::take(&mut self.god_ray_framebuffers),
+            post_color: take_created(&mut self.post_color, "post color target"),
+            post_color_state: ResourceState::Undefined,
+            post_color_framebuffer: take_created(
+                &mut self.post_color_framebuffer,
+                "post color framebuffer",
+            ),
+            smaa_edges: take_created(&mut self.smaa_edges, "SMAA edge target"),
+            smaa_edges_state: ResourceState::Undefined,
+            smaa_edge_framebuffer: take_created(
+                &mut self.smaa_edge_framebuffer,
+                "SMAA edge framebuffer",
+            ),
+            smaa_weights: take_created(&mut self.smaa_weights, "SMAA weight target"),
+            smaa_weights_state: ResourceState::Undefined,
+            smaa_weight_framebuffer: take_created(
+                &mut self.smaa_weight_framebuffer,
+                "SMAA weight framebuffer",
+            ),
             post_framebuffers: std::mem::take(&mut self.post_framebuffers),
+            pcss_history_sampler: take_created(
+                &mut self.pcss_history_sampler,
+                "PCSS history sampler",
+            ),
+            temporal_effects: TemporalEffectsState::default(),
+            temporal_frame: TemporalEffectFrame::default(),
         };
         self.finished = true;
         swapchain
@@ -658,6 +821,15 @@ impl Drop for SwapchainBuild<'_> {
 
         self.device
             .destroy_framebuffers(std::mem::take(&mut self.post_framebuffers));
+        if let Some(framebuffer) = self.smaa_weight_framebuffer.take() {
+            destroy_framebuffer(&self.device.device, framebuffer);
+        }
+        if let Some(framebuffer) = self.smaa_edge_framebuffer.take() {
+            destroy_framebuffer(&self.device.device, framebuffer);
+        }
+        if let Some(framebuffer) = self.post_color_framebuffer.take() {
+            destroy_framebuffer(&self.device.device, framebuffer);
+        }
         std::mem::take(&mut self.god_ray_framebuffers).destroy(&self.device.device);
         self.device
             .destroy_framebuffers(std::mem::take(&mut self.bloom_upsample_framebuffers));
@@ -666,10 +838,13 @@ impl Drop for SwapchainBuild<'_> {
         if let Some(framebuffer) = self.scene_fast_framebuffer.take() {
             destroy_framebuffer(&self.device.device, framebuffer);
         }
-        if let Some(framebuffer) = self.scene_framebuffer.take() {
+        for framebuffer in std::mem::take(&mut self.scene_framebuffers) {
             destroy_framebuffer(&self.device.device, framebuffer);
         }
         if let Some(pipeline) = self.post_pipeline.take() {
+            pipeline.destroy(&self.device.device);
+        }
+        if let Some(pipeline) = self.smaa_pipeline.take() {
             pipeline.destroy(&self.device.device);
         }
         if let Some(pipeline) = self.god_rays_pipeline.take() {
@@ -702,6 +877,9 @@ impl Drop for SwapchainBuild<'_> {
                 .destroy_pipeline_set(&self.device.device, pipeline);
         }
         for render_pass in [
+            self.smaa_render_pass.take(),
+            self.smaa_weight_render_pass.take(),
+            self.smaa_edge_render_pass.take(),
             self.post_render_pass.take(),
             self.god_ray_render_pass.take(),
             self.bloom_upsample_render_pass.take(),
@@ -735,6 +913,15 @@ impl Drop for SwapchainBuild<'_> {
         if let Some(target) = self.god_ray_mask.take() {
             destroy_color_target(&self.device.device, target.color);
         }
+        if let Some(target) = self.post_color.take() {
+            destroy_color_target(&self.device.device, target);
+        }
+        if let Some(target) = self.smaa_weights.take() {
+            destroy_color_target(&self.device.device, target);
+        }
+        if let Some(target) = self.smaa_edges.take() {
+            destroy_color_target(&self.device.device, target);
+        }
         if let Some(normal_roughness) = self.scene_normal_roughness.take() {
             destroy_color_target(&self.device.device, normal_roughness);
         }
@@ -743,6 +930,12 @@ impl Drop for SwapchainBuild<'_> {
         }
         if let Some(color) = self.scene_color.take() {
             destroy_color_target(&self.device.device, color);
+        }
+        for target in std::mem::take(&mut self.pcss_histories) {
+            destroy_color_target(&self.device.device, target);
+        }
+        if let Some(sampler) = self.pcss_history_sampler.take() {
+            unsafe { self.device.device.destroy_sampler(sampler, None) };
         }
         self.device
             .destroy_image_views(std::mem::take(&mut self.image_views));
@@ -954,7 +1147,9 @@ impl ShadowSamplerFallback {
             queue,
             transmittance.image,
             1,
-            [1.0; 4],
+            // RGB is additive log-transmittance (zero means no transparent attenuation); alpha is
+            // the nearest transparent depth and starts at the far plane.
+            [0.0, 0.0, 0.0, 1.0],
         ) {
             directional_depth.destroy(device);
             destroy_depth_cube_target(device, local_depth);
@@ -1091,7 +1286,7 @@ impl VulkanDevice {
                 self.graphics_queue,
                 cascade.transmittance.image,
                 1,
-                [1.0; 4],
+                [0.0, 0.0, 0.0, 1.0],
             )?;
             cascade.transmittance_state = ResourceState::ShaderRead;
         }
@@ -1242,6 +1437,15 @@ impl VulkanDevice {
             DEPTH_FORMAT,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
         )?);
+        for _ in 0..PCSS_SHADOW_HISTORY_COUNT {
+            build.pcss_histories.push(create_color_target(
+                &self.device,
+                &self.memory_properties,
+                config.extent,
+                PCSS_SHADOW_HISTORY_FORMAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            )?);
+        }
         build.bloom_levels = create_bloom_targets(
             &self.device,
             &self.memory_properties,
@@ -1258,6 +1462,28 @@ impl VulkanDevice {
         build.god_ray_prefilter = Some(god_ray_targets.prefilter);
         build.god_ray_blur = Some(god_ray_targets.blur);
         build.god_ray_histories = god_ray_targets.histories;
+        build.pcss_history_sampler = Some(create_pcss_history_sampler(&self.device)?);
+        build.post_color = Some(create_color_target(
+            &self.device,
+            &self.memory_properties,
+            config.extent,
+            SCENE_COLOR_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        )?);
+        build.smaa_edges = Some(create_color_target(
+            &self.device,
+            &self.memory_properties,
+            config.extent,
+            SMAA_EDGE_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        )?);
+        build.smaa_weights = Some(create_color_target(
+            &self.device,
+            &self.memory_properties,
+            config.extent,
+            SMAA_WEIGHT_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        )?);
 
         let scene_color = build
             .scene_color
@@ -1275,12 +1501,25 @@ impl VulkanDevice {
             .scene_depth
             .as_ref()
             .expect("scene depth was just created");
+        let post_color = build
+            .post_color
+            .as_ref()
+            .expect("post color target was just created");
+        let smaa_edges = build
+            .smaa_edges
+            .as_ref()
+            .expect("SMAA edge target was just created");
+        let smaa_weights = build
+            .smaa_weights
+            .as_ref()
+            .expect("SMAA weight target was just created");
 
         build.scene_render_pass = Some(create_scene_render_pass(
             &self.device,
             scene_color.format,
             scene_normal_roughness.format,
             scene_transparent_normal_roughness.format,
+            PCSS_SHADOW_HISTORY_FORMAT,
             scene_depth.format,
         )?);
         build.scene_fast_render_pass = Some(create_scene_fast_render_pass(
@@ -1300,7 +1539,16 @@ impl VulkanDevice {
             &self.device,
             SCENE_COLOR_FORMAT,
         )?);
-        build.post_render_pass = Some(create_post_render_pass(&self.device, config.format)?);
+        build.post_render_pass = Some(create_post_render_pass(&self.device, SCENE_COLOR_FORMAT)?);
+        build.smaa_edge_render_pass = Some(create_smaa_edge_render_pass(
+            &self.device,
+            SMAA_EDGE_FORMAT,
+        )?);
+        build.smaa_weight_render_pass = Some(create_smaa_weight_render_pass(
+            &self.device,
+            SMAA_WEIGHT_FORMAT,
+        )?);
+        build.smaa_render_pass = Some(create_smaa_render_pass(&self.device, config.format)?);
 
         let scene_render_pass = build
             .scene_render_pass
@@ -1320,6 +1568,15 @@ impl VulkanDevice {
         let post_render_pass = build
             .post_render_pass
             .expect("post render pass was just created");
+        let smaa_edge_render_pass = build
+            .smaa_edge_render_pass
+            .expect("SMAA edge render pass was just created");
+        let smaa_weight_render_pass = build
+            .smaa_weight_render_pass
+            .expect("SMAA weight render pass was just created");
+        let smaa_render_pass = build
+            .smaa_render_pass
+            .expect("SMAA render pass was just created");
 
         build.mesh_pipeline = Some(
             self.meshes
@@ -1342,16 +1599,12 @@ impl VulkanDevice {
             &self.memory_properties,
             config.extent,
             self.frames.slot_count(),
+            TEMPORAL_AA_ENABLED,
             scene_color.view,
             scene_depth.view,
             scene_normal_roughness.view,
             scene_transparent_normal_roughness.view,
         )?);
-        let taa_history_views = build
-            .taa
-            .as_ref()
-            .expect("temporal anti-aliasing was just created")
-            .history_views();
         let bloom_views = build
             .bloom_levels
             .iter()
@@ -1361,13 +1614,25 @@ impl VulkanDevice {
             &self.device,
             bloom_downsample_render_pass,
             bloom_upsample_render_pass,
-            taa_history_views,
+            scene_color.view,
             &bloom_views,
         )?);
         let god_ray_history_views = [
             build.god_ray_histories[0].color.view,
             build.god_ray_histories[1].color.view,
         ];
+        let god_ray_taa_depth_views = if TEMPORAL_AA_ENABLED {
+            build
+                .taa
+                .as_ref()
+                .expect("TAA state was just created")
+                .depth_history_views()
+        } else {
+            // The spatial SMAA production path has no TAA depth history. Bind the current scene
+            // depth to the reserved descriptors so validation never sees null image views; the
+            // shader only samples these bindings when the temporal path is explicitly enabled.
+            [scene_depth.view; 2]
+        };
         build.god_rays_pipeline = Some(GodRaysPipeline::create(
             &self.device,
             god_ray_render_pass,
@@ -1376,6 +1641,8 @@ impl VulkanDevice {
             scene_depth.view,
             scene_transparent_normal_roughness.view,
             self.shadow_fallback.directional_depth.sampled_view,
+            self.shadow_fallback.translucent_shadow_views(),
+            god_ray_taa_depth_views,
             build
                 .god_ray_mask
                 .as_ref()
@@ -1399,23 +1666,40 @@ impl VulkanDevice {
         build.post_pipeline = Some(PostPipeline::create(
             &self.device,
             post_render_pass,
-            taa_history_views,
+            scene_color.view,
             scene_depth.view,
             scene_normal_roughness.view,
             scene_transparent_normal_roughness.view,
             bloom_views[0],
             god_ray_history_views,
         )?);
-
-        build.scene_framebuffer = Some(create_scene_framebuffer(
+        build.smaa_pipeline = Some(SmaaPipeline::create(
             &self.device,
-            scene_render_pass,
-            scene_color.view,
-            scene_normal_roughness.view,
-            scene_transparent_normal_roughness.view,
-            scene_depth.view,
-            config.extent,
+            &self.memory_properties,
+            self.queue_family_index,
+            self.graphics_queue,
+            [
+                smaa_edge_render_pass,
+                smaa_weight_render_pass,
+                smaa_render_pass,
+            ],
+            post_color.view,
+            smaa_edges.view,
+            smaa_weights.view,
         )?);
+
+        for history in &build.pcss_histories {
+            build.scene_framebuffers.push(create_scene_framebuffer(
+                &self.device,
+                scene_render_pass,
+                scene_color.view,
+                scene_normal_roughness.view,
+                scene_transparent_normal_roughness.view,
+                history.view,
+                scene_depth.view,
+                config.extent,
+            )?);
+        }
         build.scene_fast_framebuffer = Some(create_scene_fast_framebuffer(
             &self.device,
             scene_fast_render_pass,
@@ -1433,8 +1717,26 @@ impl VulkanDevice {
             create_bloom_framebuffers(&self.device, bloom_upsample_render_pass, upsample_levels)?;
         build.god_ray_framebuffers =
             create_god_ray_framebuffers(&self.device, god_ray_render_pass, &build)?;
+        build.post_color_framebuffer = Some(create_post_framebuffer(
+            &self.device,
+            post_render_pass,
+            post_color.view,
+            config.extent,
+        )?);
+        build.smaa_edge_framebuffer = Some(create_post_framebuffer(
+            &self.device,
+            smaa_edge_render_pass,
+            smaa_edges.view,
+            config.extent,
+        )?);
+        build.smaa_weight_framebuffer = Some(create_post_framebuffer(
+            &self.device,
+            smaa_weight_render_pass,
+            smaa_weights.view,
+            config.extent,
+        )?);
         build.post_framebuffers =
-            self.create_post_framebuffers(post_render_pass, &build.image_views, config.extent)?;
+            self.create_post_framebuffers(smaa_render_pass, &build.image_views, config.extent)?;
 
         tracing::info!(
             width = config.extent.width(),
@@ -1445,7 +1747,7 @@ impl VulkanDevice {
                 + build.bloom_downsample_framebuffers.len()
                 + build.bloom_upsample_framebuffers.len()
                 + build.god_ray_framebuffers.count()
-                + 2,
+                + 5,
             format = ?config.format,
             present_mode = ?config.present_mode,
             transfer_src_supported = config.transfer_src_supported,
@@ -1466,7 +1768,7 @@ impl VulkanDevice {
                 + swapchain.bloom_downsample_framebuffers.len()
                 + swapchain.bloom_upsample_framebuffers.len()
                 + swapchain.god_ray_framebuffers.count()
-                + 2,
+                + 5,
             format = ?swapchain.format,
             color_space = ?swapchain.color_space,
             present_mode = ?swapchain.present_mode,
@@ -1474,12 +1776,16 @@ impl VulkanDevice {
         );
 
         self.destroy_framebuffers(swapchain.post_framebuffers);
+        destroy_framebuffer(&self.device, swapchain.smaa_weight_framebuffer);
+        destroy_framebuffer(&self.device, swapchain.smaa_edge_framebuffer);
+        destroy_framebuffer(&self.device, swapchain.post_color_framebuffer);
         swapchain.god_ray_framebuffers.destroy(&self.device);
         self.destroy_framebuffers(swapchain.bloom_upsample_framebuffers);
         self.destroy_framebuffers(swapchain.bloom_downsample_framebuffers);
         destroy_framebuffer(&self.device, swapchain.scene_fast_framebuffer);
-        destroy_framebuffer(&self.device, swapchain.scene_framebuffer);
+        self.destroy_framebuffers(swapchain.scene_framebuffers);
         swapchain.post_pipeline.destroy(&self.device);
+        swapchain.smaa_pipeline.destroy(&self.device);
         swapchain.god_rays_pipeline.destroy(&self.device);
         swapchain.bloom_pipeline.destroy(&self.device);
         swapchain.taa.destroy(&self.device);
@@ -1491,6 +1797,9 @@ impl VulkanDevice {
             .destroy_pipeline_set(&self.device, swapchain.transparent_mesh_pipeline);
         self.meshes
             .destroy_pipeline_set(&self.device, swapchain.transparent_mesh_fast_pipeline);
+        destroy_render_pass(&self.device, swapchain.smaa_render_pass);
+        destroy_render_pass(&self.device, swapchain.smaa_weight_render_pass);
+        destroy_render_pass(&self.device, swapchain.smaa_edge_render_pass);
         destroy_render_pass(&self.device, swapchain.post_render_pass);
         destroy_render_pass(&self.device, swapchain.god_ray_render_pass);
         destroy_render_pass(&self.device, swapchain.bloom_upsample_render_pass);
@@ -1499,7 +1808,14 @@ impl VulkanDevice {
         destroy_render_pass(&self.device, swapchain.scene_render_pass);
         swapchain.bloom.destroy(&self.device);
         swapchain.god_rays.destroy(&self.device);
+        destroy_color_target(&self.device, swapchain.post_color);
+        destroy_color_target(&self.device, swapchain.smaa_weights);
+        destroy_color_target(&self.device, swapchain.smaa_edges);
         swapchain.scene.destroy(&self.device);
+        unsafe {
+            self.device
+                .destroy_sampler(swapchain.pcss_history_sampler, None)
+        };
         self.destroy_image_views(swapchain.image_views);
         self.destroy_swapchain_handle(swapchain.handle);
     }
@@ -1596,9 +1912,24 @@ impl VulkanSwapchain {
         self.scene_fast_render_pass
     }
 
-    /// Returns the post render pass that writes the acquired swapchain image.
+    /// Returns the composition render pass that writes the intermediate post-color target.
     pub(super) fn post_render_pass(&self) -> vk::RenderPass {
         self.post_render_pass
+    }
+
+    /// Returns the SMAA edge-detection render pass that writes the RG edge field.
+    pub(super) fn smaa_edge_render_pass(&self) -> vk::RenderPass {
+        self.smaa_edge_render_pass
+    }
+
+    /// Returns the SMAA weight-calculation render pass that writes the RGBA blend field.
+    pub(super) fn smaa_weight_render_pass(&self) -> vk::RenderPass {
+        self.smaa_weight_render_pass
+    }
+
+    /// Returns the final SMAA neighbourhood render pass that writes the acquired swapchain image.
+    pub(super) fn smaa_render_pass(&self) -> vk::RenderPass {
+        self.smaa_render_pass
     }
 
     /// Returns the render pass that extracts and downsamples HDR bloom mips.
@@ -1641,6 +1972,11 @@ impl VulkanSwapchain {
         &self.post_pipeline
     }
 
+    /// Returns the three-pass SMAA pipeline owner.
+    pub(super) fn smaa_pipeline(&self) -> &SmaaPipeline {
+        &self.smaa_pipeline
+    }
+
     pub(super) fn prepare_taa_frame(
         &mut self,
         device: &Device,
@@ -1649,6 +1985,8 @@ impl VulkanSwapchain {
         camera: CameraSnapshot,
         quality: RenderQualitySettings,
         use_corrected_scene_color: bool,
+        volumetric_input: bool,
+        temporal_aa_enabled: bool,
     ) -> Result<TaaFrameInfo, VulkanError> {
         self.taa.prepare_frame(
             device,
@@ -1658,6 +1996,8 @@ impl VulkanSwapchain {
             quality,
             self.extent_2d(),
             use_corrected_scene_color,
+            volumetric_input,
+            temporal_aa_enabled,
         )
     }
 
@@ -1673,8 +2013,55 @@ impl VulkanSwapchain {
         self.taa.history_write_index()
     }
 
+    /// Returns whether the previous TAA depth history is safe for pre-TAA consumers.  The legacy
+    /// GodRay mask runs before the current TAA pass, so it must fall back to the jitter-corrected
+    /// scene depth during a camera cut or on the first frame instead of reading stale metadata.
+    pub(super) fn taa_stable_metadata_valid(&self) -> bool {
+        self.taa.stable_metadata_valid()
+    }
+
     pub(super) fn taa_jitter_pixels(&self) -> [f32; 2] {
         self.taa.pending_jitter_pixels()
+    }
+
+    /// Prepares the shared temporal contract used by the volumetric shaft and PCSS visibility.
+    pub(super) fn prepare_temporal_effects(
+        &mut self,
+        snapshot: &FrameSnapshot,
+        camera: CameraSnapshot,
+        light: LightPacket,
+    ) {
+        self.temporal_frame =
+            self.temporal_effects
+                .prepare(snapshot, camera, self.extent_2d(), light);
+    }
+
+    pub(super) fn temporal_frame(&self) -> TemporalEffectFrame {
+        self.temporal_frame
+    }
+
+    pub(super) fn pcss_history_write_index(&self) -> usize {
+        self.scene.pcss_history_write_index()
+    }
+
+    pub(super) fn pcss_history_valid(&self) -> bool {
+        self.scene.pcss_history_valid()
+    }
+
+    pub(super) fn pcss_history_read_view(&self) -> vk::ImageView {
+        self.scene.pcss_history_read_view()
+    }
+
+    pub(super) fn pcss_history_sampler(&self) -> vk::Sampler {
+        self.pcss_history_sampler
+    }
+
+    /// Invalidates both effect histories and their shared camera/light reprojection state after a
+    /// quality or medium-model change.
+    pub(super) fn invalidate_temporal_effects(&mut self) {
+        self.scene.invalidate_pcss_history();
+        self.temporal_effects.invalidate();
+        self.temporal_frame = TemporalEffectFrame::default();
     }
 
     /// Returns the bloom pipeline compatible with this swapchain's bloom passes.
@@ -1687,19 +2074,41 @@ impl VulkanSwapchain {
         &self.god_rays_pipeline
     }
 
-    /// Updates the CSM view used by the quality volumetric mask pass.
+    /// Returns the framebuffer used by the complete post-composition pass.
+    pub(super) fn post_color_framebuffer(&self) -> vk::Framebuffer {
+        self.post_color_framebuffer
+    }
+
+    pub(super) fn smaa_edge_framebuffer(&self) -> vk::Framebuffer {
+        self.smaa_edge_framebuffer
+    }
+
+    pub(super) fn smaa_weight_framebuffer(&self) -> vk::Framebuffer {
+        self.smaa_weight_framebuffer
+    }
+
+    /// Updates the CSM and translucent shadow views used by the dedicated volume.
     pub(super) fn update_god_ray_shadow_view(
         &mut self,
         device: &Device,
         image_view: vk::ImageView,
+        translucent_shadow_views: [vk::ImageView; SHADOW_CASCADE_COUNT],
     ) {
-        self.god_rays_pipeline
-            .update_directional_shadow_view(device, image_view);
+        self.god_rays_pipeline.update_directional_shadow_view(
+            device,
+            image_view,
+            translucent_shadow_views,
+        );
     }
 
-    /// Returns the CSM view currently bound by the volumetric mask pass.
-    pub(super) fn god_ray_shadow_view(&self) -> vk::ImageView {
-        self.god_rays_pipeline.directional_shadow_view()
+    /// Returns whether the live dedicated GodRay descriptors point at the current shadow targets.
+    pub(super) fn god_ray_shadow_views_changed(
+        &self,
+        directional_shadow_view: vk::ImageView,
+        translucent_shadow_views: &[vk::ImageView; SHADOW_CASCADE_COUNT],
+    ) -> bool {
+        self.god_rays_pipeline
+            .shadow_views_changed(directional_shadow_view, translucent_shadow_views)
     }
 
     /// Returns the number of images owned by this swapchain.
@@ -1725,8 +2134,17 @@ impl VulkanSwapchain {
     }
 
     /// Returns the framebuffer used by the graph scene pass.
-    pub(super) fn scene_framebuffer(&self) -> vk::Framebuffer {
-        self.scene_framebuffer
+    pub(super) fn scene_framebuffer(
+        &self,
+        history_index: usize,
+    ) -> Result<vk::Framebuffer, VulkanError> {
+        let index = history_index % PCSS_SHADOW_HISTORY_COUNT;
+        self.scene_framebuffers.get(index).copied().ok_or(
+            VulkanError::SwapchainImageIndexOutOfRange {
+                index,
+                count: self.scene_framebuffers.len(),
+            },
+        )
     }
 
     /// Returns the lightweight scene framebuffer used without material metadata.
@@ -1847,6 +2265,7 @@ impl VulkanSwapchain {
             scene_transparent_normal_roughness_state,
             scene_depth_state,
         ) = self.scene.graph_states();
+        let pcss_history_states = self.scene.pcss_history_states();
         let (taa_histories, taa_depth_histories, taa_normal_histories, motion_vectors) =
             self.taa.graph_states();
         Ok(FrameGraphInitialStates::new(
@@ -1858,6 +2277,8 @@ impl VulkanSwapchain {
             scene_transparent_normal_roughness_state,
             scene_depth_state,
         )
+        .with_post_color(self.post_color_state)
+        .with_smaa(self.smaa_edges_state, self.smaa_weights_state)
         .with_bloom_mips(self.bloom.graph_states())
         .with_god_rays(
             self.god_rays.mask.state,
@@ -1865,6 +2286,7 @@ impl VulkanSwapchain {
             self.god_rays.blur.state,
             self.god_rays.history_states(),
         )
+        .with_pcss_shadow_histories(pcss_history_states)
         .with_taa(
             taa_histories,
             taa_depth_histories,
@@ -1883,9 +2305,19 @@ impl VulkanSwapchain {
             *self.image_state_mut(image_index)? = state;
         }
         self.scene.apply_graph_final_states(plan);
+        if let Some(state) = plan.final_state_for(GraphResource::PostColor) {
+            self.post_color_state = state;
+        }
+        if let Some(state) = plan.final_state_for(GraphResource::SmaaEdges) {
+            self.smaa_edges_state = state;
+        }
+        if let Some(state) = plan.final_state_for(GraphResource::SmaaWeights) {
+            self.smaa_weights_state = state;
+        }
         self.bloom.apply_graph_final_states(plan);
         self.god_rays.apply_graph_final_states(plan);
         self.taa.apply_graph_final_states(plan);
+        self.temporal_effects.commit();
         Ok(())
     }
 
@@ -1913,6 +2345,15 @@ impl VulkanSwapchain {
         if let Some(image) = self.taa.graph_image(resource) {
             return Ok(image);
         }
+        if resource == GraphResource::PostColor {
+            return Ok((self.post_color.image, vk::ImageAspectFlags::COLOR));
+        }
+        if resource == GraphResource::SmaaEdges {
+            return Ok((self.smaa_edges.image, vk::ImageAspectFlags::COLOR));
+        }
+        if resource == GraphResource::SmaaWeights {
+            return Ok((self.smaa_weights.image, vk::ImageAspectFlags::COLOR));
+        }
         match resource {
             GraphResource::SwapchainImage => Ok((
                 self.image_for_index(image_index)?,
@@ -1922,6 +2363,9 @@ impl VulkanSwapchain {
             | GraphResource::SceneNormalRoughness
             | GraphResource::SceneTransparentNormalRoughness
             | GraphResource::SceneDepth
+            | GraphResource::PostColor
+            | GraphResource::SmaaEdges
+            | GraphResource::SmaaWeights
             | GraphResource::BloomMip0
             | GraphResource::BloomMip1
             | GraphResource::BloomMip2
@@ -1932,6 +2376,8 @@ impl VulkanSwapchain {
             | GraphResource::GodRayBlur
             | GraphResource::GodRayHistory0
             | GraphResource::GodRayHistory1
+            | GraphResource::PcssShadowHistory0
+            | GraphResource::PcssShadowHistory1
             | GraphResource::TaaHistory0
             | GraphResource::TaaHistory1
             | GraphResource::TaaDepthHistory0
@@ -2023,6 +2469,11 @@ impl ShadowResources {
     /// Returns the shared raw-depth descriptors used while rendering translucent shadow casters.
     pub(super) fn translucent_pass_resources(&self) -> &MeshPassResources {
         &self.mesh_pass_resources
+    }
+
+    /// Returns the fixed translucent transmittance views consumed by dedicated God Rays.
+    pub(super) fn translucent_shadow_views(&self) -> [vk::ImageView; SHADOW_CASCADE_COUNT] {
+        cascade_views(&self.cascades, |cascade| cascade.transmittance.view)
     }
 
     /// Returns the common render extent of every Stable CSM cascade layer.
@@ -2123,8 +2574,7 @@ impl ShadowResources {
         resource: GraphResource,
     ) -> Option<(vk::Image, vk::ImageAspectFlags)> {
         SHADOW_CASCADE_RESOURCES
-            .iter()
-            .any(|candidate| *candidate == resource)
+            .contains(&resource)
             .then_some((self.directional_depth.image, vk::ImageAspectFlags::DEPTH))
             .or_else(|| {
                 TRANSLUCENT_SHADOW_RESOURCES
@@ -2228,6 +2678,11 @@ impl ShadowSamplerFallback {
     /// Returns descriptors that bind full-light dummy shadow maps at the mesh pass set.
     pub(super) fn mesh_pass_resources(&self) -> &MeshPassResources {
         &self.mesh_pass_resources
+    }
+
+    /// Returns full-transmittance fallback views for dedicated GodRay translucent inputs.
+    pub(super) fn translucent_shadow_views(&self) -> [vk::ImageView; SHADOW_CASCADE_COUNT] {
+        [self.transmittance.view; SHADOW_CASCADE_COUNT]
     }
 
     /// Releases the dummy descriptor set and its tiny sampled images.
@@ -2485,8 +2940,12 @@ fn bloom_mip_extent(full_extent: NonZeroExtent, mip_index: usize) -> NonZeroExte
 }
 
 fn god_ray_extent(full_extent: NonZeroExtent) -> NonZeroExtent {
-    let width = (full_extent.width() / 4).max(1);
-    let height = (full_extent.height() / 4).max(1);
+    // The dedicated volumetric camera-ray march runs at half resolution. A quarter-resolution
+    // field left each sample responsible for a 4x4 screen footprint, so a foliage/CSM silhouette
+    // was reconstructed as a broad rectangular sheet before the bilateral upscale could reject
+    // it. Half resolution keeps the 48-step march bounded while shrinking that footprint to 2x2.
+    let width = (full_extent.width() / 2).max(1);
+    let height = (full_extent.height() / 2).max(1);
 
     NonZeroExtent::new(width, height).expect("god-ray extent must be non-zero")
 }
@@ -2778,6 +3237,20 @@ fn destroy_local_shadow_cube(device: &Device, local: LocalShadowCube) {
         destroy_framebuffer(device, framebuffer);
     }
     destroy_depth_cube_target(device, local.depth);
+}
+
+/// Creates the linear/clamped sampler used for the full-resolution PCSS visibility history.
+fn create_pcss_history_sampler(device: &Device) -> Result<vk::Sampler, VulkanError> {
+    let create_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .min_lod(0.0)
+        .max_lod(0.0);
+    unsafe { device.create_sampler(&create_info, None) }.map_err(VulkanError::Vk)
 }
 
 #[cfg(test)]

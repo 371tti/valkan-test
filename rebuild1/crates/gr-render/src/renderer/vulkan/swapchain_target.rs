@@ -2,7 +2,11 @@ use ash::{Device, vk};
 
 use crate::protocol::NonZeroExtent;
 
-use super::{VulkanError, buffer::find_memory_type, immediate::submit_immediate_commands};
+use super::{
+    VulkanError,
+    buffer::{create_buffer_with_data, find_memory_type},
+    immediate::{submit_immediate_commands, transition_image},
+};
 
 pub(super) struct ColorTarget {
     pub(super) image: vk::Image,
@@ -11,6 +15,151 @@ pub(super) struct ColorTarget {
     pub(super) sampled_view: vk::ImageView,
     pub(super) mip_views: Vec<vk::ImageView>,
     pub(super) format: vk::Format,
+}
+
+/// A small immutable lookup texture uploaded once with the swapchain.
+///
+/// SMAA's area/search tables are regular sampled images, but unlike frame targets they never
+/// participate in the frame graph. Keeping their ownership explicit prevents the post pipeline
+/// from accidentally borrowing a staging buffer or a transient target.
+pub(super) struct LookupTexture {
+    pub(super) image: vk::Image,
+    pub(super) memory: vk::DeviceMemory,
+    pub(super) view: vk::ImageView,
+}
+
+/// Uploads one tightly-packed single-mip lookup image and leaves it shader-readable.
+pub(super) fn create_lookup_texture(
+    device: &Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue_family_index: u32,
+    queue: vk::Queue,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    bytes: &[u8],
+) -> Result<LookupTexture, VulkanError> {
+    let staging = create_buffer_with_data(
+        device,
+        memory_properties,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        bytes,
+    )?;
+    let create_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = match unsafe { device.create_image(&create_info, None) } {
+        Ok(image) => image,
+        Err(error) => {
+            staging.destroy(device);
+            return Err(VulkanError::Vk(error));
+        }
+    };
+    let memory = match allocate_image_memory(device, memory_properties, image) {
+        Ok(memory) => memory,
+        Err(error) => {
+            destroy_image(device, image);
+            staging.destroy(device);
+            return Err(error);
+        }
+    };
+    if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
+        destroy_image(device, image);
+        free_memory(device, memory);
+        staging.destroy(device);
+        return Err(VulkanError::Vk(error));
+    }
+
+    let upload = submit_immediate_commands(device, queue_family_index, queue, |command_buffer| {
+        transition_image(
+            device,
+            command_buffer,
+            image,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::TRANSFER_WRITE,
+        );
+        let subresource = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(subresource)
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+        // The lookup data is tightly packed; row_length=0 asks Vulkan to use the image width.
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                command_buffer,
+                staging.handle(),
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+        transition_image(
+            device,
+            command_buffer,
+            image,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+        );
+    });
+    staging.destroy(device);
+    if let Err(error) = upload {
+        destroy_image(device, image);
+        free_memory(device, memory);
+        return Err(error);
+    }
+
+    let view = match create_color_image_view(device, image, format) {
+        Ok(view) => view,
+        Err(error) => {
+            destroy_image(device, image);
+            free_memory(device, memory);
+            return Err(error);
+        }
+    };
+    Ok(LookupTexture {
+        image,
+        memory,
+        view,
+    })
+}
+
+/// Destroys one immutable SMAA lookup texture.
+pub(super) fn destroy_lookup_texture(device: &Device, texture: LookupTexture) {
+    destroy_image_view(device, texture.view);
+    destroy_image(device, texture.image);
+    free_memory(device, texture.memory);
 }
 
 pub(super) struct DepthTarget {
@@ -160,15 +309,15 @@ pub(super) fn create_color_target(
         }
     };
     if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
-        free_memory(device, memory);
         destroy_image(device, image);
+        free_memory(device, memory);
         return Err(VulkanError::Vk(error));
     }
     let view = match create_color_image_view(device, image, format) {
         Ok(view) => view,
         Err(error) => {
-            free_memory(device, memory);
             destroy_image(device, image);
+            free_memory(device, memory);
             return Err(error);
         }
     };
@@ -223,15 +372,15 @@ pub(super) fn create_depth_target(
         }
     };
     if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
-        free_memory(device, memory);
         destroy_image(device, image);
+        free_memory(device, memory);
         return Err(VulkanError::Vk(error));
     }
     let view = match create_depth_image_view(device, image, format) {
         Ok(view) => view,
         Err(error) => {
-            free_memory(device, memory);
             destroy_image(device, image);
+            free_memory(device, memory);
             return Err(error);
         }
     };
@@ -285,15 +434,15 @@ pub(super) fn create_depth_cube_target(
         }
     };
     if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
-        free_memory(device, memory);
         destroy_image(device, image);
+        free_memory(device, memory);
         return Err(VulkanError::Vk(error));
     }
     let view = match create_depth_cube_image_view(device, image, format) {
         Ok(view) => view,
         Err(error) => {
-            free_memory(device, memory);
             destroy_image(device, image);
+            free_memory(device, memory);
             return Err(error);
         }
     };
@@ -301,8 +450,8 @@ pub(super) fn create_depth_cube_target(
         Ok(views) => views,
         Err(error) => {
             destroy_image_view(device, view);
-            free_memory(device, memory);
             destroy_image(device, image);
+            free_memory(device, memory);
             return Err(error);
         }
     };
@@ -331,15 +480,15 @@ pub(super) fn destroy_color_target(device: &Device, color: ColorTarget) {
         destroy_image_view(device, color.sampled_view);
     }
     destroy_image_view(device, color.view);
-    free_memory(device, color.memory);
     destroy_image(device, color.image);
+    free_memory(device, color.memory);
 }
 
 /// Destroys a depth target after all framebuffers that reference it are gone.
 pub(super) fn destroy_depth_target(device: &Device, depth: DepthTarget) {
     destroy_image_view(device, depth.view);
-    free_memory(device, depth.memory);
     destroy_image(device, depth.image);
+    free_memory(device, depth.memory);
 }
 
 /// Destroys a cubemap depth target after all face framebuffers are gone.
@@ -348,8 +497,8 @@ pub(super) fn destroy_depth_cube_target(device: &Device, depth: DepthCubeTarget)
         destroy_image_view(device, view);
     }
     destroy_image_view(device, depth.view);
-    free_memory(device, depth.memory);
     destroy_image(device, depth.image);
+    free_memory(device, depth.memory);
 }
 
 /// Destroys one image view.

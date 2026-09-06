@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
@@ -12,9 +13,10 @@ use gr_render::{
     protocol::{
         DebugDraw, DebugViewMode, FrameId, FrameSnapshot, FrameSnapshotBuilder,
         FramebufferReadbackOptions, LightPacket, LoadedAsset, MessageEnvelope, NativeSurfaceHandle,
-        NonZeroExtent, RenderItemPacket, RenderQualitySettings, RendererCommand, RendererEndpoint,
-        RendererEvent, SceneHandle, SnapshotError, SurfaceDescriptor, SurfaceGeneration, SurfaceId,
-        TransportError, ViewId, ViewPacket, Win32SurfaceHandle, WindowId,
+        NonZeroExtent, RenderFeatureToggles, RenderItemPacket, RenderQualitySettings,
+        RendererCommand, RendererEndpoint, RendererEvent, SceneHandle, SnapshotError,
+        SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, ViewId, ViewPacket,
+        Win32SurfaceHandle, WindowId,
     },
     renderer::{RendererError, RendererThread, VulkanRendererBackend, spawn_renderer_thread},
 };
@@ -47,6 +49,8 @@ const MAX_WINDOW_LIGHT_INTENSITY: f32 = 24.0;
 const LIGHT_CHANGE_STOPS_PER_SECOND: f32 = 1.6;
 const DAY_NIGHT_CYCLE_SECONDS: f32 = 10.0 * 60.0;
 const WINDOW_ASSET_ENV: &str = "REBUILD1_WINDOW_ASSET";
+const WINDOW_QUALITY_ENV: &str = "REBUILD1_WINDOW_QUALITY";
+const WINDOW_QUALITY_SEQUENCE_ENV: &str = "REBUILD1_WINDOW_QUALITY_SEQUENCE";
 const WINDOW_TRANSPORT_CAPACITY: usize = 32;
 const WINDOW_SMOKE_FRAMES_ENV: &str = "REBUILD1_WINDOW_SMOKE_FRAMES";
 const DEFAULT_WINDOW_SMOKE_FRAMES: u64 = 6;
@@ -129,6 +133,8 @@ pub enum WindowedRunError {
     Snapshot(#[from] SnapshotError),
     #[error("window asset load failed: {reason}")]
     AssetLoadFailed { reason: String },
+    #[error("window smoke requires an existing asset path")]
+    AssetRequired,
     #[error("static protocol id {name} was configured as zero")]
     StaticIdZero { name: &'static str },
 }
@@ -241,6 +247,7 @@ pub fn run_windowed_smoke() -> Result<(), WindowedRunError> {
 
 /// Runs a native winit window with an explicit protocol-facing window config.
 pub fn run_windowed_with_config(config: WindowConfig) -> Result<(), WindowedRunError> {
+    validate_window_config(&config)?;
     tracing::info!(
         window_id = config.window_id.raw(),
         width = config.extent.width(),
@@ -281,6 +288,17 @@ pub fn run_windowed_with_config(config: WindowConfig) -> Result<(), WindowedRunE
     Ok(())
 }
 
+/// Rejects configurations that promise an asset-backed frame limit without an asset request.
+fn validate_window_config(config: &WindowConfig) -> Result<(), WindowedRunError> {
+    if config.frame_limit_requires_loaded_asset
+        && config.presented_frame_limit.is_some()
+        && config.asset_path.is_none()
+    {
+        return Err(WindowedRunError::AssetRequired);
+    }
+    Ok(())
+}
+
 /// Joins the renderer while keeping the app-side event receiver drained.
 fn join_renderer_with_live_events(
     renderer: RendererThread,
@@ -314,6 +332,7 @@ struct WindowedApp {
     camera_effects: CameraEffectController,
     latest_framebuffer_metering: Option<CameraMetering>,
     quality_preset: WindowQualityPreset,
+    quality_sequence: VecDeque<WindowQualityPreset>,
     debug_view_mode: DebugViewMode,
     light_intensity: f32,
     day_night_started_at: Instant,
@@ -325,6 +344,7 @@ struct WindowedApp {
     mouse_captured: bool,
     presented_frames: u64,
     presented_loaded_asset_frames: u64,
+    submitted_asset_frames: HashSet<FrameId>,
     next_frame_raw: u64,
     next_surface_generation_raw: u64,
 }
@@ -348,6 +368,28 @@ enum WindowQualityPreset {
 }
 
 impl WindowQualityPreset {
+    /// Parses the quality name used by automated smoke runs and local launch scripts.
+    fn from_name(name: Option<&str>) -> Self {
+        match name.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("performance") => Self::Performance,
+            Some("interactive") => Self::Interactive,
+            Some("balanced") => Self::Balanced,
+            Some("high") | Some("high_quality") | Some("high-quality") => Self::HighQuality,
+            _ => INITIAL_WINDOW_QUALITY,
+        }
+    }
+
+    /// Parses one quality token used by an automated transition smoke run.
+    fn from_sequence_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "1" | "performance" => Some(Self::Performance),
+            "2" | "interactive" => Some(Self::Interactive),
+            "3" | "balanced" => Some(Self::Balanced),
+            "4" | "high" | "high_quality" | "high-quality" => Some(Self::HighQuality),
+            _ => None,
+        }
+    }
+
     fn from_key(physical_key: PhysicalKey) -> Option<Self> {
         match physical_key {
             PhysicalKey::Code(KeyCode::Digit1) | PhysicalKey::Code(KeyCode::Numpad1) => {
@@ -375,6 +417,7 @@ impl WindowQualityPreset {
         }
     }
 
+    /// Returns the continuous renderer profile sent by this keyboard preset.
     fn settings(self) -> RenderQualitySettings {
         match self {
             Self::Performance => RenderQualitySettings::performance(),
@@ -383,6 +426,48 @@ impl WindowQualityPreset {
             Self::HighQuality => RenderQualitySettings::high_quality(),
         }
     }
+
+    /// Returns the ON/OFF feature set sent by this keyboard preset.
+    fn features(self) -> RenderFeatureToggles {
+        match self {
+            Self::Performance => RenderFeatureToggles::disabled(),
+            Self::Interactive => RenderFeatureToggles::spatial(),
+            Self::Balanced => RenderFeatureToggles::post(),
+            Self::HighQuality => RenderFeatureToggles::full(),
+        }
+    }
+}
+
+/// Selects the initial window quality without changing the interactive keyboard controls.
+fn configured_window_quality() -> WindowQualityPreset {
+    WindowQualityPreset::from_name(std::env::var(WINDOW_QUALITY_ENV).ok().as_deref())
+}
+
+/// Reads an optional comma-separated quality transition sequence for smoke validation.
+fn configured_window_quality_sequence() -> VecDeque<WindowQualityPreset> {
+    let Some(value) = std::env::var(WINDOW_QUALITY_SEQUENCE_ENV).ok() else {
+        return VecDeque::new();
+    };
+    if value.trim().is_empty() {
+        return VecDeque::new();
+    }
+
+    let sequence: VecDeque<_> = value
+        .split(',')
+        .filter_map(WindowQualityPreset::from_sequence_token)
+        .collect();
+    if sequence.is_empty() {
+        tracing::warn!(
+            value = %value,
+            "ignoring empty window quality transition sequence"
+        );
+    } else {
+        tracing::info!(
+            sequence = ?sequence.iter().map(|preset| preset.label()).collect::<Vec<_>>(),
+            "configured window quality transition sequence"
+        );
+    }
+    sequence
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -435,7 +520,8 @@ impl WindowedApp {
             camera: FreeCamera::default(),
             camera_effects: CameraEffectController::default(),
             latest_framebuffer_metering: None,
-            quality_preset: INITIAL_WINDOW_QUALITY,
+            quality_preset: configured_window_quality(),
+            quality_sequence: configured_window_quality_sequence(),
             debug_view_mode: DebugViewMode::Disabled,
             light_intensity: DEFAULT_WINDOW_LIGHT_INTENSITY,
             day_night_started_at: now,
@@ -447,6 +533,7 @@ impl WindowedApp {
             mouse_captured: false,
             presented_frames: 0,
             presented_loaded_asset_frames: 0,
+            submitted_asset_frames: HashSet::new(),
             next_frame_raw: 1,
             next_surface_generation_raw,
         }
@@ -497,18 +584,31 @@ impl WindowedApp {
         Ok(())
     }
 
-    /// Sends the current window-selected renderer quality profile.
+    /// Sends the current window-selected continuous profile and feature switches.
     fn configure_quality_preset(
         &self,
         preset: WindowQualityPreset,
     ) -> Result<(), WindowedRunError> {
+        let settings = preset.settings();
+        let features = preset.features();
+        let shadow = settings.stable_csm_pcss();
         tracing::info!(
             quality = preset.label(),
+            feature_bits = features.bits(),
+            ssao = features.ssao_enabled(),
+            ssr = features.ssr_enabled(),
+            anti_aliasing = features.anti_aliasing_enabled(),
+            bloom = features.bloom_enabled(),
+            god_rays = features.god_rays_enabled(),
+            volumetric_fog = features.volumetric_fog_enabled(),
+            pcss_blocker_samples = shadow.blocker_search_samples(),
+            pcss_filter_samples = shadow.filter_samples(),
+            pcss_light_radius_degrees = shadow.light_angular_radius_degrees(),
+            shadow_map_resolution = shadow.shadow_map_resolution(),
             "sending window renderer quality preset"
         );
-        self.send_command(RendererCommand::SetQualitySettings {
-            settings: preset.settings(),
-        })?;
+        self.send_command(RendererCommand::SetQualitySettings { settings })?;
+        self.send_command(RendererCommand::SetQualityFeatures { features })?;
         Ok(())
     }
 
@@ -699,6 +799,9 @@ impl WindowedApp {
         match self.endpoint.try_send(command) {
             Ok(()) => {
                 self.frame_in_flight = true;
+                if self.loaded_asset.is_some() {
+                    self.submitted_asset_frames.insert(frame_id);
+                }
                 self.next_frame_at = Instant::now() + self.frame_interval;
                 tracing::trace!(
                     frame_id = frame_id.raw(),
@@ -736,7 +839,8 @@ impl WindowedApp {
         let mut builder =
             FrameSnapshotBuilder::new(frame_id, scene, self.config.surface_id, drawable.generation);
         builder
-            .add_view(ViewPacket::new(view, drawable.extent).with_camera(self.camera.snapshot()));
+            .add_view(ViewPacket::new(view, drawable.extent).with_camera(self.camera.snapshot()))
+            .set_frame_rate_hz(1.0 / self.frame_interval.as_secs_f32());
         let light = day_night_light(
             self.day_night_started_at.elapsed().as_secs_f32(),
             self.light_intensity,
@@ -822,10 +926,7 @@ impl WindowedApp {
     /// Allocates the next non-zero protocol frame id for the window loop.
     fn next_frame_id(&mut self) -> Result<FrameId, WindowedRunError> {
         let raw = self.next_frame_raw;
-        self.next_frame_raw = match raw.checked_add(1) {
-            Some(next) => next,
-            None => 1,
-        };
+        self.next_frame_raw = raw.checked_add(1).unwrap_or(1);
 
         FrameId::from_raw(raw).ok_or(WindowedRunError::StaticIdZero { name: "frame" })
     }
@@ -999,7 +1100,7 @@ impl WindowedApp {
                     frame_id: presented_id,
                 } => {
                     self.presented_frames += 1;
-                    if self.loaded_asset.is_some() {
+                    if self.submitted_asset_frames.remove(&presented_id) {
                         self.presented_loaded_asset_frames += 1;
                     }
                     tracing::trace!(
@@ -1009,11 +1110,13 @@ impl WindowedApp {
                         "renderer presented window frame"
                     );
                     self.frame_in_flight = false;
+                    self.advance_quality_sequence()?;
                 }
                 RendererEvent::FrameDropped {
                     frame_id: dropped_id,
                     reason,
                 } => {
+                    self.submitted_asset_frames.remove(&dropped_id);
                     tracing::trace!(
                         frame_id = dropped_id.raw(),
                         reason = reason.name(),
@@ -1062,6 +1165,9 @@ impl WindowedApp {
                     }
                 }
                 RendererEvent::ValidationWarning { message } if frame_id.is_some() => {
+                    if let Some(frame_id) = frame_id {
+                        self.submitted_asset_frames.remove(&frame_id);
+                    }
                     tracing::trace!(
                         frame_id = frame_id.map(|id| id.raw()),
                         message,
@@ -1089,7 +1195,7 @@ impl WindowedApp {
             return false;
         };
 
-        if self.config.frame_limit_requires_loaded_asset && self.config.asset_path.is_some() {
+        if self.config.frame_limit_requires_loaded_asset {
             self.presented_loaded_asset_frames >= limit
         } else {
             self.presented_frames >= limit
@@ -1224,7 +1330,7 @@ impl WindowedApp {
         }
     }
 
-    /// Sends a renderer quality update selected by a number key.
+    /// Sends the continuous profile and feature switches selected by a number key.
     fn set_quality_preset(&mut self, preset: WindowQualityPreset) -> Result<(), TransportError> {
         if self.quality_preset == preset {
             tracing::trace!(
@@ -1234,17 +1340,39 @@ impl WindowedApp {
             return Ok(());
         }
 
-        match self.send_command(RendererCommand::SetQualitySettings {
-            settings: preset.settings(),
-        }) {
-            Ok(()) => {
-                self.quality_preset = preset;
-                tracing::info!(
-                    quality = preset.label(),
-                    "updated window renderer quality preset"
-                );
-                Ok(())
-            }
+        let settings = preset.settings();
+        let features = preset.features();
+        match self.send_command(RendererCommand::SetQualitySettings { settings }) {
+            Ok(()) => match self.send_command(RendererCommand::SetQualityFeatures { features }) {
+                Ok(()) => {
+                    self.quality_preset = preset;
+                    let shadow = settings.stable_csm_pcss();
+                    tracing::info!(
+                        quality = preset.label(),
+                        feature_bits = features.bits(),
+                        ssao = features.ssao_enabled(),
+                        ssr = features.ssr_enabled(),
+                        anti_aliasing = features.anti_aliasing_enabled(),
+                        bloom = features.bloom_enabled(),
+                        god_rays = features.god_rays_enabled(),
+                        volumetric_fog = features.volumetric_fog_enabled(),
+                        pcss_blocker_samples = shadow.blocker_search_samples(),
+                        pcss_filter_samples = shadow.filter_samples(),
+                        pcss_light_radius_degrees = shadow.light_angular_radius_degrees(),
+                        shadow_map_resolution = shadow.shadow_map_resolution(),
+                        "updated window renderer quality preset"
+                    );
+                    Ok(())
+                }
+                Err(TransportError::Full) => {
+                    tracing::trace!(
+                        quality = preset.label(),
+                        "quality feature update skipped because command channel is full"
+                    );
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
             Err(TransportError::Full) => {
                 tracing::trace!(
                     quality = preset.label(),
@@ -1254,6 +1382,22 @@ impl WindowedApp {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Sends the next automated quality transition after a frame has retired on the GPU.
+    fn advance_quality_sequence(&mut self) -> Result<(), TransportError> {
+        // Wait until the asset-backed frame path is active.  A transition before the asset load
+        // only exercises dormant post resources and cannot cover the shadow/volumetric ownership that
+        // makes interactive `1 -> 4 -> 1 -> 4` changes risky.
+        if self.loaded_asset.is_none() {
+            return Ok(());
+        }
+
+        let Some(preset) = self.quality_sequence.pop_front() else {
+            return Ok(());
+        };
+
+        self.set_quality_preset(preset)
     }
 
     /// Converts raw captured mouse movement into camera look deltas.
@@ -1533,6 +1677,24 @@ mod tests {
     }
 
     #[test]
+    fn loaded_asset_frame_limit_requires_an_asset_path() {
+        let extent = NonZeroExtent::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+            .expect("test extent should be non-zero");
+        let window_id = WindowId::from_raw(DEFAULT_WINDOW_ID).expect("test window id");
+        let surface_id = SurfaceId::from_raw(DEFAULT_SURFACE_ID).expect("test surface id");
+        let generation =
+            SurfaceGeneration::from_raw(DEFAULT_SURFACE_GENERATION).expect("test generation");
+        let config = WindowConfig::new("test", extent, window_id, surface_id, generation)
+            .with_presented_frame_limit(1)
+            .require_loaded_asset_before_frame_limit();
+
+        assert!(matches!(
+            validate_window_config(&config),
+            Err(WindowedRunError::AssetRequired)
+        ));
+    }
+
+    #[test]
     fn number_keys_select_window_quality_presets() {
         assert_eq!(
             WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Digit1)),
@@ -1558,6 +1720,84 @@ mod tests {
             WindowQualityPreset::from_key(PhysicalKey::Code(KeyCode::Digit5)),
             None
         );
+
+        assert_eq!(
+            WindowQualityPreset::Performance.features(),
+            RenderFeatureToggles::disabled()
+        );
+        assert_eq!(
+            WindowQualityPreset::Interactive.features(),
+            RenderFeatureToggles::spatial()
+        );
+        assert_eq!(
+            WindowQualityPreset::Balanced.features(),
+            RenderFeatureToggles::post()
+        );
+        assert_eq!(
+            WindowQualityPreset::HighQuality.features(),
+            RenderFeatureToggles::full()
+        );
+        assert_eq!(
+            WindowQualityPreset::Performance
+                .settings()
+                .stable_csm_pcss(),
+            RenderQualitySettings::performance().stable_csm_pcss()
+        );
+        assert_eq!(
+            WindowQualityPreset::Interactive
+                .settings()
+                .stable_csm_pcss(),
+            RenderQualitySettings::interactive().stable_csm_pcss()
+        );
+        assert_eq!(
+            WindowQualityPreset::Balanced.settings().stable_csm_pcss(),
+            RenderQualitySettings::balanced().stable_csm_pcss()
+        );
+        assert_eq!(
+            WindowQualityPreset::HighQuality
+                .settings()
+                .stable_csm_pcss(),
+            RenderQualitySettings::high_quality().stable_csm_pcss()
+        );
+    }
+
+    #[test]
+    fn named_window_quality_defaults_safely_and_accepts_smoke_aliases() {
+        assert_eq!(WindowQualityPreset::from_name(None), INITIAL_WINDOW_QUALITY);
+        assert_eq!(
+            WindowQualityPreset::from_name(Some(" PERFORMANCE ")),
+            WindowQualityPreset::Performance
+        );
+        assert_eq!(
+            WindowQualityPreset::from_name(Some("high")),
+            WindowQualityPreset::HighQuality
+        );
+        assert_eq!(
+            WindowQualityPreset::from_name(Some("high-quality")),
+            WindowQualityPreset::HighQuality
+        );
+        assert_eq!(
+            WindowQualityPreset::from_name(Some("unknown")),
+            INITIAL_WINDOW_QUALITY
+        );
+    }
+
+    #[test]
+    fn quality_sequence_tokens_match_number_keys_and_ignore_unknown_tokens() {
+        let sequence: Vec<_> = "1, 4,performance,unknown,high-quality"
+            .split(',')
+            .filter_map(WindowQualityPreset::from_sequence_token)
+            .collect();
+
+        assert_eq!(
+            sequence,
+            vec![
+                WindowQualityPreset::Performance,
+                WindowQualityPreset::HighQuality,
+                WindowQualityPreset::Performance,
+                WindowQualityPreset::HighQuality,
+            ]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1569,15 +1809,26 @@ mod tests {
         app.handle_keyboard(PhysicalKey::Code(KeyCode::Digit2), ElementState::Pressed)
             .expect("quality key should send renderer command");
 
-        let command = inbox
+        let settings_command = inbox
             .recv_command()
             .await
-            .expect("quality command should be received");
+            .expect("continuous quality command should be received");
 
         assert!(matches!(
-            command.payload,
+            settings_command.payload,
             RendererCommand::SetQualitySettings { settings }
                 if settings == RenderQualitySettings::interactive()
+        ));
+
+        let features_command = inbox
+            .recv_command()
+            .await
+            .expect("feature quality command should be received");
+
+        assert!(matches!(
+            features_command.payload,
+            RendererCommand::SetQualityFeatures { features }
+                if features == RenderFeatureToggles::spatial()
         ));
     }
 
@@ -1611,6 +1862,11 @@ mod tests {
             DebugViewMode::Normals,
             DebugViewMode::Depth,
             DebugViewMode::PcssFilterRadius,
+            DebugViewMode::SmaaEdges,
+            DebugViewMode::SmaaWeights,
+            DebugViewMode::Ssao,
+            DebugViewMode::PcssVisibilityRaw,
+            DebugViewMode::PcssHistory,
             DebugViewMode::Disabled,
         ];
         for mode in expected {

@@ -10,3 +10,6 @@
 /.codex-target
 /.codex
 /.agents
+# Local renderer audit output (never part of source or test artifacts).
+/.codex-*.log
+/rebuild1/.codex-*.log

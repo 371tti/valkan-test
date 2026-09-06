@@ -4,12 +4,21 @@ use thiserror::Error;
 
 const SCENE_PASS: &str = "scene";
 const POST_PASS: &str = "post";
+pub(crate) const SMAA_EDGE_PASS: &str = "smaa_edges";
+pub(crate) const SMAA_WEIGHT_PASS: &str = "smaa_weights";
+pub(crate) const SMAA_PASS: &str = "smaa";
+pub(crate) const SMAA_BLEND_PASS: &str = SMAA_PASS;
 const FRAMEBUFFER_READBACK_PASS: &str = "framebuffer_readback";
 const PRESENT_PASS: &str = "present";
 pub(crate) const GOD_RAY_MASK_PASS: &str = "god_ray_mask";
 pub(crate) const GOD_RAY_PREFILTER_PASS: &str = "god_ray_prefilter";
 pub(crate) const GOD_RAY_RADIAL_PASS: &str = "god_ray_radial";
 pub(crate) const GOD_RAY_TEMPORAL_PASS: &str = "god_ray_temporal";
+pub(crate) const PCSS_SHADOW_HISTORY_COUNT: usize = 2;
+pub(crate) const PCSS_SHADOW_HISTORY_RESOURCES: [GraphResource; PCSS_SHADOW_HISTORY_COUNT] = [
+    GraphResource::PcssShadowHistory0,
+    GraphResource::PcssShadowHistory1,
+];
 pub(crate) const TAA_RESOLVE_PASS: &str = "taa_resolve";
 const BLOOM_DOWNSAMPLE_PASSES: [&str; BLOOM_MIP_COUNT] = [
     "bloom_downsample_0",
@@ -57,6 +66,9 @@ pub(crate) enum GraphResource {
     SceneNormalRoughness,
     SceneTransparentNormalRoughness,
     SceneDepth,
+    PostColor,
+    SmaaEdges,
+    SmaaWeights,
     BloomMip0,
     BloomMip1,
     BloomMip2,
@@ -74,6 +86,8 @@ pub(crate) enum GraphResource {
     TaaNormalHistory0,
     TaaNormalHistory1,
     MotionVectors,
+    PcssShadowHistory0,
+    PcssShadowHistory1,
 }
 
 impl GraphResource {
@@ -125,6 +139,15 @@ impl GraphResource {
         }
     }
 
+    /// Returns the PCSS-only visibility history index.
+    pub(crate) fn pcss_shadow_history(self) -> Option<usize> {
+        match self {
+            Self::PcssShadowHistory0 => Some(0),
+            Self::PcssShadowHistory1 => Some(1),
+            _ => None,
+        }
+    }
+
     /// Returns the HDR temporal color-history index for one ping-pong resource.
     pub(crate) fn taa_history(self) -> Option<usize> {
         match self {
@@ -167,6 +190,9 @@ impl GraphResource {
             Self::SceneNormalRoughness => "scene_normal_roughness",
             Self::SceneTransparentNormalRoughness => "scene_transparent_normal_roughness",
             Self::SceneDepth => "scene_depth",
+            Self::PostColor => "post_color",
+            Self::SmaaEdges => "smaa_edges",
+            Self::SmaaWeights => "smaa_weights",
             Self::BloomMip0 => "bloom_mip_0",
             Self::BloomMip1 => "bloom_mip_1",
             Self::BloomMip2 => "bloom_mip_2",
@@ -184,6 +210,8 @@ impl GraphResource {
             Self::TaaNormalHistory0 => "taa_normal_history_0",
             Self::TaaNormalHistory1 => "taa_normal_history_1",
             Self::MotionVectors => "motion_vectors",
+            Self::PcssShadowHistory0 => "pcss_shadow_history_0",
+            Self::PcssShadowHistory1 => "pcss_shadow_history_1",
             Self::ShadowCascade0
             | Self::ShadowCascade1
             | Self::ShadowCascade2
@@ -682,6 +710,9 @@ pub(crate) struct FrameGraphInitialStates {
     scene_normal_roughness: ResourceState,
     scene_transparent_normal_roughness: ResourceState,
     scene_depth: ResourceState,
+    post_color: ResourceState,
+    smaa_edges: ResourceState,
+    smaa_weights: ResourceState,
     bloom_mips: [ResourceState; BLOOM_MIP_COUNT],
     god_ray_mask: ResourceState,
     god_ray_prefilter: ResourceState,
@@ -691,6 +722,7 @@ pub(crate) struct FrameGraphInitialStates {
     taa_depth_histories: [ResourceState; TAA_HISTORY_COUNT],
     taa_normal_histories: [ResourceState; TAA_HISTORY_COUNT],
     motion_vectors: ResourceState,
+    pcss_shadow_histories: [ResourceState; PCSS_SHADOW_HISTORY_COUNT],
 }
 
 impl FrameGraphInitialStates {
@@ -712,6 +744,9 @@ impl FrameGraphInitialStates {
             scene_normal_roughness,
             scene_transparent_normal_roughness,
             scene_depth,
+            post_color: ResourceState::Undefined,
+            smaa_edges: ResourceState::Undefined,
+            smaa_weights: ResourceState::Undefined,
             bloom_mips: [ResourceState::Undefined; BLOOM_MIP_COUNT],
             god_ray_mask: ResourceState::Undefined,
             god_ray_prefilter: ResourceState::Undefined,
@@ -721,6 +756,7 @@ impl FrameGraphInitialStates {
             taa_depth_histories: [ResourceState::Undefined; TAA_HISTORY_COUNT],
             taa_normal_histories: [ResourceState::Undefined; TAA_HISTORY_COUNT],
             motion_vectors: ResourceState::Undefined,
+            pcss_shadow_histories: [ResourceState::Undefined; PCSS_SHADOW_HISTORY_COUNT],
         }
     }
 
@@ -760,6 +796,28 @@ impl FrameGraphInitialStates {
         self
     }
 
+    /// Overrides the persistent PCSS visibility history states.
+    pub(crate) fn with_pcss_shadow_histories(
+        mut self,
+        histories: [ResourceState; PCSS_SHADOW_HISTORY_COUNT],
+    ) -> Self {
+        self.pcss_shadow_histories = histories;
+        self
+    }
+
+    /// Overrides the persistent complete post-composition target state.
+    pub(crate) fn with_post_color(mut self, state: ResourceState) -> Self {
+        self.post_color = state;
+        self
+    }
+
+    /// Overrides the persistent edge and weight targets used by the three SMAA passes.
+    pub(crate) fn with_smaa(mut self, edges: ResourceState, weights: ResourceState) -> Self {
+        self.smaa_edges = edges;
+        self.smaa_weights = weights;
+        self
+    }
+
     /// Returns the current state of the acquired swapchain image.
     pub(crate) fn swapchain_image(self) -> ResourceState {
         self.swapchain_image
@@ -793,6 +851,19 @@ impl FrameGraphInitialStates {
     /// Returns the current state of the persistent scene depth target.
     pub(crate) fn scene_depth(self) -> ResourceState {
         self.scene_depth
+    }
+
+    /// Returns the current state of the complete post-composition target consumed by final SMAA.
+    pub(crate) fn post_color(self) -> ResourceState {
+        self.post_color
+    }
+
+    pub(crate) fn smaa_edges(self) -> ResourceState {
+        self.smaa_edges
+    }
+
+    pub(crate) fn smaa_weights(self) -> ResourceState {
+        self.smaa_weights
     }
 
     /// Returns the current state of every persistent bloom mip target.
@@ -834,6 +905,10 @@ impl FrameGraphInitialStates {
 
     pub(crate) fn motion_vectors(self) -> ResourceState {
         self.motion_vectors
+    }
+
+    pub(crate) fn pcss_shadow_histories(self) -> [ResourceState; PCSS_SHADOW_HISTORY_COUNT] {
+        self.pcss_shadow_histories
     }
 }
 
@@ -981,10 +1056,12 @@ impl FrameGraphPlan {
             taa,
             taa_history_write_index,
             false,
+            0,
+            false,
         )
     }
 
-    /// Builds the frame graph with the optional CSM dependency used by true volumetric god rays.
+    /// Builds the frame graph with the optional CSM dependency used by dedicated volumetric god rays.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa_mode(
         clear_color: [f32; 4],
@@ -999,7 +1076,9 @@ impl FrameGraphPlan {
         god_ray_history_write_index: usize,
         taa: bool,
         taa_history_write_index: usize,
-        volumetric_god_rays: bool,
+        pcss_shadow_temporal: bool,
+        pcss_history_write_index: usize,
+        god_ray_volumetric: bool,
     ) -> Result<Self, GraphCompileError> {
         let mut builder = FrameGraphBuilder::new();
         if shadow_casters {
@@ -1053,6 +1132,21 @@ impl FrameGraphPlan {
                 ResourceState::ShaderRead,
             ))
             .resource(GraphResourceDecl::new(
+                GraphResource::PostColor,
+                initial.post_color(),
+                ResourceState::ShaderRead,
+            ))
+            .resource(GraphResourceDecl::new(
+                GraphResource::SmaaEdges,
+                initial.smaa_edges(),
+                ResourceState::ShaderRead,
+            ))
+            .resource(GraphResourceDecl::new(
+                GraphResource::SmaaWeights,
+                initial.smaa_weights(),
+                ResourceState::ShaderRead,
+            ))
+            .resource(GraphResourceDecl::new(
                 GraphResource::SwapchainImage,
                 initial.swapchain_image(),
                 ResourceState::Present,
@@ -1071,11 +1165,32 @@ impl FrameGraphPlan {
             ));
         }
         if god_rays {
-            for (resource, state) in [
-                (GraphResource::GodRayMask, initial.god_ray_mask()),
-                (GraphResource::GodRayPrefilter, initial.god_ray_prefilter()),
-                (GraphResource::GodRayBlur, initial.god_ray_blur()),
-            ] {
+            builder = builder.resource(GraphResourceDecl::new(
+                GraphResource::GodRayMask,
+                initial.god_ray_mask(),
+                ResourceState::ShaderRead,
+            ));
+            if !god_ray_volumetric {
+                for (resource, state) in [
+                    (GraphResource::GodRayPrefilter, initial.god_ray_prefilter()),
+                    (GraphResource::GodRayBlur, initial.god_ray_blur()),
+                ] {
+                    builder = builder.resource(GraphResourceDecl::new(
+                        resource,
+                        state,
+                        ResourceState::ShaderRead,
+                    ));
+                }
+            }
+        }
+        if scene_metadata {
+            // The scene render pass always binds the PCSS attachment, including diagnostic
+            // views. Declare both ping-pong images so the backend can transition the attachment
+            // to COLOR_ATTACHMENT and back without clearing or invalidating the preserved value.
+            for (resource, state) in PCSS_SHADOW_HISTORY_RESOURCES
+                .into_iter()
+                .zip(initial.pcss_shadow_histories())
+            {
                 builder = builder.resource(GraphResourceDecl::new(
                     resource,
                     state,
@@ -1160,7 +1275,9 @@ impl FrameGraphPlan {
                 ));
                 builder = builder.pass(pass.write(PassOutput::color_clear(
                     color_resource,
-                    [1.0, 1.0, 1.0, 1.0],
+                    // RGB is additive log-transmittance (zero identity); alpha keeps the
+                    // nearest transparent depth and starts at the far plane.
+                    [0.0, 0.0, 0.0, 1.0],
                 )));
             }
         }
@@ -1180,6 +1297,14 @@ impl FrameGraphPlan {
                 }
             }
         }
+        let pcss_history_write_index = pcss_history_write_index % PCSS_SHADOW_HISTORY_COUNT;
+        let pcss_history_read_index = 1 - pcss_history_write_index;
+        if scene_metadata {
+            scene_pass = scene_pass.read(PassInput::read(
+                PCSS_SHADOW_HISTORY_RESOURCES[pcss_history_read_index],
+                ResourceState::ShaderRead,
+            ));
+        }
         scene_pass = scene_pass.write(PassOutput::color_clear(
             GraphResource::SceneColor,
             clear_color,
@@ -1194,6 +1319,18 @@ impl FrameGraphPlan {
                     GraphResource::SceneTransparentNormalRoughness,
                     [0.0, 0.0, 0.0, 0.0],
                 ));
+            scene_pass = scene_pass.write(if pcss_shadow_temporal {
+                PassOutput::color_clear(
+                    PCSS_SHADOW_HISTORY_RESOURCES[pcss_history_write_index],
+                    [1.0, 0.0, 0.0, 1.0],
+                )
+            } else {
+                // A diagnostic scene still binds the write-side framebuffer attachment, but its
+                // shader output is alpha-zero and the pipeline preserves this image. Keeping a
+                // color-load output gives the graph the required layout transition without
+                // committing/toggling the temporal ping-pong state.
+                PassOutput::color_load(PCSS_SHADOW_HISTORY_RESOURCES[pcss_history_write_index])
+            });
         }
         scene_pass = scene_pass.write(PassOutput::depth_clear_store(GraphResource::SceneDepth));
 
@@ -1245,7 +1382,7 @@ impl FrameGraphPlan {
             );
             TAA_HISTORY_RESOURCES[taa_history_write_index]
         } else {
-            GraphResource::SceneColor
+            taa_current_color
         };
         if bloom {
             for (index, pass_name) in BLOOM_DOWNSAMPLE_PASSES.into_iter().enumerate() {
@@ -1287,47 +1424,62 @@ impl FrameGraphPlan {
                     GraphResource::SceneTransparentNormalRoughness,
                     ResourceState::ShaderRead,
                 ));
-            if shadow_casters && volumetric_god_rays {
-                // The quality volumetric branch samples all CSM layers while the legacy branch
-                // simply ignores these inputs. Keeping the dependency conditional preserves the
-                // fallback path for scenes that have no shadow casters.
+            if taa {
+                // TAA is scheduled before the GodRay chain.  The mask therefore must consume
+                // the depth history written by *this* frame, not the ping-pong read target from
+                // the previous frame.  Reading the old target makes a moving/alpha-tested edge
+                // alternate between a one-frame-old occluder and the current scene as the TAA
+                // write index flips, which appears as pixel flicker in the ray mask.
+                let taa_history_write_index = taa_history_write_index % TAA_HISTORY_COUNT;
+                mask_pass = mask_pass.read(PassInput::read(
+                    TAA_DEPTH_HISTORY_RESOURCES[taa_history_write_index],
+                    ResourceState::ShaderRead,
+                ));
+            }
+            if shadow_casters {
+                // Dedicated volumetric God Rays sample the CSM layers in the camera-ray pass.
                 for resource in SHADOW_CASCADE_RESOURCES {
                     mask_pass =
                         mask_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
                 }
             }
-            builder = builder
-                .pass(mask_pass.write(PassOutput::color_load(GraphResource::GodRayMask)))
-                .pass(
-                    GraphPass::new(GOD_RAY_PREFILTER_PASS)
-                        .read(PassInput::read(
-                            GraphResource::GodRayMask,
-                            ResourceState::ShaderRead,
-                        ))
-                        .write(PassOutput::color_load(GraphResource::GodRayPrefilter)),
-                )
-                .pass(
-                    GraphPass::new(GOD_RAY_RADIAL_PASS)
-                        .read(PassInput::read(
-                            GraphResource::GodRayPrefilter,
-                            ResourceState::ShaderRead,
-                        ))
-                        .write(PassOutput::color_load(GraphResource::GodRayBlur)),
-                )
-                .pass(
-                    GraphPass::new(GOD_RAY_TEMPORAL_PASS)
-                        .read(PassInput::read(
-                            GraphResource::GodRayBlur,
-                            ResourceState::ShaderRead,
-                        ))
-                        .read(PassInput::read(
-                            GOD_RAY_HISTORY_RESOURCES[god_ray_history_read_index],
-                            ResourceState::ShaderRead,
-                        ))
-                        .write(PassOutput::color_load(
-                            GOD_RAY_HISTORY_RESOURCES[god_ray_history_write_index],
-                        )),
-                );
+            builder =
+                builder.pass(mask_pass.write(PassOutput::color_load(GraphResource::GodRayMask)));
+            if !god_ray_volumetric {
+                builder = builder
+                    .pass(
+                        GraphPass::new(GOD_RAY_PREFILTER_PASS)
+                            .read(PassInput::read(
+                                GraphResource::GodRayMask,
+                                ResourceState::ShaderRead,
+                            ))
+                            .write(PassOutput::color_load(GraphResource::GodRayPrefilter)),
+                    )
+                    .pass(
+                        GraphPass::new(GOD_RAY_RADIAL_PASS)
+                            .read(PassInput::read(
+                                GraphResource::GodRayPrefilter,
+                                ResourceState::ShaderRead,
+                            ))
+                            .write(PassOutput::color_load(GraphResource::GodRayBlur)),
+                    );
+            }
+            let temporal_input = if god_ray_volumetric {
+                GraphResource::GodRayMask
+            } else {
+                GraphResource::GodRayBlur
+            };
+            builder = builder.pass(
+                GraphPass::new(GOD_RAY_TEMPORAL_PASS)
+                    .read(PassInput::read(temporal_input, ResourceState::ShaderRead))
+                    .read(PassInput::read(
+                        GOD_RAY_HISTORY_RESOURCES[god_ray_history_read_index],
+                        ResourceState::ShaderRead,
+                    ))
+                    .write(PassOutput::color_load(
+                        GOD_RAY_HISTORY_RESOURCES[god_ray_history_write_index],
+                    )),
+            );
         }
 
         let mut post_pass = GraphPass::new(POST_PASS)
@@ -1347,15 +1499,63 @@ impl FrameGraphPlan {
                 GraphResource::SceneDepth,
                 ResourceState::ShaderRead,
             ))
-            .write(PassOutput::color_load(GraphResource::SwapchainImage));
+            .write(PassOutput::color_overwrite(GraphResource::PostColor));
         post_pass = post_pass.read(PassInput::read(
             GraphResource::BloomMip0,
             ResourceState::ShaderRead,
         ));
+        // The post descriptor set always contains both legacy God Ray history views, even when
+        // the shader branch is disabled. Keep those descriptor images in SHADER_READ_ONLY_OPTIMAL so validation and
+        // implementations that evaluate descriptor accesses conservatively never observe the
+        // freshly-created ping-pong targets in UNDEFINED layout.
         for resource in GOD_RAY_HISTORY_RESOURCES {
             post_pass = post_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
         }
+        // Post effects query the stable TAA depth/normal attachments, not the jittered scene MRT.
+        // Declare both ping-pong resources because the descriptor selected after the TAA pass is
+        // the history target written by this frame, while the other target remains bound in the
+        // alternate descriptor set.
+        if taa {
+            for resource in TAA_DEPTH_HISTORY_RESOURCES
+                .into_iter()
+                .chain(TAA_NORMAL_HISTORY_RESOURCES)
+            {
+                post_pass = post_pass.read(PassInput::read(resource, ResourceState::ShaderRead));
+            }
+        }
         builder = builder.pass(post_pass);
+
+        // Keep the canonical SMAA 1x chain as three explicit graph passes. This is important for
+        // diagnosis: edgesTex and blendTex can be captured independently and compared with the
+        // reference implementation instead of hiding detector/search failures in one fused draw.
+        builder = builder.pass(
+            GraphPass::new(SMAA_EDGE_PASS)
+                .read(PassInput::read(
+                    GraphResource::PostColor,
+                    ResourceState::ShaderRead,
+                ))
+                .write(PassOutput::color_overwrite(GraphResource::SmaaEdges)),
+        );
+        builder = builder.pass(
+            GraphPass::new(SMAA_WEIGHT_PASS)
+                .read(PassInput::read(
+                    GraphResource::SmaaEdges,
+                    ResourceState::ShaderRead,
+                ))
+                .write(PassOutput::color_overwrite(GraphResource::SmaaWeights)),
+        );
+        builder = builder.pass(
+            GraphPass::new(SMAA_BLEND_PASS)
+                .read(PassInput::read(
+                    GraphResource::PostColor,
+                    ResourceState::ShaderRead,
+                ))
+                .read(PassInput::read(
+                    GraphResource::SmaaWeights,
+                    ResourceState::ShaderRead,
+                ))
+                .write(PassOutput::color_overwrite(GraphResource::SwapchainImage)),
+        );
 
         if framebuffer_readback {
             builder = builder.pass(
@@ -1899,12 +2099,112 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend(shadow_pass_names());
         expected.extend(translucent_shadow_pass_names());
-        expected.extend([SCENE_PASS, POST_PASS, PRESENT_PASS]);
+        expected.extend([
+            SCENE_PASS,
+            POST_PASS,
+            SMAA_EDGE_PASS,
+            SMAA_WEIGHT_PASS,
+            SMAA_PASS,
+            PRESENT_PASS,
+        ]);
 
         assert_eq!(names, expected);
-        assert_eq!(graph.resource_count(), 16);
+        assert_eq!(graph.resource_count(), 21);
         assert!(graph.transition_count() >= 10);
         assert!(graph.barrier_count() >= 6);
+    }
+
+    #[test]
+    fn standard_frame_graph_runs_smaa_on_composited_post_color_before_readback() {
+        let graph = FrameGraphPlan::standard_frame_with_readback(
+            [0.0, 0.1, 0.2, 1.0],
+            FrameGraphInitialStates::new(
+                ResourceState::Undefined,
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+                ResourceState::Undefined,
+            ),
+            true,
+            false,
+            false,
+        )
+        .expect("graph should compile");
+
+        let post_index = graph
+            .passes()
+            .iter()
+            .position(|pass| pass.name() == POST_PASS)
+            .expect("post pass should exist");
+        let edge_index = graph
+            .passes()
+            .iter()
+            .position(|pass| pass.name() == SMAA_EDGE_PASS)
+            .expect("SMAA edge pass should exist");
+        let weight_index = graph
+            .passes()
+            .iter()
+            .position(|pass| pass.name() == SMAA_WEIGHT_PASS)
+            .expect("SMAA weight pass should exist");
+        let smaa_index = graph
+            .passes()
+            .iter()
+            .position(|pass| pass.name() == SMAA_PASS)
+            .expect("SMAA blend pass should exist");
+        let readback_index = graph
+            .passes()
+            .iter()
+            .position(|pass| pass.name() == FRAMEBUFFER_READBACK_PASS)
+            .expect("readback pass should exist");
+
+        assert!(post_index < edge_index && edge_index < weight_index);
+        assert!(weight_index < smaa_index && smaa_index < readback_index);
+
+        let post = &graph.passes()[post_index];
+        assert!(post.writes().iter().any(|output| {
+            output.resource() == GraphResource::PostColor
+                && output.state() == ResourceState::ColorAttachment
+        }));
+
+        let edges = &graph.passes()[edge_index];
+        assert!(edges.reads().iter().any(|input| {
+            input.resource() == GraphResource::PostColor
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(edges.writes().iter().any(|output| {
+            output.resource() == GraphResource::SmaaEdges
+                && output.state() == ResourceState::ColorAttachment
+        }));
+        let weights = &graph.passes()[weight_index];
+        assert!(weights.reads().iter().any(|input| {
+            input.resource() == GraphResource::SmaaEdges
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(weights.writes().iter().any(|output| {
+            output.resource() == GraphResource::SmaaWeights
+                && output.state() == ResourceState::ColorAttachment
+        }));
+        let smaa = &graph.passes()[smaa_index];
+        assert!(smaa.reads().iter().any(|input| {
+            input.resource() == GraphResource::PostColor
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(smaa.reads().iter().any(|input| {
+            input.resource() == GraphResource::SmaaWeights
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(smaa.writes().iter().any(|output| {
+            output.resource() == GraphResource::SwapchainImage
+                && output.state() == ResourceState::ColorAttachment
+        }));
+        assert!(graph.barriers().iter().any(|barrier| {
+            barrier.resource() == GraphResource::PostColor
+                && barrier.from() == ResourceState::ColorAttachment
+                && barrier.to() == ResourceState::ShaderRead
+                && barrier.location() == BarrierLocation::BeforePass(SMAA_EDGE_PASS)
+        }));
     }
 
     #[test]
@@ -2004,6 +2304,88 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn temporal_sun_shaft_and_pcss_histories_ping_pong_independently() {
+        let initial = FrameGraphInitialStates::new(
+            ResourceState::Undefined,
+            [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
+            [ResourceState::ShaderRead; SHADOW_CASCADE_COUNT],
+            ResourceState::Undefined,
+            ResourceState::Undefined,
+            ResourceState::Undefined,
+            ResourceState::Undefined,
+        )
+        .with_pcss_shadow_histories([ResourceState::ShaderRead; PCSS_SHADOW_HISTORY_COUNT]);
+
+        let graph = FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa_mode(
+            [0.0, 0.0, 0.0, 1.0],
+            initial,
+            false,
+            true,
+            [false; SHADOW_CASCADE_COUNT],
+            false,
+            true,
+            false,
+            false,
+            0,
+            false,
+            0,
+            true,
+            0,
+            false,
+        )
+        .expect("temporal God Ray and PCSS graph should compile");
+
+        let scene = graph
+            .passes()
+            .iter()
+            .find(|pass| pass.name() == SCENE_PASS)
+            .expect("scene pass should exist");
+        assert!(scene.reads().iter().any(|input| {
+            input.resource() == GraphResource::PcssShadowHistory1
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(scene.writes().iter().any(|output| {
+            output.resource() == GraphResource::PcssShadowHistory0
+                && output.load() == LoadOp::Clear
+                && output.store() == StoreOp::Store
+        }));
+
+        let graph_without_temporal_pcss =
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa_mode(
+                [0.0, 0.0, 0.0, 1.0],
+                initial,
+                false,
+                true,
+                [false; SHADOW_CASCADE_COUNT],
+                false,
+                true,
+                false,
+                false,
+                0,
+                false,
+                0,
+                false,
+                0,
+                false,
+            )
+            .expect("non-temporal PCSS graph should compile");
+        let scene_without_temporal_pcss = graph_without_temporal_pcss
+            .passes()
+            .iter()
+            .find(|pass| pass.name() == SCENE_PASS)
+            .expect("scene pass should exist without temporal PCSS");
+        assert!(scene_without_temporal_pcss.reads().iter().any(|input| {
+            input.resource() == GraphResource::PcssShadowHistory1
+                && input.state() == ResourceState::ShaderRead
+        }));
+        assert!(scene_without_temporal_pcss.writes().iter().any(|output| {
+            output.resource() == GraphResource::PcssShadowHistory0
+                && output.load() == LoadOp::Load
+                && output.store() == StoreOp::Store
+        }));
+    }
+
     // Verifies that persistent resource states affect the next frame's barrier plan.
     #[test]
     fn standard_frame_graph_uses_actual_initial_states() {
@@ -2080,7 +2462,17 @@ mod tests {
             .map(GraphPass::name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, [SCENE_PASS, POST_PASS, PRESENT_PASS]);
+        assert_eq!(
+            names,
+            [
+                SCENE_PASS,
+                POST_PASS,
+                SMAA_EDGE_PASS,
+                SMAA_WEIGHT_PASS,
+                SMAA_PASS,
+                PRESENT_PASS,
+            ]
+        );
         assert_eq!(
             graph.final_state_for(GraphResource::ShadowCascade0),
             Some(ResourceState::ShaderRead)
@@ -2154,10 +2546,17 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected = Vec::new();
         expected.extend(shadow_pass_names());
-        expected.extend([SCENE_PASS, POST_PASS, PRESENT_PASS]);
+        expected.extend([
+            SCENE_PASS,
+            POST_PASS,
+            SMAA_EDGE_PASS,
+            SMAA_WEIGHT_PASS,
+            SMAA_PASS,
+            PRESENT_PASS,
+        ]);
 
         assert_eq!(names, expected);
-        assert_eq!(graph.resource_count(), 12);
+        assert_eq!(graph.resource_count(), 17);
         assert_eq!(
             graph.final_state_for(GraphResource::TranslucentShadow0),
             None
@@ -2203,8 +2602,8 @@ mod tests {
             .map(GraphPass::name)
             .collect::<Vec<_>>();
 
-        assert_eq!(graph.resource_count(), 14);
-        assert_eq!(graph.pass_count(), 9);
+        assert_eq!(graph.resource_count(), 19);
+        assert_eq!(graph.pass_count(), 12);
         assert!(names.contains(&translucent_shadow_pass_name(0)));
         assert!(names.contains(&translucent_shadow_pass_name(3)));
         assert!(!names.contains(&translucent_shadow_pass_name(1)));
@@ -2248,8 +2647,18 @@ mod tests {
             .map(GraphPass::name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, [SCENE_PASS, POST_PASS, PRESENT_PASS]);
-        assert_eq!(graph.resource_count(), 8);
+        assert_eq!(
+            names,
+            [
+                SCENE_PASS,
+                POST_PASS,
+                SMAA_EDGE_PASS,
+                SMAA_WEIGHT_PASS,
+                SMAA_PASS,
+                PRESENT_PASS,
+            ]
+        );
+        assert_eq!(graph.resource_count(), 13);
         assert_eq!(graph.final_state_for(GraphResource::ShadowCascade0), None);
         assert_eq!(
             graph.final_state_for(GraphResource::TranslucentShadow0),
@@ -2298,6 +2707,9 @@ mod tests {
                 "bloom_upsample_1",
                 "bloom_upsample_0",
                 POST_PASS,
+                SMAA_EDGE_PASS,
+                SMAA_WEIGHT_PASS,
+                SMAA_PASS,
                 PRESENT_PASS,
             ]
         );
@@ -2355,6 +2767,9 @@ mod tests {
                 GOD_RAY_RADIAL_PASS,
                 GOD_RAY_TEMPORAL_PASS,
                 POST_PASS,
+                SMAA_EDGE_PASS,
+                SMAA_WEIGHT_PASS,
+                SMAA_PASS,
                 PRESENT_PASS,
             ]
         );
@@ -2386,6 +2801,66 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn dedicated_god_ray_graph_bypasses_legacy_radial_passes() {
+        let graph =
+            FrameGraphPlan::standard_frame_with_shadow_refresh_scene_metadata_bloom_god_rays_and_taa_mode(
+                [0.0, 0.1, 0.2, 1.0],
+                FrameGraphInitialStates::new(
+                    ResourceState::Undefined,
+                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                    [ResourceState::Undefined; SHADOW_CASCADE_COUNT],
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                    ResourceState::Undefined,
+                ),
+                false,
+                false,
+                [false; SHADOW_CASCADE_COUNT],
+                false,
+                true,
+                false,
+                true,
+                1,
+                false,
+                0,
+                false,
+                0,
+                true,
+            )
+            .expect("dedicated GodRay graph should compile");
+        let names = graph
+            .passes()
+            .iter()
+            .map(GraphPass::name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                SCENE_PASS,
+                GOD_RAY_MASK_PASS,
+                GOD_RAY_TEMPORAL_PASS,
+                POST_PASS,
+                SMAA_EDGE_PASS,
+                SMAA_WEIGHT_PASS,
+                SMAA_PASS,
+                PRESENT_PASS,
+            ]
+        );
+        assert_eq!(graph.final_state_for(GraphResource::GodRayPrefilter), None);
+        assert_eq!(graph.final_state_for(GraphResource::GodRayBlur), None);
+        let temporal = graph
+            .passes()
+            .iter()
+            .find(|pass| pass.name() == GOD_RAY_TEMPORAL_PASS)
+            .expect("dedicated temporal pass should be retained");
+        assert!(temporal.reads().iter().any(|input| {
+            input.resource() == GraphResource::GodRayMask
+                && input.state() == ResourceState::ShaderRead
+        }));
+    }
+
     // Verifies that stale persistent shadow states do not keep shadow resources alive.
     #[test]
     fn standard_frame_graph_ignores_shadow_states_without_shadow_casters() {
@@ -2406,7 +2881,7 @@ mod tests {
         )
         .expect("graph should compile");
 
-        assert_eq!(graph.pass_count(), 3);
+        assert_eq!(graph.pass_count(), 6);
         assert!(
             graph
                 .resources()
@@ -2415,7 +2890,7 @@ mod tests {
         );
     }
 
-    // Verifies that optional framebuffer readback is ordered after post and before present.
+    // Verifies that optional framebuffer readback is ordered after final SMAA and before present.
     #[test]
     fn standard_frame_graph_places_readback_before_present() {
         let graph = FrameGraphPlan::standard_frame_with_readback(
@@ -2445,6 +2920,9 @@ mod tests {
         expected.extend([
             SCENE_PASS,
             POST_PASS,
+            SMAA_EDGE_PASS,
+            SMAA_WEIGHT_PASS,
+            SMAA_PASS,
             FRAMEBUFFER_READBACK_PASS,
             PRESENT_PASS,
         ]);

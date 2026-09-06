@@ -8,6 +8,7 @@ pub(super) fn create_scene_render_pass(
     color_format: vk::Format,
     normal_roughness_format: vk::Format,
     transparent_normal_roughness_format: vk::Format,
+    pcss_shadow_history_format: vk::Format,
     depth_format: vk::Format,
 ) -> Result<vk::RenderPass, super::VulkanError> {
     let color_attachment = vk::AttachmentDescription::default()
@@ -46,6 +47,19 @@ pub(super) fn create_scene_render_pass(
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
         .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
         .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let pcss_shadow_history_attachment = vk::AttachmentDescription::default()
+        .format(pcss_shadow_history_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        // The scene pass is also used by F12 diagnostics.  Those views must preserve the
+        // previous history image; clearing here would overwrite it before the shader can sample
+        // the read ping-pong target and would make a raw/history A/B comparison meaningless.
+        // Normal frames clear this attachment explicitly after begin_render_pass.
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
     let color_attachment_ref = vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
@@ -55,13 +69,17 @@ pub(super) fn create_scene_render_pass(
     let transparent_normal_roughness_attachment_ref = vk::AttachmentReference::default()
         .attachment(2)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-    let depth_attachment_ref = vk::AttachmentReference::default()
+    let pcss_shadow_history_attachment_ref = vk::AttachmentReference::default()
         .attachment(3)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let depth_attachment_ref = vk::AttachmentReference::default()
+        .attachment(4)
         .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     let color_attachment_refs = [
         color_attachment_ref,
         normal_roughness_attachment_ref,
         transparent_normal_roughness_attachment_ref,
+        pcss_shadow_history_attachment_ref,
     ];
     let subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
@@ -71,6 +89,7 @@ pub(super) fn create_scene_render_pass(
         color_attachment,
         normal_roughness_attachment,
         transparent_normal_roughness_attachment,
+        pcss_shadow_history_attachment,
         depth_attachment,
     ];
     let subpasses = [subpass];
@@ -187,7 +206,7 @@ pub(super) fn create_local_shadow_render_pass(
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
-/// Creates the pass that keeps only the nearest translucent caster in front of opaque depth.
+/// Creates the pass that accumulates deep translucent log-transmittance in front of opaque depth.
 pub(super) fn create_translucent_shadow_render_pass(
     device: &Device,
     color_format: vk::Format,
@@ -212,8 +231,9 @@ pub(super) fn create_translucent_shadow_render_pass(
         .store_op(vk::AttachmentStoreOp::DONT_CARE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        // This is a dedicated transient depth target. The fragment shader samples layer zero of the
-        // immutable opaque D16 array, while fixed-function depth retains the nearest translucent layer.
+        // This is a dedicated transient depth target kept for framebuffer compatibility. The
+        // fragment shader samples layer zero of the immutable opaque D16 array; translucent depth
+        // ordering is stored in the color alpha lane with MIN blending.
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     let depth_attachment_ref = vk::AttachmentReference::default()
@@ -249,12 +269,38 @@ pub(super) fn create_translucent_shadow_render_pass(
     unsafe { device.create_render_pass(&create_info, None) }.map_err(super::VulkanError::Vk)
 }
 
-/// Creates the color-only render pass that writes a post result into the swapchain image.
+/// Creates the color-only render pass that writes the complete post result into an intermediate
+/// color target before the final SMAA pass.
 pub(super) fn create_post_render_pass(
     device: &Device,
     format: vk::Format,
 ) -> Result<vk::RenderPass, super::VulkanError> {
     create_color_only_render_pass(device, format, vk::AttachmentLoadOp::DONT_CARE)
+}
+
+/// Creates the color-only render pass that writes the final SMAA neighbourhood result into the
+/// swapchain image.
+pub(super) fn create_smaa_render_pass(
+    device: &Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass, super::VulkanError> {
+    create_color_only_render_pass(device, format, vk::AttachmentLoadOp::DONT_CARE)
+}
+
+/// Creates the first SMAA pass that writes the luma edge field (edgesTex).
+pub(super) fn create_smaa_edge_render_pass(
+    device: &Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass, super::VulkanError> {
+    create_color_only_render_pass(device, format, vk::AttachmentLoadOp::CLEAR)
+}
+
+/// Creates the second SMAA pass that writes the AreaTex blending weights (blendTex).
+pub(super) fn create_smaa_weight_render_pass(
+    device: &Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass, super::VulkanError> {
+    create_color_only_render_pass(device, format, vk::AttachmentLoadOp::CLEAR)
 }
 
 /// Creates the color-only pass that overwrites one bloom mip during downsample.
@@ -331,6 +377,7 @@ pub(super) fn create_scene_framebuffer(
     color_view: vk::ImageView,
     normal_roughness_view: vk::ImageView,
     transparent_normal_roughness_view: vk::ImageView,
+    pcss_shadow_history_view: vk::ImageView,
     depth_view: vk::ImageView,
     extent: NonZeroExtent,
 ) -> Result<vk::Framebuffer, super::VulkanError> {
@@ -338,6 +385,7 @@ pub(super) fn create_scene_framebuffer(
         color_view,
         normal_roughness_view,
         transparent_normal_roughness_view,
+        pcss_shadow_history_view,
         depth_view,
     ];
     let create_info = vk::FramebufferCreateInfo::default()

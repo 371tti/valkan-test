@@ -29,10 +29,11 @@ use crate::{
     protocol::{
         AssetHandle, DropReason, FrameId, FramebufferReadback, FramebufferReadbackOptions,
         LoadedAsset, MessageEnvelope, NativeSurfaceHandle, NativeSurfacePlatform, NonZeroExtent,
-        RenderItemPacket, RenderQualitySettings, RendererCommand, RendererEvent, RendererInbox,
-        SurfaceDescriptor, SurfaceGeneration, SurfaceId, TransportError, WindowId,
+        RenderFeatureToggles, RenderItemPacket, RenderQualitySettings, RendererCommand,
+        RendererEvent, RendererInbox, SurfaceDescriptor, SurfaceGeneration, SurfaceId,
+        TransportError, WindowId,
     },
-    renderer::shadow_map_size_for_quality,
+    renderer::{graph::SHADOW_CASCADE_COUNT, shadow_map_size_for_quality},
 };
 
 use self::{
@@ -40,8 +41,9 @@ use self::{
     frame::{FramePresentStatus, VulkanFrames},
     material::VulkanMaterialStore,
     mesh::VulkanMeshStore,
+    post::POST_PUSH_CONSTANT_SIZE,
     readback::{FramebufferReadbackConfig, FramebufferReadbackState},
-    shadow::{LocalShadowFrameData, LocalShadowFrameSignature},
+    shadow::{LocalShadowFrameData, LocalShadowFrameSignature, ShadowFrameData},
     swapchain::{ShadowResources, ShadowSamplerFallback, VulkanSwapchain},
 };
 use super::{
@@ -80,6 +82,10 @@ pub enum VulkanError {
     ColorAttachmentUnsupported,
     #[error("surface has no supported composite alpha mode")]
     CompositeAlphaUnavailable,
+    #[error(
+        "selected Vulkan device supports only {available} bytes of push constants, but {required} are required"
+    )]
+    PushConstantsLimit { required: u32, available: u32 },
     #[error("swapchain image index {index} is out of range for {count} swapchain images")]
     SwapchainImageIndexOutOfRange { index: usize, count: usize },
     #[error("frame slot index {index} is out of range for {count} frame slots")]
@@ -219,6 +225,9 @@ impl RendererBackend for VulkanRendererBackend {
                 }
                 RendererCommand::SetQualitySettings { settings } => {
                     context.set_quality_settings(settings)?;
+                }
+                RendererCommand::SetQualityFeatures { features } => {
+                    context.set_quality_features(features)?;
                 }
                 RendererCommand::Shutdown => {
                     tracing::info!("vulkan renderer backend stopping");
@@ -620,34 +629,64 @@ impl VulkanContext {
         &mut self,
         options: FramebufferReadbackOptions,
     ) -> Result<(), VulkanError> {
-        self.framebuffer_readback = options;
+        let previous_options = self.framebuffer_readback;
         let Some(device) = self.device.as_mut() else {
+            self.framebuffer_readback = options;
             tracing::trace!("stored framebuffer readback options before Vulkan device creation");
             return Ok(());
         };
 
         device.set_framebuffer_readback_options(options);
-        if let Some(swapchain) = self
+        let configure_result = if let Some(swapchain) = self
             .surfaces
             .values()
             .find_map(|surface| surface.swapchain.as_ref())
         {
-            device.configure_framebuffer_readback(swapchain)?;
+            device.configure_framebuffer_readback(swapchain)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = configure_result {
+            // Keep the app policy and the device state paired with the old buffers when a
+            // replacement allocation fails. The readback configure itself is transactional, so
+            // restoring the policy completes that transaction at the context boundary.
+            device.set_framebuffer_readback_options(previous_options);
+            return Err(error);
         }
+
+        self.framebuffer_readback = options;
         Ok(())
     }
 
-    /// Stores renderer quality policy and applies it to all later submitted frames.
-    fn set_quality_settings(&mut self, settings: RenderQualitySettings) -> Result<(), VulkanError> {
+    /// Stores continuous renderer controls while preserving the current feature ON/OFF mask.
+    fn set_quality_settings(
+        &mut self,
+        requested_settings: RenderQualitySettings,
+    ) -> Result<(), VulkanError> {
+        let settings = requested_settings.with_features(self.quality.features());
+        self.apply_quality_settings(settings)
+    }
+
+    /// Applies a complete renderer state after the command boundary has resolved feature state.
+    fn apply_quality_settings(
+        &mut self,
+        requested_settings: RenderQualitySettings,
+    ) -> Result<(), VulkanError> {
+        let settings = requested_settings;
+        let shadow = settings.stable_csm_pcss();
         tracing::info!(
+            feature_bits = settings.features().bits(),
             ssao_intensity = settings.ssao().intensity(),
             aa_threshold = settings.anti_aliasing().edge_threshold(),
             post_contrast = settings.post().contrast(),
+            pcss_blocker_samples = shadow.blocker_search_samples(),
+            pcss_filter_samples = shadow.filter_samples(),
+            pcss_light_radius_degrees = shadow.light_angular_radius_degrees(),
+            shadow_map_resolution = shadow.shadow_map_resolution(),
             "updated Vulkan renderer quality settings"
         );
-        let volumetric_god_rays_changed = self.quality.bloom().volumetric_god_rays()
-            != settings.bloom().volumetric_god_rays()
-            || self.quality.fog().enabled() != settings.fog().enabled();
+        let volumetric_god_rays_changed = self.quality.features().volumetric_fog_enabled()
+            != settings.features().volumetric_fog_enabled();
         if let Some(device) = self.device.as_mut() {
             device.set_quality_settings(settings)?;
         }
@@ -660,7 +699,30 @@ impl VulkanContext {
             }
             tracing::debug!("invalidated volumetric God Ray history after changing quality");
         }
+        // PCSS visibility and volumetric scattering are both parameterized by the continuous
+        // quality model. Drop their histories for every quality transaction so a new blocker,
+        // filter, or fog density value cannot be blended with pixels produced by the old model.
+        for surface in self.surfaces.values_mut() {
+            if let Some(swapchain) = surface.swapchain.as_mut() {
+                swapchain.invalidate_temporal_effects();
+            }
+        }
         Ok(())
+    }
+
+    /// Updates only feature ON/OFF switches and leaves all continuous quality values untouched.
+    fn set_quality_features(&mut self, features: RenderFeatureToggles) -> Result<(), VulkanError> {
+        tracing::info!(
+            feature_bits = features.bits(),
+            ssao = features.ssao_enabled(),
+            ssr = features.ssr_enabled(),
+            anti_aliasing = features.anti_aliasing_enabled(),
+            bloom = features.bloom_enabled(),
+            god_rays = features.god_rays_enabled(),
+            volumetric_fog = features.volumetric_fog_enabled(),
+            "updated Vulkan renderer quality feature switches"
+        );
+        self.apply_quality_settings(self.quality.with_features(features))
     }
 
     /// Creates the logical device once and verifies that later surfaces are present-capable.
@@ -671,7 +733,16 @@ impl VulkanContext {
 
         let mut device = create_device_for_surface(&self.instance, &self.surface_loader, surface)?;
         device.set_framebuffer_readback_options(self.framebuffer_readback);
-        device.set_quality_settings(self.quality)?;
+        let settings = self.quality;
+        if let Err(error) = device.set_quality_settings(settings) {
+            // `VulkanDevice` owns raw Vulkan handles and intentionally has no implicit Drop
+            // implementation. A quality request can still be rejected immediately after device
+            // creation, so make this failure path release the complete partially-installed device
+            // before returning.
+            device.destroy();
+            return Err(error);
+        }
+        self.quality = settings;
         tracing::info!(
             queue_family_index = device.queue_family_index,
             device_name = %device.name,
@@ -701,7 +772,13 @@ impl VulkanContext {
             .as_mut()
             .ok_or(VulkanError::LogicalDeviceMissing)?;
         let swapchain = device.create_swapchain(surface, config, old_swapchain)?;
-        device.configure_framebuffer_readback(&swapchain)?;
+        if let Err(error) = device.configure_framebuffer_readback(&swapchain) {
+            // The swapchain is not returned to the caller on a readback allocation failure. Keep
+            // this newly-created Vulkan object from leaking while the previous surface state is
+            // retained by the caller during resize retries.
+            device.destroy_swapchain(swapchain);
+            return Err(error);
+        }
 
         Ok(swapchain)
     }
@@ -796,6 +873,41 @@ impl VulkanContext {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_shadow_frame_data(seed: f32) -> ShadowFrameData {
+        ShadowFrameData {
+            view_proj: [[seed; 16]; SHADOW_CASCADE_COUNT],
+            coverage_near: seed,
+            splits: [seed; SHADOW_CASCADE_COUNT],
+            texel_world: [seed; SHADOW_CASCADE_COUNT],
+            depth_span: [seed; SHADOW_CASCADE_COUNT],
+            cascade_resolution: [seed; SHADOW_CASCADE_COUNT],
+        }
+    }
+
+    #[test]
+    fn directional_shadow_cache_refreshes_only_for_changed_inputs_or_invalidation() {
+        let data = test_shadow_frame_data(1.0);
+        let mut cache = ShadowCacheState::dirty();
+
+        assert!(cache.directional_needs_refresh(Some(7), Some(data)));
+        cache.mark_directional_refreshed(Some(7), Some(data), [true, false, true, false]);
+        assert!(!cache.directional_needs_refresh(Some(7), Some(data)));
+        assert_eq!(
+            cache.directional_translucent_cascades(),
+            [true, false, true, false]
+        );
+        assert!(cache.directional_needs_refresh(Some(8), Some(data)));
+        assert!(cache.directional_needs_refresh(Some(7), Some(test_shadow_frame_data(2.0))));
+
+        cache.invalidate();
+        assert!(cache.directional_needs_refresh(Some(7), Some(data)));
+    }
+}
+
 impl Drop for VulkanContext {
     /// Destroys Vulkan surfaces first, then destroys the Vulkan instance.
     fn drop(&mut self) {
@@ -872,13 +984,18 @@ struct VulkanDevice {
     shadow_cache: ShadowCacheState,
     readback: FramebufferReadbackState,
     quality: RenderQualitySettings,
+    max_image_dimension_2d: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ShadowCacheState {
     dirty: bool,
+    directional_dirty: bool,
     local_signature: Option<LocalShadowFrameSignature>,
     local_frame_data: Option<LocalShadowFrameData>,
+    directional_signature: Option<u64>,
+    directional_frame_data: Option<ShadowFrameData>,
+    directional_translucent_cascades: [bool; SHADOW_CASCADE_COUNT],
 }
 
 impl ShadowCacheState {
@@ -886,16 +1003,65 @@ impl ShadowCacheState {
     fn dirty() -> Self {
         Self {
             dirty: true,
+            directional_dirty: true,
             local_signature: None,
             local_frame_data: None,
+            directional_signature: None,
+            directional_frame_data: None,
+            directional_translucent_cascades: [false; SHADOW_CASCADE_COUNT],
         }
     }
 
     /// Marks cached shadow maps unusable after assets or shadow resources change.
     fn invalidate(&mut self) {
         self.dirty = true;
+        self.directional_dirty = true;
         self.local_signature = None;
         self.local_frame_data = None;
+        self.directional_signature = None;
+        self.directional_frame_data = None;
+        self.directional_translucent_cascades = [false; SHADOW_CASCADE_COUNT];
+    }
+
+    /// Returns whether the persistent directional CSMs no longer match this frame.
+    ///
+    /// The projection data captures camera/light/extent/resolution changes while the caster
+    /// signature captures changes to the set of packets that can write the maps. Keeping these
+    /// checks separate from the local-light cache lets a scene with only directional shadows stay
+    /// clean after its first map render.
+    fn directional_needs_refresh(
+        self,
+        signature: Option<u64>,
+        frame_data: Option<ShadowFrameData>,
+    ) -> bool {
+        match (signature, frame_data) {
+            (Some(signature), Some(frame_data)) => {
+                self.directional_dirty
+                    || self.directional_signature != Some(signature)
+                    || self.directional_frame_data != Some(frame_data)
+            }
+            _ => false,
+        }
+    }
+
+    /// Stores the frame rendered into the persistent directional CSM array.
+    fn mark_directional_refreshed(
+        &mut self,
+        signature: Option<u64>,
+        frame_data: Option<ShadowFrameData>,
+        translucent_cascades: [bool; SHADOW_CASCADE_COUNT],
+    ) {
+        if let (Some(signature), Some(frame_data)) = (signature, frame_data) {
+            self.directional_signature = Some(signature);
+            self.directional_frame_data = Some(frame_data);
+            self.directional_translucent_cascades = translucent_cascades;
+            self.directional_dirty = false;
+        }
+    }
+
+    /// Returns the translucent cascade mask belonging to the cached directional maps.
+    fn directional_translucent_cascades(self) -> [bool; SHADOW_CASCADE_COUNT] {
+        self.directional_translucent_cascades
     }
 
     /// Returns whether persistent local cubemaps no longer match the caster/light set.
@@ -1000,17 +1166,33 @@ impl VulkanDevice {
 
     /// Returns the one edge length used by every Stable CSM layer for the current profile.
     pub(super) fn shadow_map_resolution(&self) -> u32 {
-        shadow_map_size_for_quality(self.quality.stable_csm_pcss().shadow_map_resolution())
+        self.shadow_map_resolution_for(self.quality)
+    }
+
+    /// Resolves one profile's shared shadow extent against the physical image-size limit.
+    fn shadow_map_resolution_for(&self, settings: RenderQualitySettings) -> u32 {
+        let requested =
+            shadow_map_size_for_quality(settings.stable_csm_pcss().shadow_map_resolution());
+        let supported_max = self.max_image_dimension_2d.max(super::MIN_SHADOW_MAP_SIZE);
+        requested.min(supported_max)
     }
 
     /// Updates quality constants and rebuilds fixed shadow targets when their shared resolution
     /// changes.  The CSM layer count and split layout remain untouched.
     fn set_quality_settings(&mut self, settings: RenderQualitySettings) -> Result<(), VulkanError> {
         let previous_resolution = self.shadow_map_resolution();
-        let requested_resolution =
+        let profile_requested_resolution =
             shadow_map_size_for_quality(settings.stable_csm_pcss().shadow_map_resolution());
-        self.quality = settings;
+        let requested_resolution = self.shadow_map_resolution_for(settings);
+        if profile_requested_resolution > requested_resolution {
+            tracing::warn!(
+                requested = profile_requested_resolution,
+                supported_max = requested_resolution,
+                "clamping Stable CSM quality to the Vulkan 2D image dimension limit"
+            );
+        }
         if previous_resolution == requested_resolution || self.shadows.is_none() {
+            self.quality = settings;
             return Ok(());
         }
 
@@ -1018,6 +1200,7 @@ impl VulkanDevice {
         if let Some(shadows) = self.shadows.take() {
             self.destroy_shadow_resources(shadows);
         }
+        self.quality = settings;
         self.invalidate_shadow_state();
         tracing::info!(
             old_resolution = previous_resolution,
@@ -1298,6 +1481,7 @@ fn create_device_for_surface(
         shadow_cache: ShadowCacheState::dirty(),
         readback: FramebufferReadbackState::default(),
         quality: RenderQualitySettings::default(),
+        max_image_dimension_2d: physical_device_properties.limits.max_image_dimension2_d,
     })
 }
 
@@ -1330,6 +1514,8 @@ fn select_device_candidate(
         let has_shader_draw_parameters = vulkan11_features.shader_draw_parameters == vk::TRUE;
         let has_scene_color_attachments =
             properties.limits.max_color_attachments >= REQUIRED_SCENE_COLOR_ATTACHMENTS;
+        let has_post_push_constants =
+            properties.limits.max_push_constants_size >= POST_PUSH_CONSTANT_SIZE;
         let queue_family_index =
             find_graphics_present_queue(instance, surface_loader, physical_device, surface)?;
 
@@ -1341,6 +1527,9 @@ fn select_device_candidate(
             has_shader_draw_parameters,
             max_color_attachments = properties.limits.max_color_attachments,
             has_scene_color_attachments,
+            max_push_constants_size = properties.limits.max_push_constants_size,
+            has_post_push_constants,
+            max_image_dimension_2d = properties.limits.max_image_dimension2_d,
             supports_vulkan_1_1,
             queue_family_index,
             "evaluated Vulkan physical device"
@@ -1355,6 +1544,7 @@ fn select_device_candidate(
             || !has_independent_blend
             || !has_shader_draw_parameters
             || !has_scene_color_attachments
+            || !has_post_push_constants
         {
             continue;
         }

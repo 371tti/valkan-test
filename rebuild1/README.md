@@ -2,6 +2,8 @@
 
 `rebuild1/` は次の renderer を設計しながら実装していく作り直し用 crate です。前回のコードは `old/` に退避済みで、ここでは設計ドキュメントと実装を同時に保守します。
 
+作業中の短い索引と修正状態は、リポジトリ直下の [`memo/README.md`](../memo/README.md) を先に読みます。問題一覧は [`memo/issues.md`](../memo/issues.md)、テストの線引きは [`memo/tests.md`](../memo/tests.md) にあります。
+
 ## 設計の芯
 
 `rebuild1` は、app / user code / renderer を async message protocol で分離し、renderer 専用 thread に Vulkan を閉じ込める設計です。
@@ -47,16 +49,18 @@
 
 - app は headless path と winit window path を持つ。
 - protocol は command/event/envelope/id/snapshot/surface/transport に分かれている。
-- renderer 品質は `SetQualitySettings(RenderQualitySettings)` で送る。window app は時間的に安定する `balanced()` を既定とし、低遅延の `performance()` はキー1で明示選択する。SSR / SSAO / AA / lighting / post look は renderer の実行ポリシーであり、ECS owned な `FrameSnapshot` には混ぜない。
+- renderer の連続値（samples/steps/resolution/radius/intensity/look）は `SetQualitySettings(RenderQualitySettings)` で送る。機能のON/OFFだけを切り替える `SetQualityFeatures(RenderFeatureToggles)` は別コマンドとし、window のキー1〜4は対応する連続品質プロファイルとON/OFF集合を順に送る。キー1=全OFF＋performance、2=AA+SSAO＋interactive、3=そこへSSR+Bloom+GodRay＋balanced、4=さらにVolumetric Fog＋high quality。ECS owned な `FrameSnapshot` には混ぜない。
 - renderer は dedicated thread 上で `RendererBackend` を動かす。
-- Vulkan backend は instance / validation debug callback / device / surface / swapchain / 4-layer Stable CSM depth array / scene・TAA・post render pass / framebuffer / frame resources / mesh / material / post pipeline まで持つ。
-- `SubmitFrame` は target surface に対して acquire、graph compile、barrier record、必要な Stable CSM / translucent shadow pass、scene pass、TAA、bloom/post、readback、submit、present を行う。
+- Vulkan backend は instance / validation debug callback / device / surface / swapchain / 4-layer Stable CSM depth array / scene・post・SMAA (edge/weight/blend) render pass / framebuffer / frame resources / mesh / material / post pipeline を持ち、TAA は有効時だけ遅延確保する。
+- `SubmitFrame` は target surface に対して acquire、graph compile、barrier record、必要な Stable CSM / translucent shadow pass、scene pass、専用 GodRay の camera-ray mask・temporal volume（低品質時だけ prefilter・radial・temporal）、bloom/post composition、SMAA edge detection・weight calculation・neighborhood blending、readback、submit、present を行う。
 - present 待ちの semaphore は swapchain image ごとに持ち、frame slot ごとに再利用しない。
 - window path は surface configure 後に redraw-driven の最小 `SubmitFrame` loop を走らせる。
-- renderer graph は `stable_csm_depth[cascade 0..3] -> optional translucent_shadow -> scene(HDR+metadata) -> TAA -> bloom/post -> optional readback -> present` を実行計画として持ち、resource state から explicit barrier plan を生成する。CSMは4層を1つの安定したlight-space gridで更新し、PCSSの最終filterは比較サンプラのhardware PCFを使う。
+- renderer graph は `stable_csm_depth[cascade 0..3] -> optional translucent_shadow -> scene(HDR+metadata) -> dedicated GodRay volume -> optional TAA -> bloom/post composition(PostColor) -> smaa_edges -> smaa_weights -> smaa(swapchain) -> optional readback -> present` を実行計画として持ち、resource state から explicit barrier plan を生成する。SMAA の edge/weight は専用中間 target、color neighborhood は composition 済み `PostColor` だけを読み、SSR/SSAO/bloom/GodRay/camera grading 後の画像へ適用する。既定は空間 SMAA、TAA は現在 dormant。CSMは4層を1つの安定したlight-space gridで更新し、PCSSの最終filterは比較サンプラのhardware PCFを使う。
 - shader source は機能別に分けた Slang (`crates/gr-render/shaders/{shared,scene,shadow,post}/`) を `build.rs` で SPIR-V にする。`slangc` と `spirv-val` を使い、生成 asset registry は `renderer::vulkan::shader` に集約する。temporary debug triangle pipeline は削除済みで、asset 未ロード時は scene clear frame を present する。
-- 通常の `performance()` path は local light がない frame で専用 `SCENE_FAST_PATH` shader を選ぶ。local-light code と normal/material metadata target への書き込みを省き、opaque variant では alpha discard も compile しない。さらに AA / SSAO / SSR / bloom / god-rays の実 push 値がすべて無効なら専用 post fast pipeline を選び、scene color 1 sample と共有 camera effects / tone mapping だけを実行する。
-- god ray は balanced 以下では従来の画面空間ソース／放射近似を維持し、`high_quality()` では常時走る指数高さFogの中へCSM遮蔽付き太陽散乱を積分する。各画素のワールドカメラレイを32ステップ進め、Beer-Lambert透過・Henyey-Greenstein位相・ambient in-scatteringを計算するため、光源が画面外でもFogが残り、光源方向だけに依存しない。品質パスではradial blurを重ねず、積分位置をフレーム位相付きinterleaved-gradient blue noiseでずらし、3x3 neighborhood clamp付きのGod Ray temporal accumulationで層状ノイズを平均する。
+- SMAA は最終 `PostColor` を入力に、公式 1x の local-contrast edge、SearchTex line search、AreaTex pattern coverage、directional neighborhood resolve を評価する。edge detector の `PostColor` tap は point read、`edgesTex`/`blendTex` と LUT の検索は linear+clamp、最終色の resolve も linear read とし、事前に色を平均してエッジを消さない。
+- SSAO は固定近傍比較ではなく、GTAO型のview-space horizon searchとcosine-weighted analytic arc integrationを使う。品質値は2/3/4 slices × 2/3/4 steps（8/18/32 taps）へ展開し、平方距離分布、near-field falloff、receiver bias、thin-occluder compensationを適用する。TAAがdormantのため、ノイズ回転はフレーム間で固定し、まず単フレームの接触・平面・細線挙動を安定させる。
+- 通常の feature-disabled path は local light がない frame で専用 `SCENE_FAST_PATH` shader を選ぶ。local-light code と normal/material metadata target への書き込みを省き、opaque variant では alpha discard も compile しない。さらに機能ビットと連続値の両方が無効なら専用 post fast pipeline を選び、scene color 1 sample と共有 camera effects / tone mapping だけを実行する。
+- god ray の経路は feature bit で選択し、連続な Fog 密度・距離・サンプル予算は `SetQualitySettings` で調整する。`high_quality()` の本番 route は専用 half-resolution GodRay camera-ray volume（48 個別 jitter strata）で analytic height medium を積分し、view-depth を ray cosine で実距離化する。directional CSM/PCSS と deep translucent log-transmittance、Henyey-Greenstein位相、ambient in-scatteringを同じ ray 上で評価し、Beer-Lambert透過を適用する。短い raster far clip でも medium range は設定距離まで維持し、半解像度 bilateral upscale 後に PostColor へ合成して SMAA へ渡す。各 frame の sample phase/light motion/feedback は共有 temporal state から供給し、mask/history の再投影と履歴 clamp を行う。PCSS は scene MRT の visibility と receiver depth だけを別の ping-pong history へ保存し、BRDF/直接光は現フレーム値を使う。カメラ・light・surface・品質変更では両履歴を破棄する。
 - Vulkan timestamp 対応環境では、`RUST_LOG=gr_render::renderer::vulkan::gpu_timing=trace` を指定すると通常描画command bufferへpass checkpointを追加する。fence完了後にcommand buffer全体の `gpu_frame_ms`、passごとの `gpu_pass_ms`、最終記録pass後の `gpu_command_buffer_tail_ms` をtraceし、present待ちを含むCPU時間はGPU描画時間として扱わない。
 - Stage 4 first draw は window capture で triangle 表示確認済み。
 - winit resize は command channel を詰まらせないよう、in-flight 1 件と pending 最新 1 件に coalesce する。stale な resize は live surface capabilities で解決した extent を現在値と比較し、同一なら swapchain と pipeline を再生成しない。
@@ -70,15 +74,15 @@
 - `old/assets/model.glb` は app-level sample として `rebuild1/assets/model.glb` にコピー済み。window path はこのファイルが存在するときだけ `LoadAsset` を送り、全 mesh/material pair を `render_items` として submit する。
 - `render_items` は `vulkan/mesh.rs` の mesh pipeline で indexed draw を記録する。`FrameSnapshot` は owned `CameraSnapshot` を持ち、mesh shader は app-side camera の view-projection で world-space GLB を描画する。
 - window path は old-style free camera controls を持つ。left click で cursor capture、Escape で release、WASD/arrow、Space/E、Shift/Q、Ctrl、mouse wheel で移動する。
-- directional shadow は device-owned の単一 D16 array（4 cascade）へ保存する。CSMの段数とsplitは全プリセットで固定し、品質プリセットは4層すべての共有解像度だけを切り替える（performance 2048、interactive 3072、balanced 4096、high 8192。`REBUILD1_SHADOW_MAP_SIZE` は全層に対する上書き）。各cascadeはcamera frustumを包む固定sphereから正方形projectionを作り、隣接cascadeの受け面をオーバーラップさせ、light-space中心を1 shadow texel単位でsnapするため、カメラ移動でshadowが泳がない。local cubemapは独立したdepth resourceを維持する。
-- blocker探索だけがraw depth samplerを使い、raw depthはLINEARでcoverage遷移を滑らかにする。最終PCSS filterは `compareEnable = true`、`LESS_OR_EQUAL`、LINEAR filter の `SampleCmpLevelZero` を使う。各タップがVulkanの2x2 hardware PCFを利用し、オーバーラップ区間では隣接層をブレンドする。Receiver Plane Depth Biasでタップ位置ごとの受け面深度勾配も補正し、規則的な横縞を抑える。biasはD16の2段量子化余裕、texel/depth-span、receiverのslope、receiver-planeの1 texel勾配を合成し、品質設定のreceiver/slope/normal/plane scaleで調整する。PCSSの回転seedは連続ワールド座標のsinハッシュを使わず、ラスタピクセルとcascadeを整数混合するため、サブユニット周期のパターンを作らない。blocker平均は量子化幅内をsoft weightし、比較用biasとpenumbra計算用receiver深度を分離する。品質設定はblocker/filter tap数、太陽角半径、receiver/slope/normal/plane bias、contact detailを制御する。
+- directional shadow は device-owned の単一 D16 array（4 cascade）へ保存する。CSMの段数とsplitは固定し、共有解像度・tap数・biasなどの連続値は `SetQualitySettings` で個別に変更する。キー1〜4はこの連続プロファイルも performance / interactive / balanced / high へ切り替える。各cascadeはcamera frustumを包む固定sphereから正方形projectionを作り、隣接cascadeの受け面をオーバーラップさせ、light-space中心を1 shadow texel単位でsnapするため、カメラ移動でshadowが泳がない。directional map はカメラ/光源/キャスター集合と resource 状態を署名し、変化がないフレームでは再描画せず永続配列を再利用する。local cubemapは独立したdepth resourceを維持する。
+- blocker探索だけがraw depth samplerを使い、raw depthはLINEARでcoverage遷移を滑らかにする。最終PCSS filterは `compareEnable = true`、`LESS_OR_EQUAL`、LINEAR filter の `SampleCmpLevelZero` を使う。各タップがVulkanの2x2 hardware PCFを利用し、オーバーラップ区間では隣接層をブレンドする。Receiver Plane Depth Biasでタップ位置ごとの受け面深度勾配も補正し、規則的な横縞を抑える。biasはD16の2段量子化余裕、texel/depth-span、receiverのslope、receiver-planeの1 texel勾配を合成し、品質設定のreceiver/slope/normal/plane scaleで調整する。PCSSの回転seedは連続ワールド座標のsinハッシュを使わず、ラスタピクセルとcascadeを整数混合した基底へ共有64フレーム低差異位相を加えるため、サブユニット周期のパターンを作らない。blocker平均は量子化幅内をsoft weightし、比較用biasとpenumbra計算用receiver深度を分離する。品質設定はblocker/filter tap数、太陽角半径、receiver/slope/normal/plane biasを制御する。
 - glTF import は node transform を vertex へ bake した後、同一 material の近接した opaque/cutout primitive だけを上限付き spatial batch にまとめる。camera/CSM culling 境界を保つため遠い geometry は混ぜず、描画順が必要な transparent primitive は結合しない。
 - glTF の `MASK` triangle は、bilinear filter と `REPEAT` を含む完全な texture footprint を summed-area alpha classifier で保守的に判定する。全 footprint が確実に opaque の triangle だけを opaque material へ分離し、確実に transparent の triangle は除去する。判定不能または mixed の triangle は cutout のまま残す fail-closed specialization とする。
 - mesh LOD は三角形を単純に間引かない。meshoptimizer の `Medium = LockBorder`、`Low = None`、`VeryLow = Regularize` で index LOD を作り、normal / material UV を attribute error に渡す。vertex-cache reorder と opaque/cutout の overdraw reorder は維持し、transparent の triangle order は変えない。
 - directional shadow geometry のLOD選択は共有shadow-mapの実解像度と投影texel budgetに従う。CSMの解像度をカスケードごとに変えたり、近距離専用の段を追加したりせず、全層同一の解像度で遠距離のsub-texel triangleだけを送らない。
 - GPU vertex は 12-byte position stream と 20-byte surface stream の SoA に分ける。opaque shadow path は position stream だけを bind し、alpha-cutout shadow path だけが material UV を含む surface stream も読む。
 - translucent directional shadowは基準方向（direction 0）だけを描画し、opaque D16 arrayをsampleして最前面casterのRGBA16F transmittance/depthを記録する。4 cascadeのfixed-function D32 depthはpassごとにclearする単一scratchを共有する。scene shaderは色付き透過を基準方向の結果へ一度だけ適用し、方向サンプル数に比例した重複合成を避ける。
-- swapchain dependent resource は scene color/depth、normal/material、TAA history、post framebuffer を持つ。TAAはstable-grid reprojection、2x2 depth候補、同一surfaceのnormal/count、YCoCg variance clampで蓄積する。透明coverageが前後で変わるpixelは履歴を棄却し、一致するpixelだけreactiveな短い履歴でjitterを抑える。post pipeline はTAA済みHDRとmetadataを読み、material reflectance aware SSR、SSAO、camera effects、tone mappingをfullscreen triangleで書く。旧screen-space shadow blurは持たない。
+- swapchain dependent resource は scene color/depth、normal/material、PCSS visibility のフル解像度 ping-pong history、post composition target/framebuffer、SMAA の RG `edgesTex` / RGBA `blendTex` target と、機能を有効にしたときだけ作る TAA history を持つ。TAA は stable-grid reprojection、2x2 depth候補、同一surfaceのnormal/count、YCoCg variance clampを実装するが、現在の production path では無効。post composition pipeline は scene HDR と metadata を読み、material reflectance aware SSR、SSAO、bloom、GodRay、camera effects、tone mappingを `PostColor` へ書く。SMAA の3本のpipelineが `PostColor -> edgesTex -> blendTex` を通し、swapchain へ書く。旧screen-space shadow blurは持たない。
 - `vulkan/material.rs` は imported texture payload を sampled image へ upload し、material parameter buffer と descriptor set を作る。暗黙 fallback texture は作らない。
 - Stage 8 で GLB base-color texture、vertex normal、material texture sampling、alpha cutout shadow、scene shadow sampling、post camera effects を通した。
 - Stage 9 shadow slice で fixed cascade shadow、translucent shadow pass、cascade descriptor indexing、sampled opaque-depth rejection、transparent shadow smoke scene を通した。
@@ -87,7 +91,7 @@
 - mesh pipeline は scene / opaque shadow / translucent shadow ごとに untextured/textured variant を持ち、texture descriptor がある material だけ texture sampling shader を使う。
 - `REBUILD1_WINDOW_ASSET=assets/stage8_textured_cutout.r1scene` で fixed texture/cutout verification scene を window smoke に流せる。
 - `REBUILD1_WINDOW_ASSET=assets/stage9_translucent_shadow.r1scene` で transparent shadow verification scene を window smoke に流せる。
-- `--window-smoke` は `assets/model.glb` がある場合に asset load 後の mesh frame まで待って自動終了する。
+- `--window-smoke` は既存の asset path を必須とし、asset load 後に指定数の mesh frame を present して自動終了する。`REBUILD1_WINDOW_QUALITY=high` は feature preset 4（Volumetric/専用 GodRay volume をON）を指定し、連続値予算は renderer の現在設定を維持する。`verify-renderer.ps1 -Mode smoke -QualitySequence '1,4,1,4'` では機能ビットの切替を反復検証できる（PowerShellでは列を文字列として渡す）。
 - asset load 失敗時に renderer が cube や placeholder を作る経路はない。
 - まだ独立した user task、reflection JSON を使った descriptor codegen、screenshot golden image は未実装。
 
@@ -130,11 +134,12 @@ renderer/
   vulkan/
     buffer.rs    # host-visible typed buffer upload helper
     debug.rs     # validation layer and debug messenger
-    swapchain.rs # swapchain image views, fixed shadows, scene/post render passes, framebuffers
+    swapchain.rs # swapchain image views, fixed shadows, scene/post resources
     frame.rs     # frames in flight, command pools, sync, frame execution
     material.rs  # sampled images, sampler, material parameter buffers, descriptor sets
     mesh.rs      # backend-local mesh vertex/index buffers and mesh pipeline
-    post.rs      # scene_color sampling and swapchain post pipeline
+    post.rs      # post composition and three-pass SMAA pipelines
+    taa.rs       # optional temporal history route (dormant by default)
   graph/         # pass declarations, resources, barriers
   targets/       # depth, shadow, scene color
   pipeline/      # shader interface, shader modules, layouts, pipeline cache

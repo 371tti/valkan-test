@@ -58,8 +58,11 @@ void main(float4 sv_position : SV_Position) {
         discard;
     }
     float3 color = frag_color.rgb * material.base_color_factor.rgb;
+    // RGB is additive log-transmittance, so multiple transparent layers commute regardless of
+    // raster draw order. Alpha remains the nearest layer depth (MIN blend state).
+    float3 transmittance = translucent_transmittance(color, alpha);
     out_transmittance = float4(
-        translucent_transmittance(color, alpha),
+        log(max(transmittance, float3(0.0001))),
         clamp(sv_position.z, 0.0, 1.0)
     );
 }

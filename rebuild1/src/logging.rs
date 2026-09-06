@@ -20,13 +20,12 @@ pub fn init_default() {
 #[cfg(not(feature = "logging"))]
 pub fn init_default() {}
 
-/// Builds the logging filter while keeping rebuild1 trace enabled by default.
+/// Builds the logging filter, respecting an explicit `RUST_LOG` override.
 #[cfg(feature = "logging")]
 fn logging_filter() -> EnvFilter {
     let value = std::env::var("RUST_LOG")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("{DEFAULT_FILTER},{value}"))
         .unwrap_or_else(|| DEFAULT_FILTER.to_owned());
 
     EnvFilter::try_new(value).unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))

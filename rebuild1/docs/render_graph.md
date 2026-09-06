@@ -44,9 +44,8 @@ TranslucentShadow0
 TranslucentShadow1
 TranslucentShadow2
 TranslucentShadow3
-TemporalShadowCurrent
-TemporalShadowHistory0
-TemporalShadowHistory1
+PcssShadowHistory0
+PcssShadowHistory1
 TaaHistory0
 TaaHistory1
 FrameUniformBuffer
@@ -89,14 +88,18 @@ RenderPass
 | Order | Pass | Reads | Writes | Notes |
 | --- | --- | --- | --- | --- |
 | 1 | `shadow_direction_0..3/cascade_0..3` | mesh packets | D16 array layer | 4 cascadeをstable light-space gridへ描き、各層は1回だけ更新する。 |
-| 2 | `translucent_shadow_0..3` | CSM depth, mesh packets | nearest transmittance/depth | 基準方向だけを使い、depth test/writeで最前面のtransparent casterだけを残す。 |
-| 3 | `scene` | D16 array, transmittance maps | scene HDR, normal/roughness, depth | blocker探索はraw depth、PCSSの最終filterは比較サンプラのhardware 2x2 PCFで評価し、cascade境界をblendする。 |
-| 4 | `taa` | scene HDR、opaque depth/normal、transparent metadata、previous TAA history | HDR TAA history | stable-grid reprojection、同一surfaceのhistory count、YCoCg variance clampで蓄積する。transparent coverageの不一致は棄却し、一致時はreactive blendする。 |
-| 6 | `post` | TAA history, jittered scene metadata, bloom/god-ray histories | swapchain image | stable output UVをjittered metadata UVへ明示変換し、SSAO、SSR、bloom、god rays、tone mapping、camera effectsを適用する。 |
-| 7 | `framebuffer_readback` | swapchain image | CPU readback buffer | requestがあるframeだけfinal framebuffer summaryを返す。 |
-| 8 | `present` | swapchain image | external presentation | side effect passとしてcullingから守る。 |
+| 2 | `translucent_shadow_0..3` | CSM depth, mesh packets | deep log-transmittance/depth | 基準方向だけを使い、RGBを加算ログ透過率、AをMIN最前面深度として保存する。 |
+| 3 | `scene` | D16 array, transmittance maps, previous `PcssShadowHistory` | scene HDR, normal/roughness, depth, current `PcssShadowHistory` | blocker探索はraw depth、PCSSの最終filterは比較サンプラのhardware 2x2 PCFで評価し、cascade境界をblendする。visibility と receiver view-depth だけを前フレームへ再投影して時間積分する。 |
+| 4 | `taa` (optional) | scene HDR、opaque depth/normal、transparent metadata、previous TAA history | HDR TAA history | stable-grid reprojection、同一surfaceのhistory count、YCoCg variance clampで蓄積する。現在の production default は dormant で、post composition 後の専用 SMAA pass を使う。 |
+| 5 | `bloom_*`, `god_ray_*` (optional) | resolved scene, CSM/translucent shadows, bloom/god-ray histories | post inputs | quality と光源に応じた bloom、専用 half-resolution camera-ray GodRay volume（48 strata）と履歴を作る。旧3Dボリューム経路は存在しない。 |
+| 6 | `post` | resolved scene, metadata, bloom/god-ray histories | `PostColor` | stable output UVをjittered metadata UVへ明示変換し、SSAO、SSR、camera effects、tone mappingを完全な composition として書く。 |
+| 7 | `smaa_edges` | `PostColor` | `edgesTex` (RG) | 公式 luma/local-contrast edge detection。 |
+| 8 | `smaa_weights` | `edgesTex`, SearchTex, AreaTex | `blendTex` (RGBA) | quarter-pixel linear search と AreaTex pattern coverage。 |
+| 9 | `smaa` | `PostColor`, `blendTex` | swapchain image | 公式 directional neighbourhood blending。 |
+| 10 | `framebuffer_readback` | swapchain image | CPU readback buffer | requestがあるframeだけfinal framebuffer summaryを返す。 |
+| 11 | `present` | swapchain image | external presentation | side effect passとしてcullingから守る。 |
 
-Directional depthは一つのD16 arrayとして管理し、同じ方向を全cascadeで共有します。soft shadowは空間的な大半径filterではなく、太陽円盤上の方向jitterと時間履歴で収束させます。shadow historyはTAAと同じprevious view-projection、linear depth、world-space normal判定を使います。
+Directional depthは一つのD16 arrayとして管理し、同じ方向を全cascadeで共有します。soft shadowは空間的な大半径filterではなく、太陽円盤上の方向jitterとhardware PCFで評価します。PCSS visibility と専用 GodRay はそれぞれ独立した2枚の ping-pong history を持ち、カメラ・light・surface・品質の discontinuity では共有 temporal state とともに破棄します。TAA は optional で、GodRay の temporal history は別の ping-pong resource として扱います。
 
 ## Resize
 
@@ -106,6 +109,7 @@ resize では swapchain dependent resource だけを破棄して作り直しま�
 
 - swapchain images/views
 - scene color/depth
+- dedicated GodRay half-resolution targets and histories, plus PCSS visibility/history targets, are recreated with the swapchain for descriptor compatibility
 - graph resource description
 - swapchain format に依存する pipeline
 
@@ -126,11 +130,11 @@ resize では swapchain dependent resource だけを破棄して作り直しま�
 - graph: pass の依存関係と command 記録順
 - schedule: その frame で pass を実行するか
 
-shadow を light 変化時だけ更新する、readback を request frame だけ実行する、という判断は schedule の責務です。
+shadow をカメラ/光源/キャスター集合の変化時または resource invalidate 時だけ更新する、readback を request frame だけ実行する、という判断は schedule の責務です。CSM の深度配列は device-owned の永続資源として scene が継続利用します。
 
 ## Stage 7.5 compiler gate
 
-Stage 7.5 では fixed swapchain graph をやめ、pass/resource 宣言から plan を生成します。現在のexecutorはこのplanを実際に使い、Stable CSM depth array、translucent shadow、scene、TAA、post、readback、presentのimage layout transitionをgraph barrierから記録します。
+Stage 7.5 では fixed swapchain graph をやめ、pass/resource 宣言から plan を生成します。現在のexecutorはこのplanを実際に使い、Stable CSM depth array、deep translucent shadow、scene、専用 GodRay volume、optional TAA、bloom、post composition、SMAA edge/weight/neighbourhood の3段、readback、presentのimage layout transitionをgraph barrierから記録します。
 
 compiler が行うこと:
 
@@ -156,15 +160,15 @@ translucent_shadow_3
   writes: translucent_shadow_N
 
 scene
-  reads: stable_csm_depth_array, translucent_shadow_0..3
-  writes: scene_color, scene_depth, scene_normal
+  reads: stable_csm_depth_array, translucent_shadow_0..3, pcss_shadow_history[previous]
+  writes: scene_color, scene_depth, scene_normal, pcss_shadow_history[current]
 
-taa
+taa (optional; dormant in production default)
   reads: scene HDR, scene depth/normal/transparent metadata, previous TAA history
   writes: taa_history[current]
 
 post
-  reads: taa_history[current]
+  reads: resolved scene color, scene metadata, bloom/god-ray histories
   writes: swapchain_image
 
 present

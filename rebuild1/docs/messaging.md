@@ -41,6 +41,7 @@ RendererCommand
   SetDebugOptions
   SetFramebufferReadback
   SetQualitySettings
+  SetQualityFeatures
   SubmitFrame
   CaptureScreenshot
   Shutdown
@@ -83,7 +84,7 @@ FrameSnapshot
 
 `camera_effects` は app/user/ECS 側で決めた露出、white balance、contrast、saturation の owned snapshot です。renderer は framebuffer 外側の world や camera controller を読みに行かず、post pass でこの値だけを使います。暗所保護の方針として、メータリングがほぼ黒のときは exposure を強く上げず、光がない領域を黒いまま残します。
 
-`RenderQualitySettings` は `FrameSnapshot` ではなく `SetQualitySettings` で送ります。SSR、SSAO、AA、lighting wrap、renderer-wide contrast のような「renderer が frame をどう解釈して実行するか」は ECS world の snapshot ではなく renderer 状態として扱います。
+連続値の renderer 設定（SSR/SSAO/AA の強度・半径・sample budget、PCSSのtap数・解像度・光源角半径・bias、lighting wrap、renderer-wide contrast など）は `SetQualitySettings(RenderQualitySettings)` で送ります。機能をON/OFFするだけの変更は `SetQualityFeatures(RenderFeatureToggles)` で送り、既存の連続値を変更しません。window の1〜4はこの2種類を組み合わせ、プロファイルの連続値と機能集合を同時に切り替えます。どちらも ECS world の snapshot ではなく renderer 状態として扱います。
 
 `render_items` は renderer protocol 用の packet です。
 

@@ -13,6 +13,13 @@ struct GodRayParams {
     float4 color0;
     float4 source1;
     float4 color1;
+    // xy = scene projection jitter in NDC.  The low-resolution mask/ray target is stable, while
+    // scene color/depth lookups still refer to the current jittered raster.
+    float4 jitter_ndc;
+    // x = source-history feedback, y = light-motion response, z = shared low-discrepancy
+    // source phase, w = reset marker. The volumetric mask and temporal resolve use these lanes;
+    // legacy radial passes leave their values unused.
+    float4 temporal;
 };
 [[vk::push_constant]] ConstantBuffer<GodRayParams> params;
 

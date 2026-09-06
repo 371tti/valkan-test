@@ -10,28 +10,36 @@ bool temporal_uv_valid(float2 uv) {
     return all(uv >= float2(0.0)) && all(uv <= float2(1.0));
 }
 
-// History images live on the stable output pixel grid. Matrix reprojection through two jittered
-// projections contains the sampling-phase delta, which would move even a static pixel every
-// frame. Remove that delta before reading any temporal history.
+// History images are written on the output lattice, but their color/depth at a pixel still comes
+// from the jittered scene sample that produced that frame. The exact previous jittered projection
+// is therefore the correct same-world history coordinate. A caller may derive a stable fallback
+// coordinate when the exact footprint is disoccluded, but it must not replace the normal path.
 float2 temporal_stable_previous_uv(
     float2 matrix_previous_uv,
     float2 current_jitter_pixels,
     float2 previous_jitter_pixels,
     float2 texel_size
 ) {
+    // Keep this helper for the explicit stable-grid fallback used by TAA and pre-TAA consumers.
+    // The primary TAA lookup intentionally uses the unmodified matrix projection above.
     return matrix_previous_uv +
         (current_jitter_pixels - previous_jitter_pixels) * texel_size;
 }
 
-// Chooses the depth sample around a sub-pixel reprojection that best matches the projected
-// surface. A single nearest sample flips between adjacent surfaces as jitter changes phase;
-// searching the bilinear footprint makes rejection stable without accepting unrelated depth.
-bool temporal_best_previous_depth_sample(
+// Reconstructs a history color continuously over the four texels covered by a sub-pixel
+// reprojection while keeping foreground/background surfaces separate.  Picking one texel is
+// stable for rejection, but it turns the history itself into a nearest-neighbour signal: as the
+// Halton phase crosses a texel edge, the selected center jumps and the volumetric shaft flickers
+// in rectangular pixels.  Depth-aware bilinear weights retain the continuous motion coordinate
+// on a flat surface and remove only samples belonging to a different depth layer.
+float4 temporal_depth_aware_history_sample(
+    Sampler2D previous_history_color,
     Sampler2D previous_linear_depth,
     float2 previous_uv,
     float expected_previous_linear_depth,
     float absolute_threshold,
     float relative_threshold,
+    bool jitter_only,
     out int2 best_coordinate,
     out float depth_confidence
 ) {
@@ -44,6 +52,8 @@ bool temporal_best_previous_depth_sample(
         abs(expected_previous_linear_depth) * max(relative_threshold, 0.0);
     allowed_difference = max(allowed_difference, 0.000001);
 
+    float4 weighted_color = float4(0.0);
+    float weight_sum = 0.0;
     float best_error = 3.402823466e+38;
     float best_spatial_weight = -1.0;
     best_coordinate = clamp(base_coordinate, int2(0), dimensions - int2(1));
@@ -62,6 +72,26 @@ bool temporal_best_previous_depth_sample(
             float spatial_weight =
                 (x == 0 ? 1.0 - fraction.x : fraction.x) *
                 (y == 0 ? 1.0 - fraction.y : fraction.y);
+            float normalized_error = error / allowed_difference;
+            // Jitter-only history still needs depth separation.  Treating every tap as compatible
+            // at a static edge blends the foreground and background colors into one history texel;
+            // the next Halton phase then unblends a different pair and the pixel flashes.  Use a
+            // broad *continuous* shoulder for jitter-only reprojection instead of the old binary
+            // reject: quantized depth may move a matching tap slightly, while a real neighboring
+            // layer remains outside the shoulder.
+            float depth_weight = jitter_only
+                ? 1.0 - smoothstep(0.35, 2.0, normalized_error)
+                : 1.0 - smoothstep(0.30, 1.20, normalized_error);
+            float weight = spatial_weight * depth_weight;
+            if (weight > 0.0) {
+                // The depth footprint and history color share the same jittered raster. Keep the
+                // color lookup at the matching texel and use the hardware-linear sampler only for
+                // the sub-pixel footprint itself; this prevents a second unrelated layer from
+                // entering after depth filtering.
+                weighted_color += load_texel(previous_history_color, coordinate, 0) * weight;
+                weight_sum += weight;
+            }
+
             bool depth_is_better = error < best_error - 0.000001;
             bool equally_deep_but_closer =
                 abs(error - best_error) <= 0.000001 && spatial_weight > best_spatial_weight;
@@ -73,9 +103,19 @@ bool temporal_best_previous_depth_sample(
         }
     }
 
-    float normalized_error = best_error / allowed_difference;
-    depth_confidence = 1.0 - smoothstep(0.5, 1.0, normalized_error);
-    return depth_confidence > 0.0;
+    float normalized_best_error = best_error / allowed_difference;
+    depth_confidence = jitter_only
+        ? 1.0 - smoothstep(0.70, 2.0, normalized_best_error)
+        : 1.0 - smoothstep(0.70, 1.35, normalized_best_error);
+    if (weight_sum <= 0.000001) {
+        // A completely disoccluded footprint is the one case where the caller must discard the
+        // history.  Negative confidence is an explicit sentinel; confidence == 0 remains a valid
+        // (but fully reactive) footprint and is blended continuously instead of taking a binary
+        // history-valid branch.
+        depth_confidence = -1.0;
+        return float4(0.0);
+    }
+    return weighted_color / weight_sum;
 }
 
 float temporal_normal_confidence(

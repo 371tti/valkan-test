@@ -85,14 +85,40 @@ impl FramebufferReadbackState {
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
         config: FramebufferReadbackConfig,
     ) -> Result<(), VulkanError> {
+        let required_bytes = byte_size(config.extent, config.format).unwrap_or(0);
+        let can_read = self.options.enabled()
+            && config.transfer_src_supported
+            && config.image_count > 0
+            && color_order(config.format).is_some()
+            && required_bytes > 0;
+        // Build the replacement allocation before touching the currently active buffers. This keeps
+        // resize/reconfigure failures transactional: an allocation error leaves the old swapchain
+        // and its readback state usable instead of returning with a half-configured state.
+        let replacement_buffers = if can_read {
+            create_readback_buffers(
+                device,
+                memory_properties,
+                config.image_count,
+                required_bytes,
+            )?
+        } else {
+            Vec::new()
+        };
+
         self.destroy_buffers(device);
         self.extent = config.extent;
         self.format = config.format;
         self.transfer_src_supported = config.transfer_src_supported;
         self.frames_until_sample = 0;
-        self.byte_size = byte_size(config.extent, config.format).unwrap_or(0);
+        self.byte_size = required_bytes;
+        self.buffers = replacement_buffers;
+        self.copied = if can_read {
+            vec![None; config.image_count]
+        } else {
+            Vec::new()
+        };
 
-        if !self.can_read(config.image_count) {
+        if !can_read {
             tracing::trace!(
                 enabled = self.options.enabled(),
                 transfer_src_supported = self.transfer_src_supported,
@@ -103,14 +129,6 @@ impl FramebufferReadbackState {
             );
             return Ok(());
         }
-
-        self.buffers = create_readback_buffers(
-            device,
-            memory_properties,
-            config.image_count,
-            self.byte_size,
-        )?;
-        self.copied = vec![None; config.image_count];
 
         tracing::info!(
             width = config.extent.width(),

@@ -141,11 +141,12 @@ impl Drop for BloomBuild<'_> {
 }
 
 impl BloomPipeline {
+    /// Creates the bloom chain from the resolved scene color and its mip targets.
     pub(super) fn create(
         device: &Device,
         downsample_render_pass: vk::RenderPass,
         upsample_render_pass: vk::RenderPass,
-        taa_history_views: [vk::ImageView; 2],
+        source_view: vk::ImageView,
         bloom_views: &[vk::ImageView],
     ) -> Result<Self, VulkanError> {
         assert!(
@@ -160,13 +161,13 @@ impl BloomPipeline {
             take_created_ref(build.source_set_layout)?,
         )?);
         build.sampler = Some(create_sampler(device)?);
-        let set_count = bloom_views.len() + 1 + bloom_views.len().saturating_sub(1);
+        let set_count = bloom_views.len() + bloom_views.len().saturating_sub(1);
         build.descriptor_pool = Some(create_descriptor_pool(device, set_count as u32)?);
         build.downsample_sets = allocate_descriptor_sets(
             device,
             take_created_ref(build.descriptor_pool)?,
             take_created_ref(build.source_set_layout)?,
-            (bloom_views.len() + 1) as u32,
+            bloom_views.len() as u32,
         )?;
         build.upsample_sets = allocate_descriptor_sets(
             device,
@@ -178,7 +179,7 @@ impl BloomPipeline {
             device,
             &build.downsample_sets,
             take_created_ref(build.sampler)?,
-            taa_history_views,
+            source_view,
             bloom_views,
         );
         update_upsample_descriptors(
@@ -217,13 +218,8 @@ impl BloomPipeline {
         source_extent: vk::Extent2D,
         target_extent: vk::Extent2D,
         bloom: BloomQualitySettings,
-        taa_history_index: usize,
     ) -> Result<(), VulkanError> {
-        let descriptor_index = if mip_index == 0 {
-            taa_history_index.min(1)
-        } else {
-            mip_index + 1
-        };
+        let descriptor_index = mip_index;
         let descriptor_set = self.downsample_sets.get(descriptor_index).copied().ok_or(
             VulkanError::SwapchainImageIndexOutOfRange {
                 index: descriptor_index,
@@ -401,14 +397,14 @@ fn update_downsample_descriptors(
     device: &Device,
     sets: &[vk::DescriptorSet],
     sampler: vk::Sampler,
-    taa_history_views: [vk::ImageView; 2],
+    source_view: vk::ImageView,
     bloom_views: &[vk::ImageView],
 ) {
     for (index, &set) in sets.iter().enumerate() {
-        let source_view = if index < 2 {
-            taa_history_views[index]
+        let source_view = if index == 0 {
+            source_view
         } else {
-            bloom_views[index - 2]
+            bloom_views[index - 1]
         };
         update_source_descriptor(device, set, sampler, source_view);
     }

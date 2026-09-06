@@ -182,6 +182,24 @@ const SHADERS: &[Shader] = &[
         stage: "fragment",
     },
     Shader {
+        const_name: "POST_SMAA_FRAG",
+        source: "shaders/post/smaa.frag.slang",
+        output: "post_smaa.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
+        const_name: "POST_SMAA_EDGES_FRAG",
+        source: "shaders/post/smaa_edges.frag.slang",
+        output: "post_smaa_edges.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
+        const_name: "POST_SMAA_WEIGHTS_FRAG",
+        source: "shaders/post/smaa_weights.frag.slang",
+        output: "post_smaa_weights.frag.spv",
+        stage: "fragment",
+    },
+    Shader {
         const_name: "POST_FAST_FRAG",
         source: "shaders/post/post_fast.frag.slang",
         output: "post_fast.frag.spv",
@@ -192,6 +210,13 @@ const SHADERS: &[Shader] = &[
 fn main() {
     println!("cargo:rerun-if-env-changed=SLANGC");
     println!("cargo:rerun-if-env-changed=SPIRV_VAL");
+    for asset in [
+        "assets/smaa/area_tex.rg8",
+        "assets/smaa/search_tex.r8",
+        "assets/smaa/LICENSE.txt",
+    ] {
+        println!("cargo:rerun-if-changed={asset}");
+    }
     for source in shader_sources(Path::new("shaders")) {
         println!("cargo:rerun-if-changed={}", source.display());
     }

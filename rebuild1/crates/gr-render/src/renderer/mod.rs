@@ -276,6 +276,12 @@ impl RendererBackend for NullRendererBackend {
                         "null renderer accepted quality settings"
                     );
                 }
+                RendererCommand::SetQualityFeatures { features } => {
+                    tracing::trace!(
+                        feature_bits = features.bits(),
+                        "null renderer accepted quality feature switches"
+                    );
+                }
                 RendererCommand::Shutdown => {
                     tracing::info!("null renderer backend stopping");
                     asset_imports.shutdown();
@@ -511,19 +517,17 @@ mod tests {
 
         let mut loaded = false;
         while let Some(event) = endpoint.recv_event().await {
-            match event.payload {
-                RendererEvent::AssetLoaded {
-                    request_id: Some(id),
-                    asset,
-                } => {
-                    loaded = id == request_id
-                        && asset.scene.is_some()
-                        && asset.meshes.len() == 1
-                        && asset.materials.len() == 1
-                        && asset.textures.len() == 1;
-                    break;
-                }
-                _ => {}
+            if let RendererEvent::AssetLoaded {
+                request_id: Some(id),
+                asset,
+            } = event.payload
+            {
+                loaded = id == request_id
+                    && asset.scene.is_some()
+                    && asset.meshes.len() == 1
+                    && asset.materials.len() == 1
+                    && asset.textures.len() == 1;
+                break;
             }
         }
 
@@ -561,15 +565,13 @@ mod tests {
 
         let mut failed = false;
         while let Some(event) = endpoint.recv_event().await {
-            match event.payload {
-                RendererEvent::AssetLoadFailed {
-                    request_id: Some(id),
-                    reason,
-                } => {
-                    failed = id == request_id && reason.contains("does not exist");
-                    break;
-                }
-                _ => {}
+            if let RendererEvent::AssetLoadFailed {
+                request_id: Some(id),
+                reason,
+            } = event.payload
+            {
+                failed = id == request_id && reason.contains("does not exist");
+                break;
             }
         }
 

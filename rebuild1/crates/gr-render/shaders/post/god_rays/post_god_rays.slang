@@ -17,7 +17,10 @@ float volumetric_sample_surface_depth(float2 stable_uv) {
     // conservative footprint here, a low-res sample shortened by a single leaf would still be
     // labelled as background during upscale and would create a bright/thin fog seam beside it.
     float nearest = volumetric_surface_depth_at(stable_uv);
-    float2 footprint = params.aa.xy * 4.0 * 0.45;
+    // The production GodRay target is half resolution. Keep the bilateral footprint in
+    // full-resolution texel units; using the old quarter-resolution factor made the filter
+    // sample a too-small footprint and exposed the low-resolution ray strata directly.
+    float2 footprint = params.aa.xy * 2.0 * 0.45;
     float sample_depth = volumetric_surface_depth_at(stable_uv + float2( footprint.x, 0.0));
     if (!is_background_depth(sample_depth)) {
         nearest = min(nearest, sample_depth);
@@ -82,7 +85,7 @@ float god_ray_depth_similarity(float center_depth, float sample_depth, bool volu
 float4 god_ray_bilateral_upscale(float2 uv) {
     bool volumetric = post_volumetric_fog_enabled();
     float center_depth = depth_at(uv);
-    float2 low_texel = params.aa.xy * 4.0;
+    float2 low_texel = params.aa.xy * 2.0;
     float3 sum = float3(0.0);
     float transmittance_sum = 0.0;
     float total = 0.0;

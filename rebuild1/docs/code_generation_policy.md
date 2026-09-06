@@ -8,15 +8,15 @@
 
 ## 現在の短期目標
 
-Stage 7.5 の graph compiler foundation と real target slice は完了済みです。現在は `.r1scene` / GLB geometry を renderer-owned mesh record に変換し、asset load 時に Vulkan vertex/index buffer と texture/material descriptor を backend-local resource へ upload し、compiled graph が shadow cascades -> translucent shadow -> scene -> post -> optional readback -> present を実行します。
+Stage 7.5 の graph compiler foundation と real target slice は完了済みです。現在は `.r1scene` / GLB geometry を renderer-owned mesh record に変換し、asset load 時に Vulkan vertex/index buffer と texture/material descriptor を backend-local resource へ upload し、compiled graph が shadow cascades -> scene/PCSS visibility history -> optional TAA -> bloom/GodRay -> post composition (`PostColor`) -> SMAA edge/weight/blend -> optional readback -> present を実行します。TAA は production default で dormant、専用 GodRay volume と 2D temporal histories は swapchain extent と同期します。
 
 順序:
 
-1. mesh shader を base-color texture sampling へ進め、暗黙 white texture は作らない。
-2. shader interface validation の前に binding の散在を増やさない。
-3. texture / alpha cutout / cascade shadow / translucent shadow / camera effects の fixed visual scenes を用意する。
+1. high-quality dedicated GodRay の API/validation smoke を検証ゲートへ維持する。
+2. shader interface validation 後も binding の散在を増やさない。
+3. texture / alpha cutout / cascade shadow / translucent shadow / camera effects の visual acceptance は手動 capture で確認する。
 4. render graph は pass/resource/barrier の単一 owner として維持し、pass 内に layout transition を戻さない。
-5. graph optimizer は metadata から実 allocation / merge へ進めるときだけ拡張する。
+5. graph optimizer は profiler 実測後に実 allocation / merge へ進める。
 
 この段階では、ECS integration、async compute graph、複雑な importer registry を先に作り込まない。
 

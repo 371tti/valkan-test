@@ -12,6 +12,7 @@ use super::{
     VulkanError,
     mesh::{EmissiveLightUniforms, MAX_LOCAL_LIGHTS},
     shader::{self, assets},
+    taa::TemporalEffectFrame,
 };
 
 const SHADER_ENTRY: &CStr = shader::ENTRY;
@@ -25,6 +26,12 @@ const MASK_SCENE_COLOR_BINDING: u32 = 0;
 const MASK_SCENE_DEPTH_BINDING: u32 = 1;
 const MASK_TRANSPARENT_METADATA_BINDING: u32 = 2;
 const MASK_DIRECTIONAL_SHADOW_BINDING: u32 = 3;
+const MASK_TAA_DEPTH_0_BINDING: u32 = 4;
+const MASK_TAA_DEPTH_1_BINDING: u32 = 5;
+const MASK_TRANSLUCENT_SHADOW_0_BINDING: u32 = 6;
+const MASK_TRANSLUCENT_SHADOW_1_BINDING: u32 = 7;
+const MASK_TRANSLUCENT_SHADOW_2_BINDING: u32 = 8;
+const MASK_TRANSLUCENT_SHADOW_3_BINDING: u32 = 9;
 const SOURCE_BINDING: u32 = 0;
 const TEMPORAL_CURRENT_BINDING: u32 = 0;
 const TEMPORAL_HISTORY_BINDING: u32 = 1;
@@ -48,6 +55,15 @@ pub(super) struct GodRayPushConstants {
     color0: [f32; 4],
     source1: [f32; 4],
     color1: [f32; 4],
+    /// xy = current scene projection jitter in NDC. z = this frame's TAA depth-history index; w =
+    /// 1 when that stable history is valid. The low-resolution mask is evaluated on a stable
+    /// screen lattice, so its full-resolution scene/depth lookups must undo the same offset on the
+    /// legacy radial route.
+    jitter_ndc: [f32; 4],
+    /// x = source-history feedback, y = directional-light motion, z = shared sample phase,
+    /// w = temporal reset marker. The dedicated volumetric ray march consumes these values
+    /// directly; the legacy radial path ignores them.
+    temporal: [f32; 4],
 }
 
 impl GodRayPushConstants {
@@ -61,6 +77,9 @@ impl GodRayPushConstants {
         history_valid: bool,
         frame_id: u64,
         jitter_ndc: [f32; 2],
+        taa_history_write_index: usize,
+        taa_stable_metadata_valid: bool,
+        temporal: TemporalEffectFrame,
     ) -> Self {
         let bloom = quality.bloom();
         let sources = frame_god_ray_sources(
@@ -74,17 +93,23 @@ impl GodRayPushConstants {
         // scattering intentionally share this low-resolution history in the previous renderer
         // path, which keeps the temporal resolve stable while the scene is static.
         let fog = quality.fog();
-        let volumetric = bloom.volumetric_god_rays() || fog.enabled();
-        let volumetric_max_distance = camera
-            .far
-            .min(fog.max_distance().min(VOLUMETRIC_GOD_RAY_MAX_DISTANCE))
+        let volumetric = quality.features().volumetric_fog_enabled();
+        let volumetric_max_distance = fog
+            .max_distance()
+            .min(VOLUMETRIC_GOD_RAY_MAX_DISTANCE)
+            .max(camera.far)
             .max(camera.near + 0.05);
         let forward = normalize_or(sub3(camera.target, camera.eye), [0.0, 0.0, -1.0]);
         let right = normalize_or(cross3(forward, camera.up), [1.0, 0.0, 0.0]);
         let up = cross3(right, forward);
         // Keep the phase bounded so converting the protocol frame id to f32 never loses the
         // low bits that drive the spatiotemporal noise sequence after a long-running session.
-        let noise_frame = (frame_id % 4096) as f32;
+        // Keep the frame counter bounded for precision, but fold the shared light-aware phase
+        // into the actual source jitter. A post-resolve blend alone cannot remove a deterministic
+        // march layer; the source must evaluate different points when the sun moves.
+        let noise_frame = (frame_id % 4096) as f32
+            + temporal.sample_phase * 0.9375
+            + temporal.light_motion * 3.171875;
 
         Self {
             depth: depth_params(camera),
@@ -118,14 +143,19 @@ impl GodRayPushConstants {
             } else {
                 sources[1].source
             },
-            color1: if volumetric {
-                // The mask samples the jittered scene-depth MRT directly. Carry the same
-                // stable-to-raw UV correction used by the post pass without growing the push
-                // constant block.
-                [jitter_ndc[0], jitter_ndc[1], 0.0, 0.0]
-            } else {
-                sources[1].color
-            },
+            color1: sources[1].color,
+            jitter_ndc: [
+                jitter_ndc[0],
+                jitter_ndc[1],
+                (taa_history_write_index.min(1)) as f32,
+                if taa_stable_metadata_valid { 1.0 } else { 0.0 },
+            ],
+            temporal: [
+                temporal.sun_feedback,
+                temporal.light_motion,
+                temporal.sample_phase,
+                if temporal.reset { 1.0 } else { 0.0 },
+            ],
         }
     }
 }
@@ -146,10 +176,12 @@ pub(super) struct GodRaysPipeline {
     prefilter_set: vk::DescriptorSet,
     radial_set: vk::DescriptorSet,
     temporal_sets: [vk::DescriptorSet; 2],
+    volumetric_temporal_sets: [vk::DescriptorSet; 2],
     color_sampler: vk::Sampler,
     data_sampler: vk::Sampler,
     shadow_sampler: vk::Sampler,
     directional_shadow_view: vk::ImageView,
+    translucent_shadow_views: [vk::ImageView; 4],
 }
 
 struct GodRaysBuild<'a> {
@@ -169,10 +201,12 @@ struct GodRaysBuild<'a> {
     prefilter_set: Option<vk::DescriptorSet>,
     radial_set: Option<vk::DescriptorSet>,
     temporal_sets: Vec<vk::DescriptorSet>,
+    volumetric_temporal_sets: Vec<vk::DescriptorSet>,
     color_sampler: Option<vk::Sampler>,
     data_sampler: Option<vk::Sampler>,
     shadow_sampler: Option<vk::Sampler>,
     directional_shadow_view: Option<vk::ImageView>,
+    translucent_shadow_views: Option<[vk::ImageView; 4]>,
     finished: bool,
 }
 
@@ -195,10 +229,12 @@ impl<'a> GodRaysBuild<'a> {
             prefilter_set: None,
             radial_set: None,
             temporal_sets: Vec::new(),
+            volumetric_temporal_sets: Vec::new(),
             color_sampler: None,
             data_sampler: None,
             shadow_sampler: None,
             directional_shadow_view: None,
+            translucent_shadow_views: None,
             finished: false,
         }
     }
@@ -213,6 +249,16 @@ impl<'a> GodRaysBuild<'a> {
                 .get(1)
                 .copied()
                 .expect("god-ray temporal set 1 was not allocated"),
+        ];
+        let volumetric_temporal_sets = [
+            self.volumetric_temporal_sets
+                .first()
+                .copied()
+                .expect("god-ray volumetric temporal set 0 was not allocated"),
+            self.volumetric_temporal_sets
+                .get(1)
+                .copied()
+                .expect("god-ray volumetric temporal set 1 was not allocated"),
         ];
         let pipeline = GodRaysPipeline {
             mask_pipeline: take_created(&mut self.mask_pipeline, "god-ray mask pipeline"),
@@ -251,12 +297,17 @@ impl<'a> GodRaysBuild<'a> {
             prefilter_set: take_created(&mut self.prefilter_set, "god-ray prefilter set"),
             radial_set: take_created(&mut self.radial_set, "god-ray radial set"),
             temporal_sets,
+            volumetric_temporal_sets,
             color_sampler: take_created(&mut self.color_sampler, "god-ray color sampler"),
             data_sampler: take_created(&mut self.data_sampler, "god-ray data sampler"),
             shadow_sampler: take_created(&mut self.shadow_sampler, "god-ray shadow sampler"),
             directional_shadow_view: take_created(
                 &mut self.directional_shadow_view,
                 "god-ray directional shadow view",
+            ),
+            translucent_shadow_views: take_created(
+                &mut self.translucent_shadow_views,
+                "god-ray translucent shadow views",
             ),
         };
         self.finished = true;
@@ -325,6 +376,8 @@ impl GodRaysPipeline {
         scene_depth_view: vk::ImageView,
         scene_transparent_normal_roughness_view: vk::ImageView,
         directional_shadow_view: vk::ImageView,
+        translucent_shadow_views: [vk::ImageView; 4],
+        taa_depth_history_views: [vk::ImageView; 2],
         mask_view: vk::ImageView,
         prefilter_view: vk::ImageView,
         blur_view: vk::ImageView,
@@ -351,6 +404,7 @@ impl GodRaysPipeline {
         build.data_sampler = Some(create_sampler(device, vk::Filter::NEAREST)?);
         build.shadow_sampler = Some(create_shadow_sampler(device)?);
         build.directional_shadow_view = Some(directional_shadow_view);
+        build.translucent_shadow_views = Some(translucent_shadow_views);
         build.descriptor_pool = Some(create_descriptor_pool(device)?);
         build.mask_set = Some(allocate_descriptor_set(
             device,
@@ -373,6 +427,12 @@ impl GodRaysPipeline {
             take_created_ref(build.temporal_set_layout)?,
             2,
         )?;
+        build.volumetric_temporal_sets = allocate_descriptor_sets(
+            device,
+            take_created_ref(build.descriptor_pool)?,
+            take_created_ref(build.temporal_set_layout)?,
+            2,
+        )?;
 
         update_mask_descriptor(
             device,
@@ -384,6 +444,8 @@ impl GodRaysPipeline {
             scene_depth_view,
             scene_transparent_normal_roughness_view,
             directional_shadow_view,
+            translucent_shadow_views,
+            taa_depth_history_views,
         );
         update_source_descriptor(
             device,
@@ -402,6 +464,13 @@ impl GodRaysPipeline {
             &build.temporal_sets,
             take_created_ref(build.color_sampler)?,
             blur_view,
+            history_views,
+        );
+        update_temporal_descriptors(
+            device,
+            &build.volumetric_temporal_sets,
+            take_created_ref(build.color_sampler)?,
+            mask_view,
             history_views,
         );
 
@@ -434,31 +503,61 @@ impl GodRaysPipeline {
         Ok(build.finish())
     }
 
-    /// Returns the directional shadow view currently bound to the volumetric mask pass.
-    pub(super) fn directional_shadow_view(&self) -> vk::ImageView {
-        self.directional_shadow_view
+    /// Returns whether the dedicated volume descriptors need to be rebound to current shadows.
+    pub(super) fn shadow_views_changed(
+        &self,
+        directional_shadow_view: vk::ImageView,
+        translucent_shadow_views: &[vk::ImageView; 4],
+    ) -> bool {
+        self.directional_shadow_view != directional_shadow_view
+            || self.translucent_shadow_views != *translucent_shadow_views
     }
 
-    /// Rebinds the CSM view after lazy shadow resources become available or are resized.
+    /// Rebinds the CSM and deep translucent shadow views after shadow resources become available
+    /// or are resized.
     pub(super) fn update_directional_shadow_view(
         &mut self,
         device: &Device,
         image_view: vk::ImageView,
+        translucent_shadow_views: [vk::ImageView; 4],
     ) {
-        if self.directional_shadow_view == image_view {
+        if self.directional_shadow_view == image_view
+            && self.translucent_shadow_views == translucent_shadow_views
+        {
             return;
         }
 
         let info = [depth_image_info(self.shadow_sampler, image_view)];
-        let writes = [descriptor_write(
-            self.mask_set,
-            MASK_DIRECTIONAL_SHADOW_BINDING,
-            &info,
-        )];
+        let translucent_info =
+            translucent_shadow_views.map(|view| image_info(self.data_sampler, view));
+        let writes = [
+            descriptor_write(self.mask_set, MASK_DIRECTIONAL_SHADOW_BINDING, &info),
+            descriptor_write(
+                self.mask_set,
+                MASK_TRANSLUCENT_SHADOW_0_BINDING,
+                std::slice::from_ref(&translucent_info[0]),
+            ),
+            descriptor_write(
+                self.mask_set,
+                MASK_TRANSLUCENT_SHADOW_1_BINDING,
+                std::slice::from_ref(&translucent_info[1]),
+            ),
+            descriptor_write(
+                self.mask_set,
+                MASK_TRANSLUCENT_SHADOW_2_BINDING,
+                std::slice::from_ref(&translucent_info[2]),
+            ),
+            descriptor_write(
+                self.mask_set,
+                MASK_TRANSLUCENT_SHADOW_3_BINDING,
+                std::slice::from_ref(&translucent_info[3]),
+            ),
+        ];
         unsafe {
             device.update_descriptor_sets(&writes, &[]);
         }
         self.directional_shadow_view = image_view;
+        self.translucent_shadow_views = translucent_shadow_views;
     }
 
     pub(super) fn draw_mask(
@@ -522,9 +621,15 @@ impl GodRaysPipeline {
         command_buffer: vk::CommandBuffer,
         target_extent: vk::Extent2D,
         write_history_index: usize,
+        volumetric: bool,
         push: GodRayPushConstants,
     ) -> Result<(), VulkanError> {
-        let descriptor_set = self.temporal_sets.get(write_history_index).copied().ok_or(
+        let descriptor_sets = if volumetric {
+            &self.volumetric_temporal_sets
+        } else {
+            &self.temporal_sets
+        };
+        let descriptor_set = descriptor_sets.get(write_history_index).copied().ok_or(
             VulkanError::SwapchainImageIndexOutOfRange {
                 index: write_history_index,
                 count: self.temporal_sets.len(),
@@ -851,6 +956,12 @@ fn create_mask_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, Vu
         sampler_binding(MASK_SCENE_DEPTH_BINDING),
         sampler_binding(MASK_TRANSPARENT_METADATA_BINDING),
         sampler_binding(MASK_DIRECTIONAL_SHADOW_BINDING),
+        sampler_binding(MASK_TAA_DEPTH_0_BINDING),
+        sampler_binding(MASK_TAA_DEPTH_1_BINDING),
+        sampler_binding(MASK_TRANSLUCENT_SHADOW_0_BINDING),
+        sampler_binding(MASK_TRANSLUCENT_SHADOW_1_BINDING),
+        sampler_binding(MASK_TRANSLUCENT_SHADOW_2_BINDING),
+        sampler_binding(MASK_TRANSLUCENT_SHADOW_3_BINDING),
     ];
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
@@ -951,10 +1062,10 @@ fn create_shadow_sampler(device: &Device) -> Result<vk::Sampler, VulkanError> {
 fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, VulkanError> {
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(10);
+        .descriptor_count(20);
     let pool_sizes = [pool_size];
     let create_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(5)
+        .max_sets(7)
         .pool_sizes(&pool_sizes);
 
     unsafe { device.create_descriptor_pool(&create_info, None) }.map_err(VulkanError::Vk)
@@ -993,11 +1104,16 @@ fn update_mask_descriptor(
     scene_depth_view: vk::ImageView,
     transparent_view: vk::ImageView,
     directional_shadow_view: vk::ImageView,
+    translucent_shadow_views: [vk::ImageView; 4],
+    taa_depth_history_views: [vk::ImageView; 2],
 ) {
     let color_info = [image_info(color_sampler, scene_color_view)];
     let depth_info = [image_info(data_sampler, scene_depth_view)];
     let transparent_info = [image_info(data_sampler, transparent_view)];
     let shadow_info = [depth_image_info(shadow_sampler, directional_shadow_view)];
+    let taa_depth_0_info = [image_info(data_sampler, taa_depth_history_views[0])];
+    let taa_depth_1_info = [image_info(data_sampler, taa_depth_history_views[1])];
+    let translucent_infos = translucent_shadow_views.map(|view| image_info(data_sampler, view));
     let writes = [
         descriptor_write(descriptor_set, MASK_SCENE_COLOR_BINDING, &color_info),
         descriptor_write(descriptor_set, MASK_SCENE_DEPTH_BINDING, &depth_info),
@@ -1010,6 +1126,28 @@ fn update_mask_descriptor(
             descriptor_set,
             MASK_DIRECTIONAL_SHADOW_BINDING,
             &shadow_info,
+        ),
+        descriptor_write(descriptor_set, MASK_TAA_DEPTH_0_BINDING, &taa_depth_0_info),
+        descriptor_write(descriptor_set, MASK_TAA_DEPTH_1_BINDING, &taa_depth_1_info),
+        descriptor_write(
+            descriptor_set,
+            MASK_TRANSLUCENT_SHADOW_0_BINDING,
+            std::slice::from_ref(&translucent_infos[0]),
+        ),
+        descriptor_write(
+            descriptor_set,
+            MASK_TRANSLUCENT_SHADOW_1_BINDING,
+            std::slice::from_ref(&translucent_infos[1]),
+        ),
+        descriptor_write(
+            descriptor_set,
+            MASK_TRANSLUCENT_SHADOW_2_BINDING,
+            std::slice::from_ref(&translucent_infos[2]),
+        ),
+        descriptor_write(
+            descriptor_set,
+            MASK_TRANSLUCENT_SHADOW_3_BINDING,
+            std::slice::from_ref(&translucent_infos[3]),
         ),
     ];
 
@@ -1245,5 +1383,60 @@ mod tests {
         assert!(shifted_source.source[0] > centered_source.source[0]);
         assert!(centered_source.color[0] > centered_source.color[2]);
         assert!(shifted_source.color[2] > shifted_source.color[0]);
+    }
+
+    #[test]
+    fn volumetric_push_keeps_medium_range_independent_of_raster_far_clip() {
+        let camera = CameraSnapshot::perspective(
+            [0.0, 1.8, 5.0],
+            [0.0, 1.5, 4.0],
+            [0.0, 1.0, 0.0],
+            60.0_f32.to_radians(),
+            0.03,
+            32.0,
+        )
+        .expect("test camera should be valid");
+        let quality = RenderQualitySettings::high_quality();
+        let base = GodRayPushConstants::new(
+            camera,
+            vk::Extent2D {
+                width: 640,
+                height: 360,
+            },
+            quality,
+            LightPacket::new(1.0),
+            EmissiveLightUniforms::disabled(),
+            false,
+            false,
+            12,
+            [0.0, 0.0],
+            0,
+            false,
+            TemporalEffectFrame::default(),
+        );
+        assert!(base.features[2] > 0.5);
+        assert!((base.source0[3] - 160.0).abs() < 0.001);
+
+        let mut moved = TemporalEffectFrame::default();
+        moved.sample_phase = 0.5;
+        moved.light_motion = 0.75;
+        let moved = GodRayPushConstants::new(
+            camera,
+            vk::Extent2D {
+                width: 640,
+                height: 360,
+            },
+            quality,
+            LightPacket::new(1.0),
+            EmissiveLightUniforms::disabled(),
+            false,
+            false,
+            12,
+            [0.0, 0.0],
+            0,
+            false,
+            moved,
+        );
+        assert_ne!(base.source1[3], moved.source1[3]);
     }
 }

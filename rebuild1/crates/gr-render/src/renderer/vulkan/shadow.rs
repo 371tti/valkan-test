@@ -1,7 +1,7 @@
 use ash::vk;
 
 use crate::{
-    math::{add3, cross3, dot3, identity_mat4, mul3, normalize_or, sub3},
+    math::{add3, cross3, dot3, identity_mat4, length3, mul3, normalize_or, sub3},
     protocol::{CameraSnapshot, LightPacket, RenderItemPacket, StableCsmPcssQualitySettings},
     renderer::{
         DEFAULT_AMBIENT_COLOR, DEFAULT_DIRECTIONAL_LIGHT_DIR, DEFAULT_SHADOW_CASCADE_METRICS,
@@ -273,7 +273,7 @@ pub(super) fn mesh_frame_uniform_for_light(
             stable_quality.blocker_search_samples() as f32,
             stable_quality.filter_samples() as f32,
             stable_quality.light_angular_radius_radians(),
-            f32::from(stable_quality.contact_shadows()),
+            0.0,
         ],
         stable_csm_receiver_params: [
             stable_quality.receiver_bias_scale(),
@@ -307,6 +307,8 @@ pub(super) fn mesh_frame_uniform_for_light(
         emissive_light_size_kind: emissive_lights.size_kind,
         emissive_light_count: emissive_lights.count,
         debug_view: [debug_view_mode as u32 as f32, 0.0, 0.0, 0.0],
+        previous_view_projection: identity_mat4(),
+        pcss_temporal: [0.0; 4],
     }
 }
 
@@ -679,6 +681,15 @@ fn shadow_caster_hash(items: &[RenderItemPacket]) -> u64 {
     hash
 }
 
+/// Returns the stable directional-map caster signature used by the persistent CSM cache.
+///
+/// The hash intentionally uses renderer packet identity and shadow flags only. Geometry/material
+/// uploads invalidate the cache separately, while camera/light/extent changes are represented by
+/// `ShadowFrameData` itself.
+pub(super) fn directional_shadow_caster_signature(items: &[RenderItemPacket]) -> u64 {
+    shadow_caster_hash(items)
+}
+
 /// Mixes one integer into a small deterministic FNV-1a hash.
 fn fnv1a(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
@@ -732,7 +743,12 @@ fn stable_csm_cascade_bounds_for_splits(
 
 /// Returns the shared camera-depth overlap width used by CPU projection fitting and the shader.
 fn shadow_cascade_overlap_width(split: f32) -> f32 {
-    (split.max(0.0) * 0.045).max(1.0)
+    // Volumetric injection samples the shadow field continuously along camera Z.  A narrow
+    // surface-only overlap leaves a whole volumetric interval on one side of a split, which becomes
+    // a visible GodRay slab even though the rasterized receiver transition looks acceptable.
+    // Keep this in lockstep with the 10% shader transition width so both maps cover every sample
+    // used by the blend.
+    (split.max(0.0) * 0.10).max(1.0)
 }
 
 fn shadow_caster_depth_reserve(
@@ -837,13 +853,31 @@ fn snap_shadow_center_with_basis(
 
 fn stable_light_basis(light_dir: [f32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let forward = normalize_or(light_dir, [0.0, -1.0, 0.0]);
-    let reference_up = if dot3(forward, [0.0, 1.0, 0.0]).abs() > 0.92 {
-        [0.0, 0.0, 1.0]
-    } else {
-        [0.0, 1.0, 0.0]
-    };
+    // Project the preferred world-up vector onto the light plane. Near either pole that projection
+    // becomes ill-conditioned, so blend to a fixed pole frame over a finite band instead of
+    // switching reference axes at one arbitrary dot-product threshold. The previous hard switch
+    // rotated the entire CSM basis by almost 90 degrees in one frame and invalidated every shadow
+    // texel at sunrise/sunset.
+    let world_up = [0.0, 1.0, 0.0];
+    let world_projection = sub3(world_up, mul3(forward, dot3(forward, world_up)));
+    let world_projection_length = length3(world_projection);
+    let world_basis = normalize_or(world_projection, [0.0, 0.0, 1.0]);
+    let pole_projection = sub3(
+        [0.0, 0.0, 1.0],
+        mul3(forward, dot3(forward, [0.0, 0.0, 1.0])),
+    );
+    let pole_basis = normalize_or(pole_projection, [1.0, 0.0, 0.0]);
+    let transition = ((world_projection_length - 0.05) / 0.20).clamp(0.0, 1.0);
+    let transition = transition * transition * (3.0 - 2.0 * transition);
+    let reference_up = normalize_or(
+        add3(
+            mul3(pole_basis, 1.0 - transition),
+            mul3(world_basis, transition),
+        ),
+        pole_basis,
+    );
     let right = normalize_or(cross3(forward, reference_up), [1.0, 0.0, 0.0]);
-    let up = cross3(right, forward);
+    let up = normalize_or(cross3(right, forward), reference_up);
 
     (forward, right, up)
 }
@@ -1114,6 +1148,19 @@ mod tests {
     }
 
     #[test]
+    fn stable_light_basis_is_continuous_across_the_pole_transition() {
+        let near_pole_a = normalize_or([0.034, 0.9994, 0.0], [0.0, 1.0, 0.0]);
+        let near_pole_b = normalize_or([0.028, 0.9996, 0.0], [0.0, 1.0, 0.0]);
+        let (_, right_a, up_a) = stable_light_basis(near_pole_a);
+        let (_, right_b, up_b) = stable_light_basis(near_pole_b);
+
+        assert!(dot3(right_a, right_b) > 0.98);
+        assert!(dot3(up_a, up_b) > 0.98);
+        assert!(dot3(right_a, up_a).abs() < 0.0001);
+        assert!(dot3(right_b, up_b).abs() < 0.0001);
+    }
+
+    #[test]
     fn stable_csm_cull_uses_one_projection_per_cascade() {
         let data = stable_csm_frame_data_for_resolution(
             camera(),
@@ -1167,6 +1214,91 @@ mod tests {
         for boundary in 0..SHADOW_CASCADE_COUNT - 1 {
             assert!(bounds[boundary].cascade_far > splits[boundary]);
             assert!(bounds[boundary + 1].cascade_near < splits[boundary]);
+        }
+    }
+
+    #[test]
+    fn stable_csm_projection_contains_all_receiver_corners() {
+        let camera = camera();
+        let extent = vk::Extent2D {
+            width: 1920,
+            height: 1080,
+        };
+        let stable =
+            stable_csm_frame_data_for_resolution(camera, extent, LightPacket::new(1.0), 4096);
+        let basis = camera_frustum_basis(camera, extent.width as f32 / extent.height as f32);
+        let bounds = stable_csm_cascade_bounds_for_splits(
+            camera,
+            extent.width as f32 / extent.height as f32,
+            camera.near.max(0.03),
+            stable.splits,
+            4096.0,
+        );
+        let mut cascade_near = camera.near.max(0.03);
+        for cascade in 0..SHADOW_CASCADE_COUNT {
+            let far = stable.splits[cascade];
+            let corners = camera_frustum_corners(basis, cascade_near, far);
+            for corner in corners {
+                let projected = transform_point(stable.view_proj[cascade], corner);
+                assert!(
+                    projected[0] >= -1.001
+                        && projected[0] <= 1.001
+                        && projected[1] >= -1.001
+                        && projected[1] <= 1.001
+                        && projected[2] >= -0.001
+                        && projected[2] <= 1.001,
+                    "cascade {cascade} corner {corner:?} projected outside NDC {:?} bounds center {:?} radius {}",
+                    projected,
+                    bounds[cascade].center,
+                    bounds[cascade].radius
+                );
+            }
+            cascade_near = far;
+        }
+    }
+
+    #[test]
+    fn far_cascade_covers_the_complete_volumetric_frustum_at_side_lighting() {
+        // Volumetric lighting can use the largest stable CSM as a single continuous shadow field.
+        // Verify the important worst case first: with the light perpendicular to the view, every
+        // camera-depth cascade boundary projects directly into the image and is otherwise visible
+        // as a stack of volumetric layers.
+        let camera = CameraSnapshot::perspective(
+            [0.0, 1.8, 5.0],
+            [0.0, 1.5, 4.0],
+            [0.0, 1.0, 0.0],
+            60.0_f32.to_radians(),
+            0.03,
+            160.0,
+        )
+        .expect("test camera is finite");
+        let extent = vk::Extent2D {
+            width: 1280,
+            height: 720,
+        };
+        let frustum = camera_frustum_basis(camera, extent.width as f32 / extent.height as f32);
+
+        for light_direction in [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]] {
+            let light =
+                LightPacket::new(1.0).with_direction_and_color(light_direction, [1.0, 1.0, 1.0]);
+            let stable = stable_csm_frame_data_for_resolution(camera, extent, light, 4096);
+            let far_projection = stable.view_proj[SHADOW_CASCADE_COUNT - 1];
+
+            for sample in 0..=16 {
+                let depth = camera.near + (camera.far - camera.near) * sample as f32 / 16.0;
+                for point in camera_frustum_corners(frustum, depth, depth) {
+                    let projected = transform_point(far_projection, point);
+                    assert!(
+                        projected[0] >= -1.001
+                            && projected[0] <= 1.001
+                            && projected[1] >= -1.001
+                            && projected[1] <= 1.001
+                            && projected[2] >= -0.001
+                            && projected[2] <= 1.001,
+                        "light {light_direction:?}, depth {depth}, point {point:?} missed far cascade: {projected:?}"
+                    );
+                }
+            }
         }
     }
 

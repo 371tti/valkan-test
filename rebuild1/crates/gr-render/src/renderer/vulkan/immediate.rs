@@ -24,19 +24,26 @@ pub(super) fn submit_immediate_commands(
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
     // Safety: the command buffer was allocated from this transient pool and is recorded once.
+    // Keep cleanup outside the fallible sequence so begin/end/submit/wait failures cannot leak the
+    // transient command buffer or pool.
+    let result: Result<(), vk::Result> = (|| {
+        unsafe {
+            device.begin_command_buffer(command_buffer, &begin_info)?;
+            record(command_buffer);
+            device.end_command_buffer(command_buffer)?;
+            let command_buffers = [command_buffer];
+            let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+            device.queue_submit(queue, &[submit_info], vk::Fence::null())?;
+            device.queue_wait_idle(queue)?;
+        }
+        Ok(())
+    })();
     unsafe {
-        device.begin_command_buffer(command_buffer, &begin_info)?;
-        record(command_buffer);
-        device.end_command_buffer(command_buffer)?;
-        let command_buffers = [command_buffer];
-        let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
-        device.queue_submit(queue, &[submit_info], vk::Fence::null())?;
-        device.queue_wait_idle(queue)?;
-        device.free_command_buffers(command_pool, &command_buffers);
+        device.free_command_buffers(command_pool, &[command_buffer]);
     }
     destroy_command_pool(device, command_pool);
 
-    Ok(())
+    result.map_err(VulkanError::Vk)
 }
 
 /// Records one image layout transition for setup-time images.

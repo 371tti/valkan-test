@@ -246,6 +246,7 @@ impl ShadowCascadeCull {
     ///
     /// The fixed-capacity array avoids per-cascade allocation. `view_proj_count` is authoritative:
     /// inactive identity slots must never make a caster appear relevant to an active direction.
+    #[cfg(test)]
     pub(super) fn with_light_space_projections(
         mut self,
         view_proj: [[f32; 16]; SHADOW_CASCADE_COUNT],
@@ -839,6 +840,33 @@ impl VulkanMeshStore {
                 count: self.frame_descriptor_sets.len(),
             },
         )
+    }
+
+    /// Updates the optional PCSS visibility history sampled by full scene fragment shaders.
+    pub(super) fn update_pcss_history_descriptor(
+        &self,
+        device: &Device,
+        frame_slot: usize,
+        sampler: vk::Sampler,
+        view: vk::ImageView,
+    ) -> Result<(), VulkanError> {
+        let descriptor_set = self.frame_descriptor_sets.get(frame_slot).copied().ok_or(
+            VulkanError::FrameSlotIndexOutOfRange {
+                index: frame_slot,
+                count: self.frame_descriptor_sets.len(),
+            },
+        )?;
+        let image_info = [vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info)];
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        Ok(())
     }
 
     /// Writes camera, shadow, and lighting parameters used by one frame slot.
@@ -1536,9 +1564,15 @@ fn shadow_lod_for_cascade(cascade_index: usize) -> MeshLodLevel {
     }
     match cascade_index {
         0 => MeshLodLevel::Full,
-        1 => MeshLodLevel::Low,
-        2 => MeshLodLevel::VeryLow,
-        _ => MeshLodLevel::VeryLow,
+        // Volumetric shadowing evaluates the same CSM silhouettes at many depths.  A
+        // VeryLow caster simplification can collapse thin/alpha-tested structures into one
+        // large planar silhouette; the repeated silhouette then appears as a stack of boxes
+        // after volumetric prefix integration. Keep the distant floors at Low (the previous
+        // quality/performance balance) and let adaptive_directional_shadow_lod promote them
+        // further when their projected texel budget requires it.
+        1 => MeshLodLevel::Medium,
+        2 => MeshLodLevel::Low,
+        _ => MeshLodLevel::Low,
     }
 }
 
@@ -1620,15 +1654,14 @@ fn shadow_cascade_contains_bounds(
     let radius = bounds.radius();
     let range = (shadow_cull.max_depth - shadow_cull.min_depth).max(1.0);
     let light_dir = normalize_or(DEFAULT_DIRECTIONAL_LIGHT_DIR, [0.0, -1.0, 0.0]);
-    let depth_visible = if dot3(forward, light_dir).abs() > 0.82 || radius >= range * 0.75 {
+    if dot3(forward, light_dir).abs() > 0.82 || radius >= range * 0.75 {
         true
     } else {
         let padding = shadow_cascade_depth_padding(shadow_cull, radius);
         let min_depth = shadow_cull.min_depth - radius - padding;
         let max_depth = shadow_cull.max_depth + radius + padding;
         depth.is_finite() && depth >= min_depth && depth <= max_depth
-    };
-    depth_visible
+    }
 }
 
 /// Conservatively intersects one world-space sphere with a Vulkan orthographic clip volume.
@@ -1815,7 +1848,7 @@ pub(super) struct MeshFrameUniform {
     pub(super) view_proj: [f32; 16],
     pub(super) view: [f32; 16],
     pub(super) shadow_view_proj: [[f32; 16]; SHADOW_CASCADE_COUNT],
-    /// x=blocker-search taps, y=PCF taps, z=light angular radius, w=contact-shadow enable.
+    /// x=blocker-search taps, y=PCF taps, z=light angular radius, w=reserved.
     pub(super) stable_csm_pcss_params: [f32; 4],
     /// x=constant bias, y=slope bias, z=normal offset, w=receiver-plane bias scales.
     pub(super) stable_csm_receiver_params: [f32; 4],
@@ -1837,6 +1870,10 @@ pub(super) struct MeshFrameUniform {
     pub(super) emissive_light_count: [f32; 4],
     /// x=DebugViewMode value; remaining lanes reserved for future scene debug controls.
     pub(super) debug_view: [f32; 4],
+    /// Previous unjittered camera transform used to reproject PCSS visibility.
+    pub(super) previous_view_projection: [f32; 16],
+    /// x=history valid, y=feedback, z=shared sample phase, w=PCSS light/camera reactivity.
+    pub(super) pcss_temporal: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1863,11 +1900,22 @@ impl EmissiveLightUniforms {
 
 /// Creates the frame descriptor set layout shared with `shaders/scene/mesh.vert.slang`.
 fn create_frame_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, VulkanError> {
-    let bindings = [vk::DescriptorSetLayoutBinding::default()
-        .binding(shader_interface::FRAME_CAMERA_BINDING)
-        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(shader_interface::FRAME_CAMERA_BINDING)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(
+                vk::ShaderStageFlags::VERTEX
+                    | vk::ShaderStageFlags::FRAGMENT
+                    | vk::ShaderStageFlags::COMPUTE,
+            ),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+    ];
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
     // Safety: the binding slice lives for the duration of the call.
@@ -1950,9 +1998,14 @@ fn create_descriptor_pool(
     device: &Device,
     frame_count: usize,
 ) -> Result<vk::DescriptorPool, VulkanError> {
-    let pool_sizes = [vk::DescriptorPoolSize::default()
-        .ty(vk::DescriptorType::UNIFORM_BUFFER)
-        .descriptor_count(frame_count as u32)];
+    let pool_sizes = [
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(frame_count as u32),
+        vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(frame_count as u32),
+    ];
     let create_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(frame_count as u32)
         .pool_sizes(&pool_sizes);
@@ -2237,6 +2290,8 @@ fn identity_frame_uniform() -> MeshFrameUniform {
         emissive_light_size_kind: [[0.0; 4]; MAX_LOCAL_LIGHTS],
         emissive_light_count: [0.0; 4],
         debug_view: [0.0; 4],
+        previous_view_projection: identity_mat4(),
+        pcss_temporal: [0.0; 4],
     }
 }
 
@@ -2270,7 +2325,7 @@ impl MeshPipelineTarget {
     /// Returns how many color attachments the target writes.
     fn color_attachment_count(self) -> usize {
         match self {
-            Self::SceneOpaque | Self::SceneTransparent => 3,
+            Self::SceneOpaque | Self::SceneTransparent => 4,
             Self::SceneOpaqueFast | Self::SceneTransparentFast => 1,
             Self::TranslucentShadow => 1,
             Self::OpaqueShadow | Self::LocalShadowDepth => 0,
@@ -2295,18 +2350,14 @@ impl MeshPipelineTarget {
 
     /// Returns whether fixed-function depth testing is active for this pass.
     fn uses_depth_test(self) -> bool {
-        true
+        !matches!(self, Self::TranslucentShadow)
     }
 
     /// Returns whether the pass should write depth values.
     fn writes_depth(self) -> bool {
         matches!(
             self,
-            Self::SceneOpaque
-                | Self::SceneOpaqueFast
-                | Self::OpaqueShadow
-                | Self::TranslucentShadow
-                | Self::LocalShadowDepth
+            Self::SceneOpaque | Self::SceneOpaqueFast | Self::OpaqueShadow | Self::LocalShadowDepth
         )
     }
 
@@ -2336,6 +2387,19 @@ impl MeshPipelineTarget {
                 vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask),
                 vk::PipelineColorBlendAttachmentState::default()
                     .color_write_mask(vk::ColorComponentFlags::empty()),
+                // `out_pcss_shadow.a` is 1 for normal scene shading and 0 for diagnostics. The
+                // alpha gate lets the same pipeline preserve the LOADed history attachment while
+                // a debug view is active; normal opaque fragments still replace the cleared value
+                // exactly once.
+                vk::PipelineColorBlendAttachmentState::default()
+                    .blend_enable(true)
+                    .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                    .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .color_blend_op(vk::BlendOp::ADD)
+                    .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+                    .alpha_blend_op(vk::BlendOp::ADD)
+                    .color_write_mask(write_mask),
             ],
             Self::SceneOpaqueFast => {
                 vec![vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask)]
@@ -2353,6 +2417,8 @@ impl MeshPipelineTarget {
                 vk::PipelineColorBlendAttachmentState::default()
                     .color_write_mask(vk::ColorComponentFlags::empty()),
                 vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask),
+                vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(vk::ColorComponentFlags::empty()),
             ],
             Self::SceneTransparentFast => vec![
                 vk::PipelineColorBlendAttachmentState::default()
@@ -2366,9 +2432,19 @@ impl MeshPipelineTarget {
                     .color_write_mask(write_mask),
             ],
             Self::OpaqueShadow | Self::LocalShadowDepth => Vec::new(),
-            Self::TranslucentShadow => {
-                vec![vk::PipelineColorBlendAttachmentState::default().color_write_mask(write_mask)]
-            }
+            Self::TranslucentShadow => vec![
+                // Transparent casters are accumulated front-to-back independently of draw order:
+                // RGB adds log(transmittance), while alpha keeps the nearest layer depth.
+                vk::PipelineColorBlendAttachmentState::default()
+                    .blend_enable(true)
+                    .src_color_blend_factor(vk::BlendFactor::ONE)
+                    .dst_color_blend_factor(vk::BlendFactor::ONE)
+                    .color_blend_op(vk::BlendOp::ADD)
+                    .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .alpha_blend_op(vk::BlendOp::MIN)
+                    .color_write_mask(write_mask),
+            ],
         }
     }
 }
@@ -2775,7 +2851,9 @@ mod tests {
         assert_eq!(offset_of!(MeshFrameUniform, ambient_color), 528);
         assert_eq!(offset_of!(MeshFrameUniform, local_shadow_view_proj), 544);
         assert_eq!(offset_of!(MeshFrameUniform, debug_view), 2416);
-        assert_eq!(size_of::<MeshFrameUniform>(), 2432);
+        assert_eq!(offset_of!(MeshFrameUniform, previous_view_projection), 2432);
+        assert_eq!(offset_of!(MeshFrameUniform, pcss_temporal), 2496);
+        assert_eq!(size_of::<MeshFrameUniform>(), 2512);
     }
 
     #[test]
@@ -2862,9 +2940,9 @@ mod tests {
     #[test]
     fn shadow_cascades_select_progressively_cheaper_lods() {
         assert_eq!(shadow_lod_for_cascade(0), MeshLodLevel::Full);
-        assert_eq!(shadow_lod_for_cascade(1), MeshLodLevel::Low);
-        assert_eq!(shadow_lod_for_cascade(2), MeshLodLevel::VeryLow);
-        assert_eq!(shadow_lod_for_cascade(3), MeshLodLevel::VeryLow);
+        assert_eq!(shadow_lod_for_cascade(1), MeshLodLevel::Medium);
+        assert_eq!(shadow_lod_for_cascade(2), MeshLodLevel::Low);
+        assert_eq!(shadow_lod_for_cascade(3), MeshLodLevel::Low);
         assert_eq!(
             shadow_lod_for_cascade(SHADOW_CASCADE_COUNT),
             MeshLodLevel::Medium
@@ -3062,7 +3140,7 @@ mod tests {
             MeshPipelineTarget::SceneTransparent.depth_compare_op(),
             vk::CompareOp::LESS_OR_EQUAL
         );
-        assert_eq!(attachments.len(), 3);
+        assert_eq!(attachments.len(), 4);
         assert!(attachments[0].blend_enable != 0);
         assert_eq!(
             attachments[1].color_write_mask,
@@ -3070,6 +3148,10 @@ mod tests {
         );
         assert_ne!(
             attachments[2].color_write_mask,
+            vk::ColorComponentFlags::empty()
+        );
+        assert_eq!(
+            attachments[3].color_write_mask,
             vk::ColorComponentFlags::empty()
         );
     }
@@ -3084,7 +3166,7 @@ mod tests {
             MeshPipelineTarget::SceneOpaque.depth_compare_op(),
             vk::CompareOp::LESS
         );
-        assert_eq!(attachments.len(), 3);
+        assert_eq!(attachments.len(), 4);
         assert!(attachments[0].blend_enable == 0);
         assert_ne!(
             attachments[1].color_write_mask,
@@ -3092,6 +3174,10 @@ mod tests {
         );
         assert_eq!(
             attachments[2].color_write_mask,
+            vk::ColorComponentFlags::empty()
+        );
+        assert_ne!(
+            attachments[3].color_write_mask,
             vk::ColorComponentFlags::empty()
         );
     }
@@ -3117,13 +3203,15 @@ mod tests {
     }
 
     #[test]
-    fn translucent_shadow_target_overwrites_only_the_nearest_depth_layer() {
+    fn translucent_shadow_target_accumulates_deep_log_transmittance() {
         let attachments = MeshPipelineTarget::TranslucentShadow.color_blend_attachments();
 
-        assert!(MeshPipelineTarget::TranslucentShadow.uses_depth_test());
-        assert!(MeshPipelineTarget::TranslucentShadow.writes_depth());
+        assert!(!MeshPipelineTarget::TranslucentShadow.uses_depth_test());
+        assert!(!MeshPipelineTarget::TranslucentShadow.writes_depth());
         assert_eq!(attachments.len(), 1);
-        assert!(attachments[0].blend_enable == 0);
+        assert!(attachments[0].blend_enable != 0);
+        assert_eq!(attachments[0].color_blend_op, vk::BlendOp::ADD);
+        assert_eq!(attachments[0].alpha_blend_op, vk::BlendOp::MIN);
         assert_ne!(
             attachments[0].color_write_mask,
             vk::ColorComponentFlags::empty()

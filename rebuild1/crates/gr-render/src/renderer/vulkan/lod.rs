@@ -314,14 +314,14 @@ mod tests {
                 buffers[index] += 1;
                 if *level == MeshLodLevel::Full {
                     let optimized_cache = meshopt::analyze::analyze_vertex_cache(
-                        &indices,
+                        indices,
                         geometry.vertices().len(),
                         16,
                         32,
                         256,
                     );
                     let optimized_fetch = meshopt::analyze::analyze_vertex_fetch(
-                        &indices,
+                        indices,
                         geometry.vertices().len(),
                         32,
                     );

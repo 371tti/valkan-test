@@ -29,8 +29,11 @@ struct FrameCamera {
     float4 emissive_light_size_kind[4];
     float4 emissive_light_count;
     float4 debug_view;
+    float4x4 previous_view_projection;
+    float4 pcss_temporal;
 };
 [[vk::binding(0, 0)]] ConstantBuffer<FrameCamera> frame_camera;
+[[vk::binding(1, 0)]] Sampler2D pcss_shadow_history;
 
 struct MaterialParams {
     float4 base_color_factor;
@@ -88,6 +91,7 @@ void main(float4 sv_position : SV_Position, bool front_facing : SV_IsFrontFace) 
     }
     float metallic = clamp(material.pbr_alpha.x, 0.0, 1.0);
     float roughness = clamp(material.pbr_alpha.y, 0.04, 1.0);
+    float pcss_visibility;
     out_color = float4(
         shade_pbr(
             base_color.rgb,
@@ -98,7 +102,8 @@ void main(float4 sv_position : SV_Position, bool front_facing : SV_IsFrontFace) 
             1.0,
             material.emissive_occlusion.rgb,
             base_color.a,
-            sv_position.xy
+            sv_position.xy,
+            pcss_visibility
         ),
         base_color.a
     );
